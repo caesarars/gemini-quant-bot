@@ -281,8 +281,19 @@ export default function App() {
           </div>
 
           <div className="mt-8 flex-1 flex flex-col">
-            <div className="flex items-center gap-3 text-[10px] uppercase text-trading-muted tracking-[2px] mb-4 after:content-[''] after:flex-1 after:h-[1px] after:bg-trading-border after:ml-3">
+            <div className="flex items-center gap-3 text-[10px] uppercase text-trading-muted tracking-[2px] mb-4">
               Performance (USDT)
+              <div className="flex-1 h-[1px] bg-trading-border" />
+              <button
+                onClick={async () => {
+                  if (!confirm("Reset semua PnL history? Data paper trading akan dihapus.")) return;
+                  await fetch("/api/pnl-history", { method: "DELETE" });
+                  setPnlData([]);
+                }}
+                className="text-[9px] px-1.5 py-0.5 bg-trading-down/10 text-trading-down border border-trading-down/30 rounded hover:bg-trading-down/20 transition-colors font-bold uppercase tracking-wider"
+              >
+                Reset
+              </button>
             </div>
             <div className="flex-1 min-h-[200px] bg-trading-card/30 border border-trading-border rounded p-2">
               <ResponsiveContainer width="100%" height="100%">

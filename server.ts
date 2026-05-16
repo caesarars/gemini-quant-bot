@@ -745,6 +745,20 @@ app.get("/api/pnl-history", async (req, res) => {
   } catch { res.status(500).json({ error: "Failed to fetch PnL history" }); }
 });
 
+app.delete("/api/pnl-history", async (req, res) => {
+  try {
+    const { above } = req.query; // optional: DELETE /api/pnl-history?above=10000
+    if (above) {
+      const threshold = parseFloat(above as string);
+      await pool.query("DELETE FROM pnl_snapshots WHERE total_value > $1", [threshold]);
+      res.json({ ok: true, message: `Deleted snapshots with total_value > ${threshold}` });
+    } else {
+      await pool.query("TRUNCATE pnl_snapshots");
+      res.json({ ok: true, message: "All PnL history cleared" });
+    }
+  } catch { res.status(500).json({ error: "Failed to delete PnL history" }); }
+});
+
 app.get("/api/trade-history", async (req, res) => {
   try {
     const r = await pool.query(
