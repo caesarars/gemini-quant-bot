@@ -685,6 +685,97 @@ app.post("/api/sync-positions", async (_req, res) => {
   }
 });
 
+// Close a single open position by trade ID
+app.post("/api/close-position/:id", async (req, res) => {
+  const { id } = req.params;
+  try {
+    const tradeRes = await pool.query(
+      `SELECT id, symbol, type, entry_price::float, amount::float FROM trades WHERE id = $1 AND status = 'OPEN'`,
+      [id]
+    );
+    if (tradeRes.rows.length === 0)
+      return res.status(404).json({ error: "Position not found or already closed" });
+
+    const trade   = tradeRes.rows[0];
+    const hasKeys = !!(process.env.BINANCE_API_KEY && process.env.BINANCE_SECRET_KEY);
+    let exitPrice = trade.entry_price;
+
+    if (hasKeys) {
+      try { await binance.cancelAllOrders(trade.symbol); } catch { /* TP/SL may already be filled */ }
+      try {
+        const closeSide = trade.type === "BUY" ? "sell" : "buy";
+        const order = await binance.createOrder(trade.symbol, "market", closeSide, trade.amount, undefined, { reduceOnly: true });
+        exitPrice = parseFloat(String((order as any).average || (order as any).price || trade.entry_price));
+      } catch (e: any) {
+        return res.status(500).json({ error: `Binance close failed: ${e?.message}` });
+      }
+    } else {
+      exitPrice = scanResults.find(r => r.symbol === trade.symbol)?.price ?? trade.entry_price;
+    }
+
+    const isLong  = trade.type === "BUY";
+    const pnlUsdt = (isLong ? exitPrice - trade.entry_price : trade.entry_price - exitPrice) * trade.amount;
+    await pool.query(
+      `UPDATE trades SET status = 'CLOSED', exit_price = $1, pnl = $2 WHERE id = $3`,
+      [exitPrice, pnlUsdt.toFixed(4), id]
+    );
+    console.log(`[CLOSE] ${trade.symbol} @ ${exitPrice} PnL:${pnlUsdt.toFixed(2)} USDT`);
+    res.json({ ok: true, symbol: trade.symbol, exitPrice, pnlUsdt: parseFloat(pnlUsdt.toFixed(4)) });
+  } catch (err: any) {
+    res.status(500).json({ error: err?.message });
+  }
+});
+
+// Close all open positions at market
+app.post("/api/close-all-positions", async (_req, res) => {
+  try {
+    const openTrades = await pool.query(
+      `SELECT id, symbol, type, entry_price::float, amount::float FROM trades WHERE status = 'OPEN'`
+    );
+    if (openTrades.rows.length === 0) return res.json({ ok: true, closed: 0 });
+
+    const hasKeys      = !!(process.env.BINANCE_API_KEY && process.env.BINANCE_SECRET_KEY);
+    const symbolsSeen  = new Set<string>();
+    let   closed       = 0;
+    const results: any[] = [];
+
+    for (const trade of openTrades.rows) {
+      let exitPrice = trade.entry_price;
+
+      if (hasKeys) {
+        if (!symbolsSeen.has(trade.symbol)) {
+          try { await binance.cancelAllOrders(trade.symbol); } catch { /* ignore */ }
+          symbolsSeen.add(trade.symbol);
+        }
+        try {
+          const closeSide = trade.type === "BUY" ? "sell" : "buy";
+          const order = await binance.createOrder(trade.symbol, "market", closeSide, trade.amount, undefined, { reduceOnly: true });
+          exitPrice = parseFloat(String((order as any).average || (order as any).price || trade.entry_price));
+        } catch (e: any) {
+          console.error(`[CLOSE-ALL] ${trade.symbol} failed:`, e?.message);
+          continue;
+        }
+      } else {
+        exitPrice = scanResults.find(r => r.symbol === trade.symbol)?.price ?? trade.entry_price;
+      }
+
+      const isLong  = trade.type === "BUY";
+      const pnlUsdt = (isLong ? exitPrice - trade.entry_price : trade.entry_price - exitPrice) * trade.amount;
+      await pool.query(
+        `UPDATE trades SET status = 'CLOSED', exit_price = $1, pnl = $2 WHERE id = $3`,
+        [exitPrice, pnlUsdt.toFixed(4), trade.id]
+      );
+      closed++;
+      results.push({ symbol: trade.symbol, exitPrice, pnlUsdt: parseFloat(pnlUsdt.toFixed(4)) });
+      console.log(`[CLOSE-ALL] ${trade.symbol} @ ${exitPrice} PnL:${pnlUsdt.toFixed(2)} USDT`);
+    }
+
+    res.json({ ok: true, closed, results });
+  } catch (err: any) {
+    res.status(500).json({ error: err?.message });
+  }
+});
+
 app.get("/api/settings", async (req, res) => {
   try {
     const r = await pool.query("SELECT * FROM bot_settings WHERE id = 'bot_config'");

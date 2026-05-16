@@ -73,7 +73,9 @@ export default function App() {
   const [isPositionsOpen, setIsPositionsOpen] = useState(false);
   const [openPositions, setOpenPositions] = useState<OpenPosition[]>([]);
   const [lastSync, setLastSync] = useState<string | null>(null);
-  const [isSyncing, setIsSyncing] = useState(false);
+  const [isSyncing, setIsSyncing]       = useState(false);
+  const [closingId, setClosingId]       = useState<string | null>(null);
+  const [closingAll, setClosingAll]     = useState(false);
   const [logs, setLogs] = useState<{ id: string; msg: string; time: string; type: string }[]>([]);
   const [isAutoPilot, setIsAutoPilot]             = useState(false);
   const [activeStrategies, setActiveStrategies]   = useState<string[]>(["ULTRA-SCALP", "MOMENTUM-ARB"]);
@@ -132,6 +134,40 @@ export default function App() {
       body: JSON.stringify({ activeStrategiesVal: next }),
     });
     addLog(`Active: ${next.join(", ")}`, "info");
+  };
+
+  const refreshPositions = async () => {
+    const r = await fetch("/api/open-positions");
+    const d = await r.json();
+    setOpenPositions(d.positions ?? []);
+    if (d.last_sync) setLastSync(d.last_sync);
+  };
+
+  const closePosition = async (id: string) => {
+    setClosingId(id);
+    try {
+      const r = await fetch(`/api/close-position/${id}`, { method: "POST" });
+      const d = await r.json();
+      if (!r.ok) { addLog(`Close failed: ${d.error}`, "error"); return; }
+      addLog(`Closed ${d.symbol} @ ${d.exitPrice} PnL: ${d.pnlUsdt >= 0 ? "+" : ""}${d.pnlUsdt.toFixed(2)} USDT`, d.pnlUsdt >= 0 ? "success" : "error");
+      await refreshPositions();
+    } finally {
+      setClosingId(null);
+    }
+  };
+
+  const closeAllPositions = async () => {
+    if (!confirm(`Close semua ${openPositions.length} posisi sekarang?`)) return;
+    setClosingAll(true);
+    try {
+      const r = await fetch("/api/close-all-positions", { method: "POST" });
+      const d = await r.json();
+      if (!r.ok) { addLog(`Close all failed: ${d.error}`, "error"); return; }
+      addLog(`Closed ${d.closed} positions`, "success");
+      await refreshPositions();
+    } finally {
+      setClosingAll(false);
+    }
   };
 
   useEffect(() => {
@@ -690,9 +726,24 @@ export default function App() {
                     {openPositions.length} Active
                   </span>
                 </div>
-                <button onClick={() => setIsPositionsOpen(false)} className="p-2 hover:bg-trading-border rounded transition-colors text-trading-muted hover:text-white">
-                  <X className="w-5 h-5" />
-                </button>
+                <div className="flex items-center gap-2">
+                  {openPositions.length > 0 && (
+                    <button
+                      onClick={closeAllPositions}
+                      disabled={closingAll || closingId !== null}
+                      className="flex items-center gap-1.5 px-3 py-1.5 bg-trading-down/10 text-trading-down border border-trading-down/30 rounded text-[10px] font-black uppercase tracking-widest hover:bg-trading-down/20 transition-colors disabled:opacity-50"
+                    >
+                      {closingAll ? (
+                        <><Activity className="w-3 h-3 animate-spin" /> Closing...</>
+                      ) : (
+                        <><X className="w-3 h-3" /> Close All</>
+                      )}
+                    </button>
+                  )}
+                  <button onClick={() => setIsPositionsOpen(false)} className="p-2 hover:bg-trading-border rounded transition-colors text-trading-muted hover:text-white">
+                    <X className="w-5 h-5" />
+                  </button>
+                </div>
               </div>
 
               <div className="flex-1 overflow-auto">
@@ -714,6 +765,7 @@ export default function App() {
                         <th className="px-6 py-4 font-medium">Fee</th>
                         <th className="px-6 py-4 font-medium">Unrealized PnL</th>
                         <th className="px-6 py-4 font-medium text-right">Opened</th>
+                        <th className="px-4 py-4 font-medium text-right">Action</th>
                       </tr>
                     </thead>
                     <tbody className="divide-y divide-trading-border">
@@ -747,6 +799,15 @@ export default function App() {
                             </div>
                           </td>
                           <td className="px-6 py-4 text-right text-trading-muted font-mono">{pos.opened_at}</td>
+                          <td className="px-4 py-4 text-right">
+                            <button
+                              onClick={() => closePosition(pos.id)}
+                              disabled={closingId === pos.id || closingAll}
+                              className="px-2 py-1 bg-trading-down/10 text-trading-down border border-trading-down/30 rounded text-[9px] font-black uppercase tracking-widest hover:bg-trading-down/20 transition-colors disabled:opacity-40"
+                            >
+                              {closingId === pos.id ? <Activity className="w-3 h-3 animate-spin inline" /> : "Close"}
+                            </button>
+                          </td>
                         </tr>
                       ))}
                     </tbody>
