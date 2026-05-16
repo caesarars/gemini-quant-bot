@@ -254,9 +254,9 @@ function getTrend(symbol: string): "UP" | "DOWN" | "NEUTRAL" {
   const lastEma = ema200[ema200.length - 1];
   const lastPrice = closes[closes.length - 1];
   if (isNaN(lastEma) || lastEma === 0) return "NEUTRAL";
-  if (lastPrice > lastEma * 1.001) return "UP";    // price > EMA200 + 0.1% buffer
-  if (lastPrice < lastEma * 0.999) return "DOWN";  // price < EMA200 - 0.1% buffer
-  return "NEUTRAL";
+  if (lastPrice > lastEma) return "UP";
+  if (lastPrice < lastEma) return "DOWN";
+  return "NEUTRAL"; // hanya tepat di EMA200 (sangat jarang)
 }
 
 // ── Auto-Execute ───────────────────────────────────────────────────────────────
@@ -277,8 +277,8 @@ async function checkAutoExecute(symbol: string, signal: AnySignal, strategyName:
   if (signal.action === "SELL" && trend === "UP")   { console.log(`[TREND] ${symbol} SELL blocked — UP`);     return; }
   if (trend === "NEUTRAL")                           { console.log(`[TREND] ${symbol} blocked — NEUTRAL`);     return; }
 
-  // Volume threshold: ULTRA-SCALP requires spike (1.5×), MOMENTUM-ARB is looser (1.2×)
-  const volThreshold = strategyName === "MOMENTUM-ARB" ? 1.2 : 1.5;
+  // Volume threshold: both strategies use 1.2× minimum
+  const volThreshold = 1.2;
   const volRatio     = signal.volumeRatio ?? 1;
   if (volRatio < volThreshold) {
     console.log(`[VOL] ${symbol} blocked — ${volRatio}× < ${volThreshold}× threshold`);
