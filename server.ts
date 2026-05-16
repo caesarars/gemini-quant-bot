@@ -46,6 +46,9 @@ async function runMigrations() {
   // Futures additions
   await pool.query(`ALTER TABLE trades ADD COLUMN IF NOT EXISTS leverage INTEGER DEFAULT 1`);
   await pool.query(`ALTER TABLE bot_settings ADD COLUMN IF NOT EXISTS leverage INTEGER DEFAULT 10`);
+  // Stop Loss & Take Profit
+  await pool.query(`ALTER TABLE bot_settings ADD COLUMN IF NOT EXISTS take_profit_pct NUMERIC(5,2) DEFAULT 1.5`);
+  await pool.query(`ALTER TABLE bot_settings ADD COLUMN IF NOT EXISTS stop_loss_pct   NUMERIC(5,2) DEFAULT 0.8`);
 }
 
 // ── AI & Exchange ─────────────────────────────────────────────────────────────
@@ -291,6 +294,73 @@ const takePnLSnapshot = async () => {
   }
 };
 
+// ── Trade Monitor (Stop Loss / Take Profit) ───────────────────────────────────
+
+const runTradeMonitor = async () => {
+  try {
+    const openTrades = await pool.query(
+      `SELECT id, symbol, type, entry_price::float, amount::float, leverage
+       FROM trades WHERE status = 'OPEN'`
+    );
+    if (openTrades.rows.length === 0) return;
+
+    const cfg = await pool.query(
+      `SELECT take_profit_pct::float, stop_loss_pct::float FROM bot_settings WHERE id = 'bot_config'`
+    );
+    const tpPct = (cfg.rows[0]?.take_profit_pct ?? 1.5) / 100;
+    const slPct = (cfg.rows[0]?.stop_loss_pct  ?? 0.8)  / 100;
+    const hasKeys = !!(process.env.BINANCE_API_KEY && process.env.BINANCE_SECRET_KEY);
+
+    for (const trade of openTrades.rows) {
+      try {
+        const ticker = await binance.fetchTicker(trade.symbol);
+        const currentPrice: number = ticker.last as number;
+        const entry: number = trade.entry_price;
+        const isLong = trade.type === "BUY";
+
+        // PnL % from entry (direction-aware)
+        const pnlPct = isLong
+          ? (currentPrice - entry) / entry
+          : (entry - currentPrice) / entry;
+
+        const hitTP = pnlPct >=  tpPct;
+        const hitSL = pnlPct <= -slPct;
+
+        if (!hitTP && !hitSL) continue;
+
+        const reason    = hitTP ? "TP" : "SL";
+        const closeSide = isLong ? "sell" : "buy";
+        // USDT-M futures PnL = price diff × base amount
+        const pnlUSDT = (isLong ? currentPrice - entry : entry - currentPrice) * trade.amount;
+
+        console.log(`[${reason}] ${trade.symbol} entry:${entry} current:${currentPrice} pnlPct:${(pnlPct*100).toFixed(3)}% pnl:${pnlUSDT.toFixed(2)} USDT`);
+
+        if (hasKeys) {
+          try {
+            await binance.createOrder(
+              trade.symbol, "market", closeSide, trade.amount,
+              undefined, { reduceOnly: true }
+            );
+            console.log(`[${reason}] ✓ Position closed on Binance: ${trade.symbol}`);
+          } catch (e: any) {
+            console.error(`[${reason}] ✗ Close order failed [${trade.symbol}]:`, e?.message);
+          }
+        }
+
+        await pool.query(
+          `UPDATE trades SET status = 'CLOSED', exit_price = $1, pnl = $2 WHERE id = $3`,
+          [currentPrice, pnlUSDT.toFixed(4), trade.id]
+        );
+        console.log(`[${reason}] DB closed: ${trade.symbol} PnL=${pnlUSDT.toFixed(2)} USDT`);
+      } catch (e: any) {
+        console.error(`Trade monitor error [${trade.symbol}]:`, e?.message);
+      }
+    }
+  } catch (err) {
+    console.error("Trade monitor critical error:", err);
+  }
+};
+
 // ── API Routes ────────────────────────────────────────────────────────────────
 
 app.get("/api/health", (req, res) => {
@@ -307,16 +377,20 @@ app.get("/api/settings", async (req, res) => {
 });
 
 app.post("/api/settings", async (req, res) => {
-  const { isAutoPilot, riskLevel, maxSlippage } = req.body;
+  const { isAutoPilot, riskLevel, maxSlippage, takeProfitPct, stopLossPct, leverage } = req.body;
   try {
     const result = await pool.query(
       `UPDATE bot_settings
-       SET is_auto_pilot = COALESCE($1, is_auto_pilot),
-           risk_level    = COALESCE($2, risk_level),
-           max_slippage  = COALESCE($3, max_slippage)
+       SET is_auto_pilot    = COALESCE($1, is_auto_pilot),
+           risk_level       = COALESCE($2, risk_level),
+           max_slippage     = COALESCE($3, max_slippage),
+           take_profit_pct  = COALESCE($4, take_profit_pct),
+           stop_loss_pct    = COALESCE($5, stop_loss_pct),
+           leverage         = COALESCE($6, leverage)
        WHERE id = 'bot_config'
        RETURNING *`,
-      [isAutoPilot ?? null, riskLevel ?? null, maxSlippage ?? null]
+      [isAutoPilot ?? null, riskLevel ?? null, maxSlippage ?? null,
+       takeProfitPct ?? null, stopLossPct ?? null, leverage ?? null]
     );
     res.json(result.rows[0]);
   } catch (err) {
@@ -470,8 +544,10 @@ async function startServer() {
   console.log("Markets loaded");
 
   setInterval(runScanner, 30000);
+  setInterval(runTradeMonitor, 10000);
   setInterval(takePnLSnapshot, 60 * 60 * 1000);
   runScanner();
+  runTradeMonitor();
 
   if (process.env.NODE_ENV !== "production") {
     const vite = await createViteServer({ server: { middlewareMode: true }, appType: "spa" });
