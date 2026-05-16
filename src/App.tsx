@@ -550,13 +550,15 @@ export default function App() {
                       <tr key={trade.id} className="hover:bg-white/[0.02] transition-colors">
                         <td className="px-6 py-4 font-bold">{trade.symbol}</td>
                         <td className="px-6 py-4 text-trading-muted">{trade.strategy}</td>
-                        <td className="px-6 py-4 font-mono">${trade.entry.toLocaleString()}</td>
-                        <td className="px-6 py-4 font-mono">${trade.exit.toLocaleString()}</td>
+                        <td className="px-6 py-4 font-mono">${trade.entry?.toLocaleString() ?? '—'}</td>
+                        <td className="px-6 py-4 font-mono text-trading-muted">
+                          {trade.exit != null ? `$${trade.exit.toLocaleString()}` : <span className="text-trading-accent text-[9px] font-bold uppercase">OPEN</span>}
+                        </td>
                         <td className={cn(
                           "px-6 py-4 font-bold font-mono",
-                          trade.pnl >= 0 ? "text-trading-up" : "text-trading-down"
+                          trade.pnl == null ? "text-trading-muted" : trade.pnl >= 0 ? "text-trading-up" : "text-trading-down"
                         )}>
-                          {trade.pnl >= 0 ? '+' : ''}{trade.pnl.toFixed(2)} USDT
+                          {trade.pnl != null ? `${trade.pnl >= 0 ? '+' : ''}${trade.pnl.toFixed(2)} USDT` : '—'}
                         </td>
                         <td className="px-6 py-4 text-right text-trading-muted font-mono">{trade.time}</td>
                       </tr>
