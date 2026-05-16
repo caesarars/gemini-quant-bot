@@ -63,13 +63,23 @@ export default function App() {
 
   const [apiStatus, setApiStatus] = useState<string>("connecting");
 
+  // Load persisted settings (including isAutoPilot) on mount
+  useEffect(() => {
+    fetch("/api/settings")
+      .then((r) => r.json())
+      .then((s) => {
+        if (typeof s.is_auto_pilot === "boolean") setIsAutoPilot(s.is_auto_pilot);
+      })
+      .catch(() => {});
+  }, []);
+
   useEffect(() => {
     const fetchData = async () => {
       try {
         const scanRes = await fetch("/api/scan");
         const scanData = await scanRes.json();
         setScanResults(scanData.results);
-        
+
         const balRes = await fetch("/api/balance");
         if (balRes.ok) {
           const balData = await balRes.json();
@@ -457,8 +467,10 @@ export default function App() {
               <div className="text-[10px] text-trading-muted uppercase tracking-widest font-bold">Auto-Trade Override</div>
               <div 
                 onClick={() => {
-                  setIsAutoPilot(!isAutoPilot);
-                  addLog(`Auto-trade ${!isAutoPilot ? 'ENABLED' : 'DISABLED'}`, !isAutoPilot ? 'success' : 'warning');
+                  const next = !isAutoPilot;
+                  setIsAutoPilot(next);
+                  addLog(`Auto-trade ${next ? 'ENABLED' : 'DISABLED'}`, next ? 'success' : 'warning');
+                  fetch("/api/settings", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ isAutoPilot: next }) });
                 }}
                 className={cn(
                   "w-8 h-4 rounded-full transition-all relative cursor-pointer",
@@ -473,8 +485,10 @@ export default function App() {
             </div>
             <button 
               onClick={() => {
-                setIsAutoPilot(!isAutoPilot);
-                addLog(`Manual Override: ${!isAutoPilot ? 'EXECUTION START' : 'EMERGENCY KILL'}`, !isAutoPilot ? 'success' : 'error');
+                const next = !isAutoPilot;
+                setIsAutoPilot(next);
+                addLog(`Manual Override: ${next ? 'EXECUTION START' : 'EMERGENCY KILL'}`, next ? 'success' : 'error');
+                fetch("/api/settings", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ isAutoPilot: next }) });
               }}
               className={cn(
                 "w-full py-3 rounded text-[11px] font-black uppercase tracking-widest transition-all",

@@ -11,6 +11,7 @@ CREATE TABLE IF NOT EXISTS trades (
   pnl         NUMERIC(20, 8),
   amount      NUMERIC(20, 8),
   strategy    VARCHAR(100),
+  leverage    INTEGER     DEFAULT 1,
   timestamp   TIMESTAMPTZ DEFAULT NOW(),
   status      VARCHAR(10) DEFAULT 'OPEN' CHECK (status IN ('OPEN', 'CLOSED'))
 );
@@ -23,12 +24,28 @@ CREATE TABLE IF NOT EXISTS pnl_snapshots (
 );
 
 CREATE TABLE IF NOT EXISTS bot_settings (
-  id           VARCHAR(50) PRIMARY KEY DEFAULT 'bot_config',
-  is_auto_pilot BOOLEAN    DEFAULT false,
-  risk_level   NUMERIC(5, 2) DEFAULT 1,
-  max_slippage NUMERIC(5, 2) DEFAULT 0.5,
-  symbols      TEXT[]      DEFAULT '{BTC/USDT,ETH/USDT,SOL/USDT,DOGE/USDT,BNB/USDT}'
+  id            VARCHAR(50) PRIMARY KEY DEFAULT 'bot_config',
+  is_auto_pilot BOOLEAN     DEFAULT false,
+  risk_level    NUMERIC(5, 2) DEFAULT 1,
+  max_slippage  NUMERIC(5, 2) DEFAULT 0.5,
+  leverage      INTEGER     DEFAULT 10,
+  symbols       TEXT[]      DEFAULT '{BTC/USDT,ETH/USDT,SOL/USDT,DOGE/USDT,BNB/USDT}'
 );
+
+CREATE TABLE IF NOT EXISTS ohlcv (
+  id        SERIAL      PRIMARY KEY,
+  symbol    VARCHAR(20) NOT NULL,
+  timeframe VARCHAR(10) NOT NULL DEFAULT '1m',
+  timestamp BIGINT      NOT NULL,
+  open      NUMERIC(20, 8) NOT NULL,
+  high      NUMERIC(20, 8) NOT NULL,
+  low       NUMERIC(20, 8) NOT NULL,
+  close     NUMERIC(20, 8) NOT NULL,
+  volume    NUMERIC(30, 8) NOT NULL,
+  UNIQUE (symbol, timeframe, timestamp)
+);
+
+CREATE INDEX IF NOT EXISTS idx_ohlcv_symbol_ts ON ohlcv (symbol, timeframe, timestamp DESC);
 
 -- Default settings row
 INSERT INTO bot_settings (id) VALUES ('bot_config') ON CONFLICT (id) DO NOTHING;
