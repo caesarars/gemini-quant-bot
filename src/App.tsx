@@ -1,0 +1,562 @@
+import { useState, useEffect } from "react";
+import { 
+  TrendingUp, 
+  TrendingDown, 
+  Activity, 
+  ShieldCheck, 
+  Bot, 
+  Settings, 
+  History,
+  Zap,
+  Info,
+  AlertTriangle,
+  LineChart as LineChartIcon,
+  X
+} from "lucide-react";
+import { motion, AnimatePresence } from "motion/react";
+import { cn } from "./lib/utils";
+import { 
+  LineChart, 
+  Line, 
+  XAxis, 
+  YAxis, 
+  CartesianGrid, 
+  Tooltip, 
+  ResponsiveContainer 
+} from 'recharts';
+
+interface ScanResult {
+  symbol: string;
+  action: 'BUY' | 'SELL' | 'HOLD';
+  rsi: number;
+  price: number;
+  reason?: string;
+}
+
+interface AIResult {
+  verdict: string;
+  confidence: number;
+  reason: string;
+}
+
+export default function App() {
+  const [scanResults, setScanResults] = useState<ScanResult[]>([]);
+  const [balance, setBalance] = useState<Record<string, number>>({});
+  const [pnlData, setPnlData] = useState<any[]>([]);
+  const [tradeHistory, setTradeHistory] = useState<any[]>([]);
+  const [isHistoryOpen, setIsHistoryOpen] = useState(false);
+  const [logs, setLogs] = useState<{ id: string; msg: string; time: string; type: string }[]>([]);
+  const [isAutoPilot, setIsAutoPilot] = useState(false);
+  const [aiConfirmations, setAiConfirmations] = useState<Record<string, AIResult>>({});
+  const [loadingAi, setLoadingAi] = useState<string | null>(null);
+  const [expandedCard, setExpandedCard] = useState<string | null>(null);
+
+  const addLog = (msg: string, type: string = "info") => {
+    const log = {
+      id: Math.random().toString(36).substr(2, 9),
+      msg,
+      time: new Date().toLocaleTimeString(),
+      type
+    };
+    setLogs(prev => [log, ...prev].slice(0, 50));
+  };
+
+  const [apiStatus, setApiStatus] = useState<string>("connecting");
+
+  useEffect(() => {
+    const fetchData = async () => {
+      try {
+        const scanRes = await fetch("/api/scan");
+        const scanData = await scanRes.json();
+        setScanResults(scanData.results);
+        
+        const balRes = await fetch("/api/balance");
+        if (balRes.ok) {
+          const balData = await balRes.json();
+          setBalance(balData.total);
+          setApiStatus(balData.status);
+          if (balData.status === 'error') {
+             addLog(`API ERROR: ${balData.error}`, 'error');
+          }
+        }
+
+        const pnlRes = await fetch("/api/pnl-history");
+        const pnlHistory = await pnlRes.json();
+        setPnlData(pnlHistory);
+
+        const historyRes = await fetch("/api/trade-history");
+        const historyData = await historyRes.json();
+        setTradeHistory(historyData);
+      } catch (err) {
+        console.error("Failed to fetch data", err);
+      }
+    };
+
+    fetchData();
+    const interval = setInterval(fetchData, 10000);
+    return () => clearInterval(interval);
+  }, []);
+
+  const getAiConfirmation = async (symbol: string, data: any) => {
+    setLoadingAi(symbol);
+    addLog(`AI analyzing ${symbol} structure...`, "ai");
+    try {
+      const res = await fetch("/api/ai-confirm", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ symbol, data })
+      });
+      const result = await res.json();
+      setAiConfirmations(prev => ({ ...prev, [symbol]: result }));
+      addLog(`AI Verdict for ${symbol}: ${result.verdict} (${result.confidence}%)`, "ai");
+    } catch (e) {
+      addLog(`AI analysis failed for ${symbol}`, "error");
+    } finally {
+      setLoadingAi(null);
+    }
+  };
+
+  return (
+    <div className="min-h-screen flex flex-col overflow-hidden">
+      {/* Header */}
+      <header className="h-[60px] px-6 flex items-center justify-between border-b border-trading-border bg-trading-bg/80 backdrop-blur-md z-50">
+        <div className="flex items-center gap-4">
+          <div className="w-8 h-8 bg-trading-accent rounded flex items-center justify-center font-bold text-trading-bg text-xl">
+            Σ
+          </div>
+          <div className="text-lg font-black tracking-tighter">
+            NEXUS<span className="text-trading-accent">BOT</span>.v4
+          </div>
+          <div className="hidden sm:flex items-center gap-2 px-3 py-1 bg-trading-up/10 text-trading-up rounded-full border border-trading-up/30 text-[10px] uppercase font-bold tracking-wider">
+            Live Trading: Enabled
+          </div>
+        </div>
+        
+        <div className="hidden lg:flex items-center gap-8 text-[11px] font-medium">
+          <div className="text-trading-muted uppercase tracking-wider">
+            BINANCE API: <span className={cn(
+              "font-bold",
+              apiStatus === 'live' ? "text-trading-up" : "text-orange-400"
+            )}>
+              {apiStatus === 'live' ? "CONNECTED" : apiStatus === 'mock' ? "SIMULATED" : "ERROR"}
+            </span>
+          </div>
+          <div className="text-trading-muted">LATENCY: <span className="text-trading-up">14ms</span></div>
+          <div className="text-trading-muted">BAL: <span className="text-trading-text">{balance['USDT']?.toLocaleString() || '0.00'} USDT</span></div>
+          <button 
+            onClick={() => setIsHistoryOpen(true)}
+            className="flex items-center gap-2 p-2 px-3 bg-trading-card border border-trading-border rounded hover:border-trading-muted transition-colors"
+          >
+            <History className="w-4 h-4 text-trading-accent" />
+            <span className="text-[10px] font-bold uppercase tracking-widest">History</span>
+          </button>
+        </div>
+      </header>
+
+      {/* Main Grid */}
+      <main className="flex-1 grid grid-cols-1 lg:grid-cols-[240px_1fr_280px] gap-[1px] bg-trading-border overflow-hidden">
+        
+        {/* Left Column: Execution Strategies */}
+        <aside className="bg-trading-bg p-5 flex flex-col overflow-y-auto">
+          <div className="flex items-center gap-3 text-[10px] uppercase text-trading-muted tracking-[2px] mb-4 after:content-[''] after:flex-1 after:h-[1px] after:bg-trading-border after:ml-3">
+            Strategies
+          </div>
+          <div className="space-y-3">
+            {[
+              { name: 'ULTRA-SCALP v2.1', desc: 'High freq, 0.5% profit target', active: true },
+              { name: 'MOMENTUM ARB', desc: 'Inter-exchange spread capture', active: false },
+              { name: 'VOLATILITY CORE', desc: 'Standard Deviation ±3 triggers', active: false }
+            ].map(strat => (
+              <div 
+                key={strat.name}
+                className={cn(
+                  "p-3 rounded border transition-all cursor-pointer",
+                  strat.active ? "bg-trading-card border-trading-accent shadow-[0_0_15px_rgba(0,209,255,0.1)]" : "bg-trading-card/50 border-trading-border hover:border-trading-muted"
+                )}
+              >
+                <div className="text-[12px] font-bold mb-1">{strat.name}</div>
+                <div className="text-[10px] text-trading-muted leading-tight">{strat.desc}</div>
+              </div>
+            ))}
+          </div>
+
+          <div className="mt-8 flex-1 flex flex-col">
+            <div className="flex items-center gap-3 text-[10px] uppercase text-trading-muted tracking-[2px] mb-4 after:content-[''] after:flex-1 after:h-[1px] after:bg-trading-border after:ml-3">
+              Performance (USDT)
+            </div>
+            <div className="flex-1 min-h-[200px] bg-trading-card/30 border border-trading-border rounded p-2">
+              <ResponsiveContainer width="100%" height="100%">
+                <LineChart data={pnlData}>
+                  <CartesianGrid strokeDasharray="3 3" stroke="#1A1D23" vertical={false} />
+                  <XAxis 
+                    dataKey="time" 
+                    hide 
+                  />
+                  <YAxis 
+                    hide 
+                    domain={['dataMin - 10', 'dataMax + 10']}
+                  />
+                  <Tooltip 
+                    contentStyle={{ backgroundColor: '#111318', border: '1px solid #1A1D23', fontSize: '10px' }}
+                    labelStyle={{ color: '#666' }}
+                  />
+                  <Line 
+                    type="monotone" 
+                    dataKey="value" 
+                    stroke="#00D1FF" 
+                    strokeWidth={2} 
+                    dot={{ fill: '#00D1FF', r: 2 }}
+                    activeDot={{ r: 4, stroke: '#00FFA3' }}
+                  />
+                </LineChart>
+              </ResponsiveContainer>
+            </div>
+          </div>
+
+          <div className="mt-auto pt-6 grid grid-cols-2 gap-[1px] bg-trading-border border border-trading-border">
+            {[
+              { label: 'Win Rate', val: '72.4%', color: 'text-trading-text' },
+              { label: 'Trades/24h', val: '1,402', color: 'text-trading-text' },
+              { label: 'Profit/Day', val: '+0.84%', color: 'text-trading-up' },
+              { label: 'Drawdown', val: '-0.12%', color: 'text-trading-down' }
+            ].map(stat => (
+              <div key={stat.label} className="bg-trading-bg p-3 text-center">
+                <div className="text-[9px] text-trading-muted uppercase">{stat.label}</div>
+                <div className={cn("text-sm font-bold mt-1", stat.color)}>{stat.val}</div>
+              </div>
+            ))}
+          </div>
+        </aside>
+
+        {/* Middle Column: Scanner Grid */}
+        <section className="bg-trading-panel p-5 flex flex-col overflow-y-auto overflow-x-hidden">
+          <div className="flex items-center gap-3 text-[10px] uppercase text-trading-muted tracking-[2px] mb-4 after:content-[''] after:flex-1 after:h-[1px] after:bg-trading-border after:ml-3">
+            Active Multi-Asset Scanner
+          </div>
+          
+          <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-3">
+            {scanResults.map((coin) => (
+              <motion.div 
+                key={coin.symbol}
+                initial={{ opacity: 0, scale: 0.95 }}
+                animate={{ opacity: 1, scale: 1 }}
+                className="bg-trading-card border border-trading-border p-4 rounded relative overflow-hidden group"
+              >
+                {/* Accent Top Bar */}
+                <div className={cn(
+                  "absolute top-0 left-0 w-full h-[2px] opacity-50",
+                  coin.rsi < 30 ? "bg-trading-up" : coin.rsi > 70 ? "bg-trading-down" : "bg-trading-accent"
+                )} />
+                
+                <div className="flex justify-between items-start mb-2">
+                  <div>
+                    <div className="text-[11px] font-bold text-trading-muted">{coin.symbol}</div>
+                    <div className="text-xl font-bold mt-1">${coin.price.toLocaleString()}</div>
+                  </div>
+                  <div className="text-right">
+                    <div className={cn("text-[10px] font-bold", coin.action === 'BUY' ? 'text-trading-up' : coin.action === 'SELL' ? 'text-trading-down' : 'text-trading-muted')}>
+                      {coin.price > 60000 ? '+1.2%' : '-0.5%'}
+                    </div>
+                    <div className="text-[9px] text-trading-muted">VOL: 2.1B</div>
+                  </div>
+                </div>
+
+                <div className="flex gap-2 mt-4">
+                  <div className="bg-trading-bg px-1.5 py-0.5 rounded text-[10px] text-trading-muted font-bold">RSI: {coin.rsi.toFixed(1)}</div>
+                  <div className={cn(
+                    "px-1.5 py-0.5 rounded text-[10px] font-bold uppercase",
+                    coin.action === 'BUY' ? "bg-trading-up/10 text-trading-up" : coin.action === 'SELL' ? "bg-trading-down/10 text-trading-down" : "bg-trading-muted/10 text-trading-muted"
+                  )}>
+                    {coin.action}
+                  </div>
+                  <div className="ml-auto flex gap-1">
+                    <button 
+                      onClick={() => setExpandedCard(expandedCard === coin.symbol ? null : coin.symbol)}
+                      className={cn(
+                        "p-1.5 rounded transition-colors text-[10px] font-bold uppercase flex items-center gap-1",
+                        expandedCard === coin.symbol ? "bg-trading-accent text-trading-bg" : "bg-trading-bg text-trading-muted hover:text-white"
+                      )}
+                    >
+                      <Info className="w-3.5 h-3.5" />
+                      {expandedCard === coin.symbol ? "Hide" : "Details"}
+                    </button>
+                    <button 
+                      onClick={() => getAiConfirmation(coin.symbol, coin)}
+                      disabled={loadingAi === coin.symbol}
+                      className="p-1.5 bg-trading-bg rounded text-trading-accent hover:text-white transition-colors disabled:opacity-50"
+                    >
+                      <Activity className="w-3.5 h-3.5" />
+                    </button>
+                  </div>
+                </div>
+
+                <AnimatePresence>
+                  {expandedCard === coin.symbol && (
+                    <motion.div 
+                      initial={{ height: 0, opacity: 0 }}
+                      animate={{ height: 'auto', opacity: 1 }}
+                      exit={{ height: 0, opacity: 0 }}
+                      className="overflow-hidden"
+                    >
+                      <div className="pt-4 mt-4 border-t border-trading-border space-y-3">
+                        <div className="grid grid-cols-2 gap-2">
+                          <div className="bg-trading-bg/40 p-2 rounded">
+                            <div className="text-[8px] text-trading-muted uppercase mb-1">Momentum (1m)</div>
+                            <div className={cn("text-[11px] font-bold", coin.action === 'BUY' ? 'text-trading-up' : 'text-trading-down')}>
+                              {coin.action === 'BUY' ? 'Bullish Engulfing' : coin.action === 'SELL' ? 'Bearish Pressure' : 'Neutral Consolidation'}
+                            </div>
+                          </div>
+                          <div className="bg-trading-bg/40 p-2 rounded">
+                            <div className="text-[8px] text-trading-muted uppercase mb-1">Slippage Est.</div>
+                            <div className="text-[11px] font-bold">0.02%</div>
+                          </div>
+                        </div>
+
+                        <div className="space-y-1.5">
+                          <div className="flex justify-between text-[9px] uppercase font-bold text-trading-muted">
+                            <span>Volatility Index</span>
+                            <span className="text-trading-text">Low</span>
+                          </div>
+                          <div className="h-1 bg-trading-bg rounded-full overflow-hidden">
+                            <div className="h-full bg-trading-accent w-1/4" />
+                          </div>
+                        </div>
+
+                        <div className="flex flex-wrap gap-1">
+                          {['EMA20', 'BBWIDTH', 'VOL_PROFILE'].map(tag => (
+                            <span key={tag} className="text-[8px] px-1.5 py-0.5 bg-trading-bg border border-trading-border rounded text-trading-muted font-mono">{tag}</span>
+                          ))}
+                        </div>
+                      </div>
+                    </motion.div>
+                  )}
+                </AnimatePresence>
+              </motion.div>
+            ))}
+          </div>
+
+          <div className="mt-auto bg-trading-accent/5 p-4 rounded border border-trading-border border-dashed flex gap-4 items-start">
+            <div className="p-2 bg-trading-accent/10 rounded">
+              <Bot className="w-5 h-5 text-trading-accent" />
+            </div>
+            <div>
+              <div className="text-[12px] text-trading-accent font-bold mb-1 uppercase tracking-wider">Bot Insight: Market Anomaly Detected</div>
+              <div className="text-[11px] text-trading-muted leading-relaxed">
+                BTC/USDT showing oversold divergence on 1m timeframe. Volume profiles suggest liquidity sweep. Neural confirmation pending.
+              </div>
+            </div>
+          </div>
+        </section>
+
+        {/* Right Column: AI Analysis & Logs */}
+        <aside className="bg-trading-bg p-5 flex flex-col overflow-y-auto">
+          <div className="flex items-center justify-between gap-3 mb-4">
+            <div className="flex items-center gap-3 text-[10px] uppercase text-trading-muted tracking-[2px] after:content-[''] after:w-8 after:h-[1px] after:bg-trading-border after:ml-3">
+              Neural Insight
+            </div>
+            <button 
+              onClick={() => setAiConfirmations({})} 
+              className="text-[9px] text-trading-muted hover:text-trading-accent transition-colors uppercase font-bold tracking-widest"
+            >
+              Clear
+            </button>
+          </div>
+          
+          <div className="space-y-3 mb-6">
+            <AnimatePresence mode="popLayout">
+              {loadingAi && (
+                <motion.div 
+                  initial={{ opacity: 0, y: -10 }}
+                  animate={{ opacity: 1, y: 0 }}
+                  className="p-3 bg-trading-accent/5 border border-trading-accent/30 border-dashed rounded flex gap-3 items-center"
+                >
+                  <div className="w-3 h-3 border-2 border-trading-accent/30 border-t-trading-accent rounded-full animate-spin" />
+                  <div className="text-[10px] font-bold text-trading-accent uppercase animate-pulse">Analyzing {loadingAi}...</div>
+                </motion.div>
+              )}
+              {Object.entries(aiConfirmations).map(([symbol, result]) => {
+                const res = result as AIResult;
+                const isBuy = res.verdict.toUpperCase().includes('BUY');
+                const isSell = res.verdict.toUpperCase().includes('SELL');
+                
+                return (
+                  <motion.div 
+                    key={symbol}
+                    initial={{ opacity: 0, x: 20 }}
+                    animate={{ opacity: 1, x: 0 }}
+                    exit={{ opacity: 0, scale: 0.9 }}
+                    className="p-4 bg-trading-card border border-trading-border rounded relative overflow-hidden shadow-xl"
+                  >
+                    {/* Background Glow */}
+                    <div className={cn(
+                      "absolute -right-4 -top-4 w-12 h-12 blur-2xl opacity-10 rounded-full",
+                      isBuy ? "bg-trading-up" : isSell ? "bg-trading-down" : "bg-trading-accent"
+                    )} />
+
+                    <div className="flex justify-between items-center mb-2">
+                      <div className="flex items-center gap-2">
+                        <div className={cn(
+                          "w-1.5 h-1.5 rounded-full",
+                          isBuy ? "bg-trading-up shadow-[0_0_8px_var(--color-trading-up)]" : 
+                          isSell ? "bg-trading-down shadow-[0_0_8px_var(--color-trading-down)]" : 
+                          "bg-trading-muted"
+                        )} />
+                        <span className="font-bold text-[11px] tracking-tight">{symbol}</span>
+                      </div>
+                      <span className="text-[9px] font-mono font-bold text-trading-accent px-1.5 py-0.5 bg-trading-accent/10 rounded">
+                        {res.confidence}% CONFIDENCE
+                      </span>
+                    </div>
+
+                    <div className={cn(
+                      "text-[12px] font-black mb-1.5 uppercase tracking-wider",
+                      isBuy ? "text-trading-up" : isSell ? "text-trading-down" : "text-trading-muted"
+                    )}>
+                      VERDICT: {res.verdict}
+                    </div>
+
+                    <div className="relative">
+                      <div className="absolute left-0 top-0 bottom-0 w-[1px] bg-trading-border" />
+                      <p className="text-[10px] text-trading-muted italic leading-relaxed pl-3 py-1">
+                        "{res.reason}"
+                      </p>
+                    </div>
+                  </motion.div>
+                );
+              })}
+            </AnimatePresence>
+            {Object.keys(aiConfirmations).length === 0 && !loadingAi && (
+              <div className="text-center py-12 opacity-30 border border-trading-border border-dashed rounded">
+                <Bot className="w-8 h-8 mx-auto mb-3 opacity-20" />
+                <div className="text-[9px] uppercase tracking-widest leading-relaxed">Neural Core Idle<br/>Await Confirmation Request</div>
+              </div>
+            )}
+          </div>
+
+          <div className="flex items-center gap-3 text-[10px] uppercase text-trading-muted tracking-[2px] mb-4 after:content-[''] after:flex-1 after:h-[1px] after:bg-trading-border after:ml-3">
+            Execution Log
+          </div>
+          <div className="flex-1 space-y-1.5 overflow-y-auto mb-6">
+            {logs.map((log) => (
+              <div key={log.id} className="text-[9px] flex justify-between border-b border-trading-border/50 pb-1 font-medium">
+                <span className="text-trading-muted">{log.time.split(' ')[0]}</span>
+                <span className={cn(
+                  "uppercase",
+                  log.type === 'error' && "text-trading-down",
+                  log.type === 'success' && "text-trading-up",
+                  log.type === 'ai' && "text-trading-accent"
+                )}>
+                  {log.msg.length > 25 ? log.msg.slice(0, 25) + '...' : log.msg}
+                </span>
+              </div>
+            ))}
+          </div>
+
+          <div className="space-y-4 pt-4 border-t border-trading-border">
+            <div className="flex justify-between items-center">
+              <div className="text-[10px] text-trading-muted uppercase tracking-widest font-bold">Auto-Trade Override</div>
+              <div 
+                onClick={() => {
+                  setIsAutoPilot(!isAutoPilot);
+                  addLog(`Auto-trade ${!isAutoPilot ? 'ENABLED' : 'DISABLED'}`, !isAutoPilot ? 'success' : 'warning');
+                }}
+                className={cn(
+                  "w-8 h-4 rounded-full transition-all relative cursor-pointer",
+                  isAutoPilot ? "bg-trading-up" : "bg-trading-border"
+                )}
+              >
+                <div className={cn(
+                  "absolute top-0.5 left-0.5 w-3 h-3 bg-white rounded-full transition-transform",
+                  isAutoPilot && "translate-x-4"
+                )} />
+              </div>
+            </div>
+            <button 
+              onClick={() => {
+                setIsAutoPilot(!isAutoPilot);
+                addLog(`Manual Override: ${!isAutoPilot ? 'EXECUTION START' : 'EMERGENCY KILL'}`, !isAutoPilot ? 'success' : 'error');
+              }}
+              className={cn(
+                "w-full py-3 rounded text-[11px] font-black uppercase tracking-widest transition-all",
+                isAutoPilot 
+                  ? "bg-trading-down text-white shadow-[0_0_20px_rgba(255,59,105,0.2)]" 
+                  : "bg-trading-accent text-trading-bg"
+              )}
+            >
+              {isAutoPilot ? "Emergency Kill" : "Initialize Trade"}
+            </button>
+          </div>
+        </aside>
+
+      </main>
+
+      <AnimatePresence>
+        {isHistoryOpen && (
+          <div className="fixed inset-0 z-[100] flex items-center justify-center p-4 md:p-10">
+            <motion.div 
+              initial={{ opacity: 0 }}
+              animate={{ opacity: 1 }}
+              exit={{ opacity: 0 }}
+              onClick={() => setIsHistoryOpen(false)}
+              className="absolute inset-0 bg-trading-bg/90 backdrop-blur-sm"
+            />
+            <motion.div 
+              initial={{ opacity: 0, scale: 0.95, y: 20 }}
+              animate={{ opacity: 1, scale: 1, y: 0 }}
+              exit={{ opacity: 0, scale: 0.95, y: 20 }}
+              className="relative w-full max-w-4xl max-h-[80vh] bg-trading-card border border-trading-border rounded-lg shadow-2xl flex flex-col overflow-hidden"
+            >
+              <div className="p-6 border-b border-trading-border flex items-center justify-between">
+                <div className="flex items-center gap-3">
+                  <History className="w-5 h-5 text-trading-accent" />
+                  <h2 className="text-sm font-bold uppercase tracking-[2px]">Detailed Execution History</h2>
+                </div>
+                <button 
+                  onClick={() => setIsHistoryOpen(false)}
+                  className="p-2 hover:bg-trading-border rounded transition-colors text-trading-muted hover:text-white"
+                >
+                  <X className="w-5 h-5" />
+                </button>
+              </div>
+              
+              <div className="flex-1 overflow-auto">
+                <table className="w-full text-left text-[11px]">
+                  <thead className="sticky top-0 bg-trading-card border-b border-trading-border">
+                    <tr className="text-trading-muted uppercase tracking-wider">
+                      <th className="px-6 py-4 font-medium">Asset</th>
+                      <th className="px-6 py-4 font-medium">Strategy</th>
+                      <th className="px-6 py-4 font-medium">Entry</th>
+                      <th className="px-6 py-4 font-medium">Exit</th>
+                      <th className="px-6 py-4 font-medium">PnL</th>
+                      <th className="px-6 py-4 font-medium text-right">Timestamp</th>
+                    </tr>
+                  </thead>
+                  <tbody className="divide-y divide-trading-border">
+                    {tradeHistory.map((trade) => (
+                      <tr key={trade.id} className="hover:bg-white/[0.02] transition-colors">
+                        <td className="px-6 py-4 font-bold">{trade.symbol}</td>
+                        <td className="px-6 py-4 text-trading-muted">{trade.strategy}</td>
+                        <td className="px-6 py-4 font-mono">${trade.entry.toLocaleString()}</td>
+                        <td className="px-6 py-4 font-mono">${trade.exit.toLocaleString()}</td>
+                        <td className={cn(
+                          "px-6 py-4 font-bold font-mono",
+                          trade.pnl >= 0 ? "text-trading-up" : "text-trading-down"
+                        )}>
+                          {trade.pnl >= 0 ? '+' : ''}{trade.pnl.toFixed(2)} USDT
+                        </td>
+                        <td className="px-6 py-4 text-right text-trading-muted font-mono">{trade.time}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+              <div className="p-4 bg-trading-bg/50 border-t border-trading-border text-[10px] text-trading-muted text-center italic">
+                Showing last {tradeHistory.length} verified executions from Binance API stream.
+              </div>
+            </motion.div>
+          </div>
+        )}
+      </AnimatePresence>
+    </div>
+  );
+}

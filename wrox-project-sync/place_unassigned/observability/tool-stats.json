@@ -1,0 +1,21 @@
+{
+  "version": 2,
+  "lastUpdated": "2026-05-16T11:51:58.727Z",
+  "totalSessions": 1,
+  "totalCalls": 0,
+  "totalSuccessCalls": 0,
+  "totalFailedCalls": 0,
+  "tools": {},
+  "tierSummary": {
+    "basic": {
+      "totalCalls": 0,
+      "successCount": 0,
+      "failureCount": 0
+    },
+    "pro": {
+      "totalCalls": 0,
+      "successCount": 0,
+      "failureCount": 0
+    }
+  }
+}

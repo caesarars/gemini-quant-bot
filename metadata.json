@@ -1,0 +1,8 @@
+{
+  "name": "Gemini Quant Bot",
+  "description": "AI-powered Binance trading bot with multi-crypto scanning and Gemini-confirmed scalping strategies.",
+  "requestFramePermissions": [],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}
