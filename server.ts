@@ -196,6 +196,8 @@ const runScanner = async () => {
         await saveOHLCV(symbol, ohlcv);
 
         // Auto-execute: only if autopilot on, signal is actionable, and no recent open trade
+        console.log(`[SCAN] ${symbol} → action:${signal.action} rsi:${signal.rsi} autoPilot:${isAutoPilot}`);
+
         if (isAutoPilot && signal.action !== "HOLD") {
           const recent = await pool.query(
             `SELECT id FROM trades
@@ -204,29 +206,35 @@ const runScanner = async () => {
              LIMIT 1`,
             [symbol]
           );
-          if (recent.rows.length === 0) {
+
+          if (recent.rows.length > 0) {
+            console.log(`[AUTO] ${symbol} skipped — open trade exists within 5 min`);
+          } else {
             const cfgRow = await pool.query("SELECT leverage FROM bot_settings WHERE id = 'bot_config'");
             const leverage = cfgRow.rows[0]?.leverage || 10;
             const side = signal.action === "BUY" ? "buy" : "sell";
+            const hasKeys = !!(process.env.BINANCE_API_KEY && process.env.BINANCE_SECRET_KEY);
 
-            // Place real futures market order if API keys are configured
-            if (process.env.BINANCE_API_KEY && process.env.BINANCE_SECRET_KEY) {
+            console.log(`[AUTO] Executing ${signal.action} ${symbol} x${leverage} | hasKeys:${hasKeys}`);
+
+            if (hasKeys) {
               try {
                 await binance.setLeverage(leverage, symbol);
                 await binance.createOrder(symbol, "market", side, 0.001);
-                console.log(`[AUTO-FUTURES] Real order: ${signal.action} ${symbol} x${leverage} @ ${signal.price}`);
+                console.log(`[AUTO-FUTURES] ✓ Real order placed: ${signal.action} ${symbol} x${leverage} @ ${signal.price}`);
               } catch (e: any) {
-                console.error(`[AUTO-FUTURES] Order failed [${symbol}]:`, e?.message);
+                console.error(`[AUTO-FUTURES] ✗ Order failed [${symbol}]:`, e?.message);
               }
+            } else {
+              console.log(`[AUTO] No API keys — recorded to DB only`);
             }
 
-            // Always record to DB regardless of real order success
             await pool.query(
               `INSERT INTO trades (symbol, type, entry_price, amount, strategy, status, leverage)
                VALUES ($1, $2, $3, 0.001, 'AUTO-FUTURES', 'OPEN', $4)`,
               [symbol, signal.action, signal.price, leverage]
             );
-            console.log(`[AUTO] ${signal.action} ${symbol} @ ${signal.price} | RSI:${signal.rsi} MACD:${signal.macd?.histogram} Lev:${leverage}x`);
+            console.log(`[AUTO] DB recorded: ${signal.action} ${symbol} @ ${signal.price}`);
           }
         }
       } catch (e: any) {
@@ -404,8 +412,7 @@ app.get("/api/balance", async (req, res) => {
       });
     }
     const balance = await binance.fetchBalance({ type: "future" });
-    // Futures wallet: available margin in USDT
-    const usdt = balance.USDT ?? balance.total?.USDT ?? 0;
+    const usdt = parseFloat(String(balance.total?.USDT ?? 0));
     res.json({ total: { USDT: usdt }, status: "live", type: "futures" });
   } catch (err: any) {
     console.error("Balance Error:", err);
