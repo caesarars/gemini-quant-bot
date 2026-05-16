@@ -50,6 +50,8 @@ async function runMigrations() {
   await pool.query(`ALTER TABLE bot_settings ADD COLUMN IF NOT EXISTS active_strategy   VARCHAR(30)  DEFAULT 'ULTRA-SCALP'`);
   await pool.query(`ALTER TABLE bot_settings ADD COLUMN IF NOT EXISTS arb_sl_mult      NUMERIC(5,2) DEFAULT 1.0`);
   await pool.query(`ALTER TABLE bot_settings ADD COLUMN IF NOT EXISTS arb_tp_mult      NUMERIC(5,2) DEFAULT 3.0`);
+  await pool.query(`ALTER TABLE bot_settings ADD COLUMN IF NOT EXISTS active_strategies TEXT[]       DEFAULT '{ULTRA-SCALP,MOMENTUM-ARB}'`);
+  await pool.query(`ALTER TABLE trades ADD COLUMN IF NOT EXISTS fee_usdt NUMERIC(20,8) DEFAULT 0`);
 }
 
 // ── Exchange ───────────────────────────────────────────────────────────────────
@@ -239,8 +241,8 @@ const momentumBuffer = new Map<string, number[][]>(SYMBOLS.map(s => [s, []]));
 const trendBuffer    = new Map<string, number[][]>(SYMBOLS.map(s => [s, []]));
 
 let scanResults: any[] = [];
-// Cached active strategy to avoid DB read on every candle
-let activeStrategy = "ULTRA-SCALP";
+// Set of currently enabled strategies — both active by default
+let activeStrategies = new Set<string>(["ULTRA-SCALP", "MOMENTUM-ARB"]);
 
 // ── Trend Filter (EMA 200 on 15m) ─────────────────────────────────────────────
 
@@ -308,13 +310,24 @@ async function checkAutoExecute(symbol: string, signal: AnySignal, strategyName:
   console.log(`[AUTO] ${signal.action} ${symbol} x${leverage} ATR:${signal.atrPct?.toFixed(3)}% amount:${amount}`);
 
   let fillPrice = signal.price;
+  // Binance USDM futures taker rate: 0.04% — used as fallback when fee not in API response
+  const TAKER_RATE = 0.0004;
+  let feeUsdt = parseFloat((fillPrice * amount * TAKER_RATE).toFixed(6));
 
   if (hasKeys) {
     try {
       await binance.setLeverage(leverage, symbol);
       const order = await binance.createOrder(symbol, "market", side, amount);
-      fillPrice   = parseFloat(String((order as any).average || (order as any).price || signal.price));
-      console.log(`[AUTO-FUTURES] ✓ ${signal.action} ${symbol} x${leverage} fill:${fillPrice}`);
+      fillPrice = parseFloat(String((order as any).average || (order as any).price || signal.price));
+      // Prefer actual fee from API; ccxt normalises to USDT for same-currency fees
+      const orderFee = (order as any).fee;
+      if (orderFee?.cost && orderFee?.currency === "USDT") {
+        feeUsdt = parseFloat(Math.abs(orderFee.cost).toFixed(6));
+      } else {
+        // Fallback: estimate from fill price (covers BNB-fee case where ccxt doesn't convert)
+        feeUsdt = parseFloat((fillPrice * amount * TAKER_RATE).toFixed(6));
+      }
+      console.log(`[AUTO-FUTURES] ✓ ${signal.action} ${symbol} x${leverage} fill:${fillPrice} fee:${feeUsdt} USDT`);
     } catch (e: any) {
       console.error(`[AUTO-FUTURES] ✗ Market order failed [${symbol}]:`, e?.message);
       return; // abort — don't record a trade that didn't execute
@@ -358,17 +371,17 @@ async function checkAutoExecute(symbol: string, signal: AnySignal, strategyName:
   }
 
   await pool.query(
-    `INSERT INTO trades (symbol, type, entry_price, amount, strategy, status, leverage)
-     VALUES ($1, $2, $3, $4, $5, 'OPEN', $6)`,
-    [symbol, signal.action, fillPrice, amount, strategyName, leverage]
+    `INSERT INTO trades (symbol, type, entry_price, amount, strategy, status, leverage, fee_usdt)
+     VALUES ($1, $2, $3, $4, $5, 'OPEN', $6, $7)`,
+    [symbol, signal.action, fillPrice, amount, strategyName, leverage, feeUsdt]
   );
-  console.log(`[AUTO] DB recorded: ${signal.action} ${symbol} @ ${fillPrice} [${strategyName}]`);
+  console.log(`[AUTO] DB recorded: ${signal.action} ${symbol} @ ${fillPrice} fee:${feeUsdt} USDT [${strategyName}]`);
 }
 
 // ── WebSocket — Binance Futures Kline Stream ───────────────────────────────────
 
 async function seedCandleBuffer() {
-  console.log(`[SEED] Fetching 1m + 5m + 15m candles (strategy: ${activeStrategy})...`);
+  console.log(`[SEED] Fetching 1m + 5m + 15m candles (active: ${[...activeStrategies].join(", ")})...`);
   await Promise.all(SYMBOLS.map(async symbol => {
     try {
       // 1m — ULTRA-SCALP signal indicators
@@ -388,19 +401,20 @@ async function seedCandleBuffer() {
       trendBuffer.set(symbol, buf15m);
       await saveOHLCV(symbol, buf15m, "15m");
 
-      // Build initial scanResult based on active strategy
-      const trend = getTrend(symbol);
-      let entry: any;
-      if (activeStrategy === "MOMENTUM-ARB") {
-        const signal = calculateMomentumSignal(buf5m);
-        entry = { symbol, ...signal, trend, strategyName: "MOMENTUM-ARB" };
-      } else {
-        const signal = calculateSignal(buf1m);
-        entry = { symbol, ...signal, trend, strategyName: "ULTRA-SCALP" };
-      }
+      // Build initial scanResult for BOTH strategies simultaneously
+      const trend  = getTrend(symbol);
+      const sig1m  = calculateSignal(buf1m);
+      const sig5m  = calculateMomentumSignal(buf5m);
+      const entry  = {
+        symbol,
+        price:       sig1m.price || sig5m.price,
+        trend,
+        ultraScalp:  { action: sig1m.action, rsi: sig1m.rsi, volumeRatio: sig1m.volumeRatio, atrPct: sig1m.atrPct },
+        momentumArb: { action: sig5m.action, rsi: sig5m.rsi, volumeRatio: sig5m.volumeRatio, atrPct: sig5m.atrPct, cross: sig5m.cross },
+      };
       const idx = scanResults.findIndex(r => r.symbol === symbol);
       if (idx >= 0) scanResults[idx] = entry; else scanResults.push(entry);
-      console.log(`[SEED] ${symbol} → ${entry.action} RSI:${entry.rsi?.toFixed(1)} trend:${trend}`);
+      console.log(`[SEED] ${symbol} US:${sig1m.action} MA:${sig5m.action} trend:${trend}`);
     } catch (e: any) {
       console.error(`[SEED] ${symbol}:`, e?.message);
     }
@@ -440,7 +454,7 @@ function initWebSocket() {
         return;
       }
 
-      // ── 5m: MOMENTUM ARB ──
+      // ── 5m: MOMENTUM ARB — always compute, gate only auto-execute ──
       if (k.i === "5m") {
         const buf5 = momentumBuffer.get(symbol) || [];
         if (k.x) {
@@ -448,26 +462,29 @@ function initWebSocket() {
           if (buf5.length > 50) buf5.shift();
           momentumBuffer.set(symbol, buf5);
 
-          if (activeStrategy === "MOMENTUM-ARB" && buf5.length >= 22) {
+          if (buf5.length >= 22) {
             const signal = calculateMomentumSignal(buf5);
             const trend  = getTrend(symbol);
             const idx    = scanResults.findIndex(r => r.symbol === symbol);
-            const entry  = { symbol, ...signal, trend, strategyName: "MOMENTUM-ARB" };
+            const entry  = scanResults[idx] || { symbol, price: signal.price, trend };
+            entry.trend       = trend;
+            entry.price       = signal.price;
+            entry.momentumArb = { action: signal.action, rsi: signal.rsi, volumeRatio: signal.volumeRatio, atrPct: signal.atrPct, cross: signal.cross };
             if (idx >= 0) scanResults[idx] = entry; else scanResults.push(entry);
-            await checkAutoExecute(symbol, signal, "MOMENTUM-ARB");
+            if (activeStrategies.has("MOMENTUM-ARB")) {
+              await checkAutoExecute(symbol, signal, "MOMENTUM-ARB");
+            }
           }
         } else {
           if (buf5.length > 0) buf5[buf5.length - 1] = candle;
           momentumBuffer.set(symbol, buf5);
-          if (activeStrategy === "MOMENTUM-ARB") {
-            const idx = scanResults.findIndex(r => r.symbol === symbol);
-            if (idx >= 0) scanResults[idx] = { ...scanResults[idx], price: +k.c };
-          }
+          const idx = scanResults.findIndex(r => r.symbol === symbol);
+          if (idx >= 0) scanResults[idx] = { ...scanResults[idx], price: +k.c };
         }
         return;
       }
 
-      // ── 1m: ULTRA-SCALP ──
+      // ── 1m: ULTRA-SCALP — always compute, gate only auto-execute ──
       const buffer = candleBuffer.get(symbol) || [];
       if (k.x) {
         buffer.push(candle);
@@ -475,19 +492,22 @@ function initWebSocket() {
         candleBuffer.set(symbol, buffer);
         await saveOHLCV(symbol, [candle]);
 
-        if (activeStrategy === "ULTRA-SCALP" && buffer.length >= 26) {
+        if (buffer.length >= 26) {
           const signal = calculateSignal(buffer);
           const trend  = getTrend(symbol);
           const idx    = scanResults.findIndex(r => r.symbol === symbol);
-          const entry  = { symbol, ...signal, trend, strategyName: "ULTRA-SCALP" };
+          const entry  = scanResults[idx] || { symbol, price: signal.price, trend };
+          entry.trend     = trend;
+          entry.price     = signal.price;
+          entry.ultraScalp = { action: signal.action, rsi: signal.rsi, volumeRatio: signal.volumeRatio, atrPct: signal.atrPct };
           if (idx >= 0) scanResults[idx] = entry; else scanResults.push(entry);
-          await checkAutoExecute(symbol, signal, "ULTRA-SCALP");
+          if (activeStrategies.has("ULTRA-SCALP")) {
+            await checkAutoExecute(symbol, signal, "ULTRA-SCALP");
+          }
         }
       } else {
-        if (activeStrategy === "ULTRA-SCALP") {
-          const idx = scanResults.findIndex(r => r.symbol === symbol);
-          if (idx >= 0) scanResults[idx] = { ...scanResults[idx], price: +k.c };
-        }
+        const idx = scanResults.findIndex(r => r.symbol === symbol);
+        if (idx >= 0) scanResults[idx] = { ...scanResults[idx], price: +k.c };
       }
     } catch (e: any) {
       console.error("[WS] Message error:", e?.message);
@@ -627,7 +647,7 @@ app.get("/api/scan", (req, res) => res.json({ results: scanResults, timestamp: D
 app.get("/api/open-positions", async (_req, res) => {
   try {
     const result = await pool.query(
-      `SELECT id, symbol, type, entry_price::float, amount::float, leverage,
+      `SELECT id, symbol, type, entry_price::float, amount::float, leverage, fee_usdt::float,
               TO_CHAR(timestamp AT TIME ZONE 'UTC', 'HH24:MI:SS') AS opened_at
        FROM trades WHERE status = 'OPEN' ORDER BY timestamp DESC`
     );
@@ -635,14 +655,17 @@ app.get("/api/open-positions", async (_req, res) => {
       const live         = scanResults.find(r => r.symbol === trade.symbol);
       const currentPrice = live?.price ?? trade.entry_price;
       const isLong       = trade.type === "BUY";
-      const pnlUSDT      = (isLong ? currentPrice - trade.entry_price : trade.entry_price - currentPrice) * trade.amount;
+      const grossPnl     = (isLong ? currentPrice - trade.entry_price : trade.entry_price - currentPrice) * trade.amount;
       const pnlPct       = ((isLong ? currentPrice - trade.entry_price : trade.entry_price - currentPrice) / trade.entry_price) * 100;
+      const feeUsdt      = trade.fee_usdt ?? 0;
       return {
         ...trade,
         side:          isLong ? "LONG" : "SHORT",
         current_price: parseFloat(currentPrice.toFixed(4)),
-        pnl_usdt:      parseFloat(pnlUSDT.toFixed(4)),
+        pnl_usdt:      parseFloat(grossPnl.toFixed(4)),
+        net_pnl_usdt:  parseFloat((grossPnl - feeUsdt).toFixed(4)),
         pnl_pct:       parseFloat(pnlPct.toFixed(3)),
+        fee_usdt:      parseFloat(feeUsdt.toFixed(6)),
       };
     });
     res.json({ positions, last_sync: lastSyncAt });
@@ -671,7 +694,8 @@ app.get("/api/settings", async (req, res) => {
 
 app.post("/api/settings", async (req, res) => {
   const { isAutoPilot, riskLevel, maxSlippage, takeProfitPct, stopLossPct, leverage,
-          atrSlMult, atrTpMult, arbSlMult, arbTpMult, activeStrategyVal } = req.body;
+          atrSlMult, atrTpMult, arbSlMult, arbTpMult, activeStrategiesVal } = req.body;
+  const strategiesParam = Array.isArray(activeStrategiesVal) ? activeStrategiesVal : null;
   try {
     const r = await pool.query(
       `UPDATE bot_settings
@@ -685,37 +709,17 @@ app.post("/api/settings", async (req, res) => {
            atr_tp_mult      = COALESCE($8,  atr_tp_mult),
            arb_sl_mult      = COALESCE($9,  arb_sl_mult),
            arb_tp_mult      = COALESCE($10, arb_tp_mult),
-           active_strategy  = COALESCE($11, active_strategy)
+           active_strategies = COALESCE($11, active_strategies)
        WHERE id = 'bot_config' RETURNING *`,
       [isAutoPilot ?? null, riskLevel ?? null, maxSlippage ?? null,
        takeProfitPct ?? null, stopLossPct ?? null, leverage ?? null,
        atrSlMult ?? null, atrTpMult ?? null, arbSlMult ?? null, arbTpMult ?? null,
-       activeStrategyVal ?? null]
+       strategiesParam]
     );
-    // Sync in-memory cache so WebSocket handlers react immediately
-    if (activeStrategyVal) {
-      activeStrategy = activeStrategyVal;
-      // Rebuild scanResults for the new strategy
-      for (const symbol of SYMBOLS) {
-        const trend = getTrend(symbol);
-        const idx   = scanResults.findIndex(s => s.symbol === symbol);
-        if (activeStrategy === "MOMENTUM-ARB") {
-          const buf5 = momentumBuffer.get(symbol) || [];
-          if (buf5.length >= 22) {
-            const sig = calculateMomentumSignal(buf5);
-            const entry = { symbol, ...sig, trend, strategyName: "MOMENTUM-ARB" };
-            if (idx >= 0) scanResults[idx] = entry; else scanResults.push(entry);
-          }
-        } else {
-          const buf1 = candleBuffer.get(symbol) || [];
-          if (buf1.length >= 26) {
-            const sig = calculateSignal(buf1);
-            const entry = { symbol, ...sig, trend, strategyName: "ULTRA-SCALP" };
-            if (idx >= 0) scanResults[idx] = entry; else scanResults.push(entry);
-          }
-        }
-      }
-      console.log(`[STRATEGY] Switched to ${activeStrategy}`);
+    // Sync in-memory Set so WebSocket handlers react immediately
+    if (strategiesParam) {
+      activeStrategies = new Set(strategiesParam);
+      console.log(`[STRATEGY] Active: ${[...activeStrategies].join(", ")}`);
     }
     res.json(r.rows[0]);
   } catch { res.status(500).json({ error: "Failed to update settings" }); }
@@ -763,7 +767,7 @@ app.get("/api/trade-history", async (req, res) => {
   try {
     const r = await pool.query(
       `SELECT id, symbol, entry_price::float AS entry, exit_price::float AS exit,
-              pnl::float, strategy,
+              pnl::float, fee_usdt::float AS fee, strategy,
               TO_CHAR(timestamp AT TIME ZONE 'UTC','HH24:MI:SS') AS time
        FROM trades ORDER BY timestamp DESC LIMIT 50`
     );
@@ -990,10 +994,10 @@ async function startServer() {
   await runMigrations();
   console.log("Migrations applied");
 
-  // Load persisted active strategy before seeding
-  const stRow = await pool.query("SELECT active_strategy FROM bot_settings WHERE id = 'bot_config'");
-  activeStrategy = stRow.rows[0]?.active_strategy || "ULTRA-SCALP";
-  console.log(`Active strategy: ${activeStrategy}`);
+  // Load persisted active strategies before seeding
+  const stRow = await pool.query("SELECT active_strategies FROM bot_settings WHERE id = 'bot_config'");
+  activeStrategies = new Set(stRow.rows[0]?.active_strategies || ["ULTRA-SCALP", "MOMENTUM-ARB"]);
+  console.log(`Active strategies: ${[...activeStrategies].join(", ")}`);
 
   await binance.loadMarkets();
   console.log("Markets loaded");
