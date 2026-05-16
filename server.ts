@@ -1,7 +1,7 @@
 import express from "express";
 import path from "path";
 import { createServer as createViteServer } from "vite";
-import { GoogleGenAI } from "@google/genai";
+// DeepSeek replaces Gemini — OpenAI-compatible API, free tier is much more generous
 import ccxt from "ccxt";
 import * as dotenv from "dotenv";
 import { Pool } from "pg";
@@ -50,10 +50,26 @@ async function runMigrations() {
 
 // ── AI & Exchange ─────────────────────────────────────────────────────────────
 
-const ai = new GoogleGenAI({
-  apiKey: process.env.GEMINI_API_KEY || "",
-  httpOptions: { headers: { "User-Agent": "aistudio-build" } },
-});
+// DeepSeek AI helper — OpenAI-compatible endpoint, generous free tier
+async function callDeepSeek(prompt: string): Promise<string> {
+  const apiKey = process.env.DEEPSEEK_API_KEY;
+  if (!apiKey) return "WAIT|0|DeepSeek API key not configured";
+  const res = await fetch("https://api.deepseek.com/v1/chat/completions", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "Authorization": `Bearer ${apiKey}`,
+    },
+    body: JSON.stringify({
+      model: "deepseek-chat",
+      messages: [{ role: "user", content: prompt }],
+      max_tokens: 120,
+      temperature: 0.3,
+    }),
+  });
+  const data = await res.json() as any;
+  return data.choices?.[0]?.message?.content?.trim() || "WAIT|0|No response";
+}
 
 // USDT-M Perpetual Futures — public OHLCV works without keys
 const binance = new ccxt.binanceusdm({
@@ -215,12 +231,17 @@ const runScanner = async () => {
             const side = signal.action === "BUY" ? "buy" : "sell";
             const hasKeys = !!(process.env.BINANCE_API_KEY && process.env.BINANCE_SECRET_KEY);
 
-            console.log(`[AUTO] Executing ${signal.action} ${symbol} x${leverage} | hasKeys:${hasKeys}`);
+            // Calculate amount so notional ≥ $25 (safe above Binance $20 minimum)
+            const targetNotional = 25;
+            const rawAmount = targetNotional / signal.price;
+            const amount = parseFloat((binance as any).amountToPrecision(symbol, rawAmount));
+
+            console.log(`[AUTO] Executing ${signal.action} ${symbol} x${leverage} amount:${amount} notional:~$${(amount * signal.price).toFixed(2)} | hasKeys:${hasKeys}`);
 
             if (hasKeys) {
               try {
                 await binance.setLeverage(leverage, symbol);
-                await binance.createOrder(symbol, "market", side, 0.001);
+                await binance.createOrder(symbol, "market", side, amount);
                 console.log(`[AUTO-FUTURES] ✓ Real order placed: ${signal.action} ${symbol} x${leverage} @ ${signal.price}`);
               } catch (e: any) {
                 console.error(`[AUTO-FUTURES] ✗ Order failed [${symbol}]:`, e?.message);
@@ -231,8 +252,8 @@ const runScanner = async () => {
 
             await pool.query(
               `INSERT INTO trades (symbol, type, entry_price, amount, strategy, status, leverage)
-               VALUES ($1, $2, $3, 0.001, 'AUTO-FUTURES', 'OPEN', $4)`,
-              [symbol, signal.action, signal.price, leverage]
+               VALUES ($1, $2, $3, $4, 'AUTO-FUTURES', 'OPEN', $5)`,
+              [symbol, signal.action, signal.price, amount, leverage]
             );
             console.log(`[AUTO] DB recorded: ${signal.action} ${symbol} @ ${signal.price}`);
           }
@@ -385,11 +406,10 @@ app.post("/api/execute", async (req, res) => {
 app.post("/api/ai-confirm", async (req, res) => {
   const { symbol, data } = req.body;
   try {
-    const prompt = `Analyze this crypto market data for ${symbol}: ${JSON.stringify(data)}.
+    const prompt = `Analyze this crypto futures market data for ${symbol}: ${JSON.stringify(data)}.
     Give a short technical verdict: BUY, SELL, or WAIT. Include a confidence score (0-100) and 1 reason.
-    Format: VERDICT|CONFIDENCE|REASON`;
-    const response = await ai.models.generateContent({ model: "gemini-2.0-flash", contents: prompt });
-    const text = response.text || "WAIT|0|Unknown error";
+    Reply in this exact format only: VERDICT|CONFIDENCE|REASON`;
+    const text = await callDeepSeek(prompt);
     const [verdict, confidence, reason] = text.split("|");
     res.json({
       verdict: verdict?.trim() || "WAIT",
@@ -397,7 +417,7 @@ app.post("/api/ai-confirm", async (req, res) => {
       reason: reason?.trim() || "No detailed reason provided",
     });
   } catch (error) {
-    console.error("Gemini Error:", error);
+    console.error("DeepSeek Error:", error);
     res.status(500).json({ error: "AI Confirmation Failed" });
   }
 });
@@ -445,6 +465,9 @@ async function startServer() {
 
   await runMigrations();
   console.log("Migrations applied");
+
+  await binance.loadMarkets();
+  console.log("Markets loaded");
 
   setInterval(runScanner, 30000);
   setInterval(takePnLSnapshot, 60 * 60 * 1000);
