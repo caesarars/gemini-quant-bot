@@ -43,6 +43,8 @@ async function runMigrations() {
   await pool.query(`ALTER TABLE bot_settings ADD COLUMN IF NOT EXISTS leverage       INTEGER       DEFAULT 10`);
   await pool.query(`ALTER TABLE bot_settings ADD COLUMN IF NOT EXISTS take_profit_pct NUMERIC(5,2) DEFAULT 1.5`);
   await pool.query(`ALTER TABLE bot_settings ADD COLUMN IF NOT EXISTS stop_loss_pct   NUMERIC(5,2) DEFAULT 0.8`);
+  await pool.query(`ALTER TABLE trades ADD COLUMN IF NOT EXISTS trailing_high NUMERIC(20,8)`);
+  await pool.query(`ALTER TABLE trades ADD COLUMN IF NOT EXISTS trailing_low  NUMERIC(20,8)`);
 }
 
 // ── Exchange ───────────────────────────────────────────────────────────────────
@@ -123,15 +125,23 @@ function calcBollingerBands(closes: number[], period = 20, mult = 2) {
   };
 }
 
+function calcVolumeRatio(ohlcv: number[], period = 20): number {
+  if (ohlcv.length < period + 1) return 1;
+  const avg = ohlcv.slice(-period - 1, -1).reduce((a, b) => a + b, 0) / period;
+  return avg > 0 ? ohlcv[ohlcv.length - 1] / avg : 1;
+}
+
 function calculateSignal(ohlcv: number[][]) {
-  if (!ohlcv || ohlcv.length < 26) return { action: "HOLD" as const, rsi: 50, price: 0, macd: null, bb: null, ema9: null, ema21: null };
-  const closes = ohlcv.map(c => c[4]);
-  const price  = closes[closes.length - 1];
-  const rsi    = parseFloat(calcRSI(closes).toFixed(2));
-  const macd   = calcMACD(closes);
-  const bb     = calcBollingerBands(closes);
-  const ema9   = parseFloat((calcEMA(closes, 9).at(-1)  || 0).toFixed(4));
-  const ema21  = parseFloat((calcEMA(closes, 21).at(-1) || 0).toFixed(4));
+  if (!ohlcv || ohlcv.length < 26) return { action: "HOLD" as const, rsi: 50, price: 0, macd: null, bb: null, ema9: null, ema21: null, volumeRatio: 1 };
+  const closes  = ohlcv.map(c => c[4]);
+  const volumes = ohlcv.map(c => c[5]);
+  const price   = closes[closes.length - 1];
+  const rsi     = parseFloat(calcRSI(closes).toFixed(2));
+  const macd    = calcMACD(closes);
+  const bb      = calcBollingerBands(closes);
+  const ema9    = parseFloat((calcEMA(closes, 9).at(-1)  || 0).toFixed(4));
+  const ema21   = parseFloat((calcEMA(closes, 21).at(-1) || 0).toFixed(4));
+  const volumeRatio = parseFloat(calcVolumeRatio(volumes).toFixed(2));
 
   let buyScore = 0, sellScore = 0;
   if (rsi < 35)                                          buyScore++;
@@ -144,19 +154,19 @@ function calculateSignal(ohlcv: number[][]) {
   if (ema9 < ema21)                                      sellScore++;
 
   const action = buyScore >= 2 ? "BUY" as const : sellScore >= 2 ? "SELL" as const : "HOLD" as const;
-  return { action, rsi, price, macd, bb, ema9, ema21 };
+  return { action, rsi, price, macd, bb, ema9, ema21, volumeRatio };
 }
 
 // ── OHLCV Persistence ──────────────────────────────────────────────────────────
 
-async function saveOHLCV(symbol: string, candles: number[][]) {
+async function saveOHLCV(symbol: string, candles: number[][], timeframe = "1m") {
   if (!candles.length) return;
   await pool.query(
     `INSERT INTO ohlcv (symbol, timeframe, timestamp, open, high, low, close, volume)
-     SELECT $1, '1m', unnest($2::bigint[]), unnest($3::numeric[]), unnest($4::numeric[]),
-            unnest($5::numeric[]), unnest($6::numeric[]), unnest($7::numeric[])
+     SELECT $1, $2, unnest($3::bigint[]), unnest($4::numeric[]), unnest($5::numeric[]),
+            unnest($6::numeric[]), unnest($7::numeric[]), unnest($8::numeric[])
      ON CONFLICT (symbol, timeframe, timestamp) DO NOTHING`,
-    [symbol,
+    [symbol, timeframe,
      candles.map(c => c[0]), candles.map(c => c[1]), candles.map(c => c[2]),
      candles.map(c => c[3]), candles.map(c => c[4]), candles.map(c => c[5])]
   );
@@ -168,9 +178,28 @@ const SYMBOLS   = ["BTC/USDT", "ETH/USDT", "SOL/USDT", "DOGE/USDT", "BNB/USDT"];
 const toWsSym   = (s: string) => s.replace("/", "").toLowerCase();    // BTC/USDT → btcusdt
 const toCcxtSym = (s: string) => s.slice(0, -4) + "/" + s.slice(-4); // BTCUSDT → BTC/USDT
 
-// Rolling 50-candle buffer per symbol, updated by WebSocket
+// Rolling 50-candle buffer per symbol (1m), updated by WebSocket
 const candleBuffer = new Map<string, number[][]>(SYMBOLS.map(s => [s, []]));
+
+// 200-candle buffer (15m) for trend filter — EMA200 direction
+const trendBuffer = new Map<string, number[][]>(SYMBOLS.map(s => [s, []]));
+
 let scanResults: any[] = [];
+
+// ── Trend Filter (EMA 200 on 15m) ─────────────────────────────────────────────
+
+function getTrend(symbol: string): "UP" | "DOWN" | "NEUTRAL" {
+  const buf = trendBuffer.get(symbol) || [];
+  if (buf.length < 200) return "NEUTRAL";
+  const closes  = buf.map(c => c[4]);
+  const ema200  = calcEMA(closes, 200);
+  const lastEma = ema200[ema200.length - 1];
+  const lastPrice = closes[closes.length - 1];
+  if (isNaN(lastEma) || lastEma === 0) return "NEUTRAL";
+  if (lastPrice > lastEma * 1.001) return "UP";    // price > EMA200 + 0.1% buffer
+  if (lastPrice < lastEma * 0.999) return "DOWN";  // price < EMA200 - 0.1% buffer
+  return "NEUTRAL";
+}
 
 // ── Auto-Execute ───────────────────────────────────────────────────────────────
 
@@ -178,8 +207,22 @@ async function checkAutoExecute(symbol: string, signal: ReturnType<typeof calcul
   const settingsRow = await pool.query("SELECT is_auto_pilot FROM bot_settings WHERE id = 'bot_config'");
   const isAutoPilot = settingsRow.rows[0]?.is_auto_pilot || false;
 
-  console.log(`[SIGNAL] ${symbol} → ${signal.action} RSI:${signal.rsi} autoPilot:${isAutoPilot}`);
+  const trend = getTrend(symbol);
+  console.log(`[SIGNAL] ${symbol} → ${signal.action} RSI:${signal.rsi} trend:${trend} autoPilot:${isAutoPilot}`);
+
   if (!isAutoPilot || signal.action === "HOLD") return;
+
+  // Block if trade direction opposes higher-timeframe trend
+  if (signal.action === "BUY"  && trend === "DOWN") { console.log(`[TREND] ${symbol} BUY blocked — 15m trend is DOWN`);    return; }
+  if (signal.action === "SELL" && trend === "UP")   { console.log(`[TREND] ${symbol} SELL blocked — 15m trend is UP`);      return; }
+  if (trend === "NEUTRAL")                           { console.log(`[TREND] ${symbol} blocked — no clear 15m trend`);        return; }
+
+  // Block if volume is below 1.5× 20-period average (thin candle = likely false signal)
+  const volRatio = signal.volumeRatio ?? 1;
+  if (volRatio < 1.5) {
+    console.log(`[VOL] ${symbol} blocked — volumeRatio ${volRatio}× < 1.5× (no volume spike)`);
+    return;
+  }
 
   const recent = await pool.query(
     `SELECT id FROM trades WHERE symbol = $1 AND status = 'OPEN'
@@ -209,8 +252,8 @@ async function checkAutoExecute(symbol: string, signal: ReturnType<typeof calcul
   }
 
   await pool.query(
-    `INSERT INTO trades (symbol, type, entry_price, amount, strategy, status, leverage)
-     VALUES ($1, $2, $3, $4, 'AUTO-FUTURES', 'OPEN', $5)`,
+    `INSERT INTO trades (symbol, type, entry_price, amount, strategy, status, leverage, trailing_high, trailing_low)
+     VALUES ($1, $2, $3, $4, 'AUTO-FUTURES', 'OPEN', $5, $3, $3)`,
     [symbol, signal.action, signal.price, amount, leverage]
   );
   console.log(`[AUTO] DB recorded: ${signal.action} ${symbol} @ ${signal.price}`);
@@ -219,30 +262,41 @@ async function checkAutoExecute(symbol: string, signal: ReturnType<typeof calcul
 // ── WebSocket — Binance Futures Kline Stream ───────────────────────────────────
 
 async function seedCandleBuffer() {
-  console.log("[SEED] Fetching initial candles via REST...");
-  for (const symbol of SYMBOLS) {
+  console.log("[SEED] Fetching initial 1m + 15m candles via REST...");
+  await Promise.all(SYMBOLS.map(async symbol => {
     try {
-      const ohlcv = await binance.fetchOHLCV(symbol, "1m", undefined, 50);
-      const buf   = ohlcv.map((c: any[]) => c.map(Number) as number[]);
-      candleBuffer.set(symbol, buf);
-      await saveOHLCV(symbol, buf);
-      const signal = calculateSignal(buf);
+      // 1m — signal indicators
+      const ohlcv1m = await binance.fetchOHLCV(symbol, "1m", undefined, 50);
+      const buf1m   = ohlcv1m.map((c: any[]) => c.map(Number) as number[]);
+      candleBuffer.set(symbol, buf1m);
+      await saveOHLCV(symbol, buf1m);
+
+      // 15m — trend filter (200 candles = ~50 hours)
+      const ohlcv15m = await binance.fetchOHLCV(symbol, "15m", undefined, 200);
+      const buf15m   = ohlcv15m.map((c: any[]) => c.map(Number) as number[]);
+      trendBuffer.set(symbol, buf15m);
+      await saveOHLCV(symbol, buf15m, "15m");
+
+      const signal = calculateSignal(buf1m);
+      const trend  = getTrend(symbol);
       const idx    = scanResults.findIndex(r => r.symbol === symbol);
-      const entry  = { symbol, ...signal };
+      const entry  = { symbol, ...signal, trend };
       if (idx >= 0) scanResults[idx] = entry; else scanResults.push(entry);
-      console.log(`[SEED] ${symbol} → ${signal.action} RSI:${signal.rsi}`);
+      console.log(`[SEED] ${symbol} → ${signal.action} RSI:${signal.rsi} trend:${trend}`);
     } catch (e: any) {
       console.error(`[SEED] ${symbol}:`, e?.message);
     }
-  }
+  }));
 }
 
 function initWebSocket() {
-  const streams = SYMBOLS.map(s => `${toWsSym(s)}@kline_1m`).join("/");
+  const streams1m  = SYMBOLS.map(s => `${toWsSym(s)}@kline_1m`);
+  const streams15m = SYMBOLS.map(s => `${toWsSym(s)}@kline_15m`);
+  const allStreams  = [...streams1m, ...streams15m].join("/");
   // fstream1.binance.com is the Asia-optimized endpoint (lower latency from Tokyo VPS)
-  const ws = new WebSocket(`wss://fstream1.binance.com/stream?streams=${streams}`);
+  const ws = new WebSocket(`wss://fstream1.binance.com/stream?streams=${allStreams}`);
 
-  ws.on("open", () => console.log("[WS] Connected to Binance Futures kline stream"));
+  ws.on("open", () => console.log("[WS] Connected to Binance Futures kline stream (1m + 15m)"));
 
   ws.on("message", async (raw: Buffer) => {
     try {
@@ -251,6 +305,25 @@ function initWebSocket() {
 
       const symbol = toCcxtSym(k.s);
       const candle: number[] = [k.t, +k.o, +k.h, +k.l, +k.c, +k.v];
+
+      if (k.i === "15m") {
+        // ── 15m candle: feed trendBuffer ──
+        if (k.x) {
+          const buf15 = trendBuffer.get(symbol) || [];
+          buf15.push(candle);
+          if (buf15.length > 200) buf15.shift();
+          trendBuffer.set(symbol, buf15);
+          await saveOHLCV(symbol, [candle], "15m");
+        } else {
+          // Update last live candle for more responsive trend reads
+          const buf15 = trendBuffer.get(symbol) || [];
+          if (buf15.length > 0) buf15[buf15.length - 1] = candle;
+          trendBuffer.set(symbol, buf15);
+        }
+        return;
+      }
+
+      // ── 1m candle ──
       const buffer = candleBuffer.get(symbol) || [];
 
       if (k.x) {
@@ -262,8 +335,9 @@ function initWebSocket() {
 
         if (buffer.length >= 26) {
           const signal = calculateSignal(buffer);
+          const trend  = getTrend(symbol);
           const idx    = scanResults.findIndex(r => r.symbol === symbol);
-          const entry  = { symbol, ...signal };
+          const entry  = { symbol, ...signal, trend };
           if (idx >= 0) scanResults[idx] = entry; else scanResults.push(entry);
           await checkAutoExecute(symbol, signal);
         }
@@ -290,7 +364,8 @@ function initWebSocket() {
 const runTradeMonitor = async () => {
   try {
     const openTrades = await pool.query(
-      `SELECT id, symbol, type, entry_price::float, amount::float, leverage
+      `SELECT id, symbol, type, entry_price::float, amount::float, leverage,
+              trailing_high::float, trailing_low::float
        FROM trades WHERE status = 'OPEN'`
     );
     if (openTrades.rows.length === 0) return;
@@ -305,17 +380,41 @@ const runTradeMonitor = async () => {
         const ticker       = await binance.fetchTicker(trade.symbol);
         const currentPrice = ticker.last as number;
         const isLong       = trade.type === "BUY";
-        const pnlPct       = isLong ? (currentPrice - trade.entry_price) / trade.entry_price
-                                    : (trade.entry_price - currentPrice) / trade.entry_price;
-        const hitTP = pnlPct >=  tpPct;
-        const hitSL = pnlPct <= -slPct;
+
+        // ── Update trailing reference ──
+        let trailingRef: number;
+        if (isLong) {
+          const newHigh = Math.max(trade.trailing_high ?? trade.entry_price, currentPrice);
+          if (newHigh > (trade.trailing_high ?? trade.entry_price)) {
+            await pool.query(`UPDATE trades SET trailing_high = $1 WHERE id = $2`, [newHigh, trade.id]);
+            trade.trailing_high = newHigh;
+          }
+          trailingRef = trade.trailing_high ?? trade.entry_price;
+        } else {
+          const newLow = Math.min(trade.trailing_low ?? trade.entry_price, currentPrice);
+          if (newLow < (trade.trailing_low ?? trade.entry_price)) {
+            await pool.query(`UPDATE trades SET trailing_low = $1 WHERE id = $2`, [newLow, trade.id]);
+            trade.trailing_low = newLow;
+          }
+          trailingRef = trade.trailing_low ?? trade.entry_price;
+        }
+
+        // TP: fixed % against entry_price
+        const pnlPctTP = isLong ? (currentPrice - trade.entry_price) / trade.entry_price
+                                : (trade.entry_price - currentPrice) / trade.entry_price;
+        // TSL: falls slPct% from the trailing high/low
+        const pnlPctSL = isLong ? (currentPrice - trailingRef) / trailingRef
+                                : (trailingRef - currentPrice) / trailingRef;
+
+        const hitTP = pnlPctTP >= tpPct;
+        const hitSL = pnlPctSL <= -slPct;
         if (!hitTP && !hitSL) continue;
 
-        const reason    = hitTP ? "TP" : "SL";
+        const reason    = hitTP ? "TP" : "TSL";
         const closeSide = isLong ? "sell" : "buy";
         const pnlUSDT   = (isLong ? currentPrice - trade.entry_price : trade.entry_price - currentPrice) * trade.amount;
 
-        console.log(`[${reason}] ${trade.symbol} pnl:${(pnlPct*100).toFixed(3)}% → ${pnlUSDT.toFixed(2)} USDT`);
+        console.log(`[${reason}] ${trade.symbol} trailRef:${trailingRef.toFixed(2)} pnlTP:${(pnlPctTP*100).toFixed(3)}% pnlSL:${(pnlPctSL*100).toFixed(3)}% → ${pnlUSDT.toFixed(2)} USDT`);
 
         if (hasKeys) {
           try {
@@ -565,6 +664,162 @@ app.get("/api/check-api", async (req, res) => {
     return res.json({ connected: false, reason: "Keys not found" });
   try { await binance.fetchBalance(); res.json({ connected: true }); }
   catch (e: any) { res.json({ connected: false, reason: e.message }); }
+});
+
+// ── Backtest Engine ────────────────────────────────────────────────────────────
+
+function resampleTo15m(candles1m: number[][]): number[][] {
+  const buckets = new Map<number, number[][]>();
+  for (const c of candles1m) {
+    const key = Math.floor(c[0] / (15 * 60 * 1000)) * 15 * 60 * 1000;
+    if (!buckets.has(key)) buckets.set(key, []);
+    buckets.get(key)!.push(c);
+  }
+  return Array.from(buckets.entries())
+    .sort((a, b) => a[0] - b[0])
+    .map(([ts, group]) => [
+      ts,
+      group[0][1],                               // open  = first 1m open
+      Math.max(...group.map(c => c[2])),          // high  = max
+      Math.min(...group.map(c => c[3])),          // low   = min
+      group[group.length - 1][4],                 // close = last 1m close
+      group.reduce((s, c) => s + c[5], 0),        // vol   = sum
+    ]);
+}
+
+app.get("/api/backtest", async (req, res) => {
+  const symbol = (req.query.symbol as string) || "BTC/USDT";
+  const days   = Math.min(parseInt((req.query.days as string) || "7"), 30);
+
+  try {
+    const since = Date.now() - days * 24 * 60 * 60 * 1000;
+    const raw   = await pool.query(
+      `SELECT timestamp, open::float, high::float, low::float, close::float, volume::float
+       FROM ohlcv WHERE symbol = $1 AND timeframe = '1m' AND timestamp >= $2
+       ORDER BY timestamp ASC`,
+      [symbol, since]
+    );
+    const candles1m: number[][] = raw.rows.map((r: any) =>
+      [r.timestamp, r.open, r.high, r.low, r.close, r.volume]
+    );
+    if (candles1m.length < 60) {
+      return res.json({ error: "Not enough 1m data in DB yet. Let the bot run for a while first.", candles: candles1m.length });
+    }
+
+    const cfg   = await pool.query(`SELECT take_profit_pct::float, stop_loss_pct::float FROM bot_settings WHERE id = 'bot_config'`);
+    const tpPct = (cfg.rows[0]?.take_profit_pct ?? 1.5) / 100;
+    const slPct = (cfg.rows[0]?.stop_loss_pct   ?? 0.8) / 100;
+
+    // Build 15m trend lookup: ts15m → EMA200 value
+    const candles15m = resampleTo15m(candles1m);
+    const closes15m  = candles15m.map(c => c[4]);
+    const ema200arr  = calcEMA(closes15m, 200);
+    const trendAt15m: Array<{ ts: number; ema: number; price: number }> = candles15m.map((c, i) => ({
+      ts: c[0], ema: ema200arr[i], price: c[4],
+    }));
+
+    function getTrendAtTime(ts: number): "UP" | "DOWN" | "NEUTRAL" {
+      let idx = -1;
+      for (let i = trendAt15m.length - 1; i >= 0; i--) {
+        if (trendAt15m[i].ts <= ts) { idx = i; break; }
+      }
+      if (idx < 0) return "NEUTRAL";
+      const { ema, price } = trendAt15m[idx];
+      if (isNaN(ema) || ema === 0) return "NEUTRAL";
+      if (price > ema * 1.001) return "UP";
+      if (price < ema * 0.999) return "DOWN";
+      return "NEUTRAL";
+    }
+
+    interface BtTrade {
+      type: string; entry: number; exit: number;
+      pnlPct: number; reason: string;
+      entryTs: number; exitTs: number; holdMinutes: number;
+    }
+
+    const trades: BtTrade[] = [];
+    let position: { type: string; entry: number; trailingHigh: number; trailingLow: number; entryTs: number } | null = null;
+    const WINDOW = 50;
+
+    for (let i = WINDOW; i < candles1m.length; i++) {
+      const window = candles1m.slice(i - WINDOW, i + 1);
+      const signal = calculateSignal(window);
+      const currentPrice = candles1m[i][4];
+
+      // ── Manage open position ──
+      if (position) {
+        const isLong = position.type === "BUY";
+
+        if (isLong) position.trailingHigh = Math.max(position.trailingHigh, currentPrice);
+        else         position.trailingLow  = Math.min(position.trailingLow, currentPrice);
+
+        const pnlTP = isLong ? (currentPrice - position.entry) / position.entry
+                             : (position.entry - currentPrice) / position.entry;
+        const trailRef = isLong ? position.trailingHigh : position.trailingLow;
+        const pnlSL = isLong ? (currentPrice - trailRef) / trailRef
+                             : (trailRef - currentPrice) / trailRef;
+
+        if (pnlTP >= tpPct || pnlSL <= -slPct) {
+          const reason = pnlTP >= tpPct ? "TP" : "TSL";
+          const realPnl = isLong ? (currentPrice - position.entry) / position.entry * 100
+                                 : (position.entry - currentPrice) / position.entry * 100;
+          trades.push({
+            type: position.type, entry: position.entry, exit: currentPrice,
+            pnlPct: parseFloat(realPnl.toFixed(3)), reason,
+            entryTs: position.entryTs, exitTs: candles1m[i][0],
+            holdMinutes: Math.round((candles1m[i][0] - position.entryTs) / 60000),
+          });
+          position = null;
+        }
+      }
+
+      // ── Open new position ──
+      if (!position && signal.action !== "HOLD") {
+        const trend  = getTrendAtTime(candles1m[i][0]);
+        const volOk  = (signal.volumeRatio ?? 1) >= 1.5;
+        const trendOk = (signal.action === "BUY" && trend === "UP") ||
+                        (signal.action === "SELL" && trend === "DOWN");
+        if (volOk && trendOk) {
+          position = {
+            type: signal.action, entry: currentPrice,
+            trailingHigh: currentPrice, trailingLow: currentPrice,
+            entryTs: candles1m[i][0],
+          };
+        }
+      }
+    }
+
+    const wins     = trades.filter(t => t.pnlPct > 0);
+    const losses   = trades.filter(t => t.pnlPct <= 0);
+    const totalPnl = parseFloat(trades.reduce((s, t) => s + t.pnlPct, 0).toFixed(3));
+    const winRate  = trades.length > 0 ? parseFloat((wins.length / trades.length * 100).toFixed(1)) : 0;
+    const avgWin   = wins.length  > 0 ? parseFloat((wins.reduce((s,t) => s + t.pnlPct, 0) / wins.length).toFixed(3)) : 0;
+    const avgLoss  = losses.length > 0 ? parseFloat((losses.reduce((s,t) => s + t.pnlPct, 0) / losses.length).toFixed(3)) : 0;
+
+    // Max drawdown: max cumulative PnL drop from a peak
+    let peak = 0, cumPnl = 0, maxDD = 0;
+    for (const t of trades) {
+      cumPnl += t.pnlPct;
+      if (cumPnl > peak) peak = cumPnl;
+      const dd = peak - cumPnl;
+      if (dd > maxDD) maxDD = dd;
+    }
+
+    res.json({
+      symbol, days,
+      stats: {
+        total: trades.length, wins: wins.length, losses: losses.length,
+        winRate, totalPnlPct: totalPnl,
+        avgWinPct: avgWin, avgLossPct: avgLoss,
+        maxDrawdownPct: parseFloat(maxDD.toFixed(3)),
+        candles: candles1m.length,
+      },
+      trades: trades.slice(-100),  // last 100 trades max
+    });
+  } catch (err: any) {
+    console.error("[BACKTEST] Error:", err?.message);
+    res.status(500).json({ error: err?.message });
+  }
 });
 
 // ── Startup ────────────────────────────────────────────────────────────────────

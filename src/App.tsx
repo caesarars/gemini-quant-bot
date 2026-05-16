@@ -31,6 +31,8 @@ interface ScanResult {
   action: 'BUY' | 'SELL' | 'HOLD';
   rsi: number;
   price: number;
+  trend?: 'UP' | 'DOWN' | 'NEUTRAL';
+  volumeRatio?: number;
   reason?: string;
 }
 
@@ -69,6 +71,22 @@ export default function App() {
   const [aiConfirmations, setAiConfirmations] = useState<Record<string, AIResult>>({});
   const [loadingAi, setLoadingAi] = useState<string | null>(null);
   const [expandedCard, setExpandedCard] = useState<string | null>(null);
+  const [isBacktestOpen, setIsBacktestOpen]   = useState(false);
+  const [btSymbol, setBtSymbol]               = useState("BTC/USDT");
+  const [btDays, setBtDays]                   = useState(7);
+  const [btLoading, setBtLoading]             = useState(false);
+  const [btResult, setBtResult]               = useState<any>(null);
+
+  const runBacktest = async () => {
+    setBtLoading(true);
+    setBtResult(null);
+    try {
+      const r = await fetch(`/api/backtest?symbol=${encodeURIComponent(btSymbol)}&days=${btDays}`);
+      const d = await r.json();
+      setBtResult(d);
+    } catch { setBtResult({ error: "Request failed" }); }
+    setBtLoading(false);
+  };
 
   const addLog = (msg: string, type: string = "info") => {
     const log = {
@@ -196,6 +214,13 @@ export default function App() {
             <History className="w-4 h-4 text-trading-accent" />
             <span className="text-[10px] font-bold uppercase tracking-widest">History</span>
           </button>
+          <button
+            onClick={() => setIsBacktestOpen(true)}
+            className="flex items-center gap-2 p-2 px-3 bg-trading-card border border-trading-border rounded hover:border-trading-muted transition-colors"
+          >
+            <LineChartIcon className="w-4 h-4 text-trading-accent" />
+            <span className="text-[10px] font-bold uppercase tracking-widest">Backtest</span>
+          </button>
         </div>
       </header>
 
@@ -307,7 +332,7 @@ export default function App() {
                   </div>
                 </div>
 
-                <div className="flex gap-2 mt-4">
+                <div className="flex gap-2 mt-4 flex-wrap">
                   <div className="bg-trading-bg px-1.5 py-0.5 rounded text-[10px] text-trading-muted font-bold">RSI: {coin.rsi.toFixed(1)}</div>
                   <div className={cn(
                     "px-1.5 py-0.5 rounded text-[10px] font-bold uppercase",
@@ -315,6 +340,26 @@ export default function App() {
                   )}>
                     {coin.action}
                   </div>
+                  {coin.trend && (
+                    <div className={cn(
+                      "px-1.5 py-0.5 rounded text-[10px] font-bold uppercase flex items-center gap-0.5",
+                      coin.trend === 'UP'      ? "bg-trading-up/10 text-trading-up"
+                    : coin.trend === 'DOWN'    ? "bg-trading-down/10 text-trading-down"
+                    :                            "bg-trading-muted/10 text-trading-muted"
+                    )}>
+                      {coin.trend === 'UP' ? '↑' : coin.trend === 'DOWN' ? '↓' : '—'} {coin.trend}
+                    </div>
+                  )}
+                  {coin.volumeRatio !== undefined && (
+                    <div className={cn(
+                      "px-1.5 py-0.5 rounded text-[10px] font-bold",
+                      coin.volumeRatio >= 2.0 ? "bg-trading-up/20 text-trading-up"
+                    : coin.volumeRatio >= 1.5 ? "bg-trading-accent/20 text-trading-accent"
+                    :                            "bg-trading-muted/10 text-trading-muted"
+                    )}>
+                      VOL {coin.volumeRatio.toFixed(1)}×
+                    </div>
+                  )}
                   <div className="ml-auto flex gap-1">
                     <button 
                       onClick={() => setExpandedCard(expandedCard === coin.symbol ? null : coin.symbol)}
@@ -728,6 +773,143 @@ export default function App() {
               </div>
               <div className="p-4 bg-trading-bg/50 border-t border-trading-border text-[10px] text-trading-muted text-center italic">
                 Showing last {tradeHistory.length} verified executions from Binance API stream.
+              </div>
+            </motion.div>
+          </div>
+        )}
+      </AnimatePresence>
+
+      {/* ── Backtest Modal ── */}
+      <AnimatePresence>
+        {isBacktestOpen && (
+          <div className="fixed inset-0 z-[100] flex items-center justify-center p-4 md:p-10">
+            <motion.div
+              initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }}
+              className="absolute inset-0 bg-black/70 backdrop-blur-sm"
+              onClick={() => setIsBacktestOpen(false)}
+            />
+            <motion.div
+              initial={{ opacity: 0, scale: 0.95 }} animate={{ opacity: 1, scale: 1 }} exit={{ opacity: 0, scale: 0.95 }}
+              className="relative bg-trading-bg border border-trading-border rounded-xl w-full max-w-4xl max-h-[85vh] flex flex-col z-10 overflow-hidden"
+            >
+              {/* Header */}
+              <div className="flex items-center justify-between px-6 py-4 border-b border-trading-border shrink-0">
+                <div className="flex items-center gap-3">
+                  <LineChartIcon className="w-5 h-5 text-trading-accent" />
+                  <span className="font-black tracking-tight">BACKTEST ENGINE</span>
+                  <span className="text-[10px] text-trading-muted font-mono uppercase">Historical Strategy Simulation</span>
+                </div>
+                <button onClick={() => setIsBacktestOpen(false)} className="text-trading-muted hover:text-white transition-colors">
+                  <X className="w-5 h-5" />
+                </button>
+              </div>
+
+              {/* Controls */}
+              <div className="flex items-center gap-3 px-6 py-3 border-b border-trading-border bg-trading-card/30 shrink-0 flex-wrap">
+                <select
+                  value={btSymbol}
+                  onChange={e => setBtSymbol(e.target.value)}
+                  className="bg-trading-bg border border-trading-border rounded px-2 py-1.5 text-[11px] font-bold text-trading-text"
+                >
+                  {["BTC/USDT","ETH/USDT","SOL/USDT","DOGE/USDT","BNB/USDT"].map(s => (
+                    <option key={s} value={s}>{s}</option>
+                  ))}
+                </select>
+                <select
+                  value={btDays}
+                  onChange={e => setBtDays(parseInt(e.target.value))}
+                  className="bg-trading-bg border border-trading-border rounded px-2 py-1.5 text-[11px] font-bold text-trading-text"
+                >
+                  {[1,3,7,14,30].map(d => (
+                    <option key={d} value={d}>Last {d} day{d > 1 ? "s" : ""}</option>
+                  ))}
+                </select>
+                <button
+                  onClick={runBacktest}
+                  disabled={btLoading}
+                  className="px-4 py-1.5 bg-trading-accent text-trading-bg rounded text-[11px] font-black uppercase tracking-wider hover:bg-trading-accent/80 transition-colors disabled:opacity-50"
+                >
+                  {btLoading ? "Running..." : "Run Backtest"}
+                </button>
+                <span className="text-[10px] text-trading-muted">Uses real OHLCV from DB · Signal + Trend + Volume filters</span>
+              </div>
+
+              {/* Body */}
+              <div className="overflow-y-auto flex-1 p-6">
+                {!btResult && !btLoading && (
+                  <div className="text-center text-trading-muted text-[12px] mt-12">
+                    Select a symbol and period, then click Run Backtest.
+                    <div className="text-[10px] mt-2 text-trading-muted/60">Requires OHLCV data stored in DB — bot must have been running for the selected period.</div>
+                  </div>
+                )}
+                {btLoading && (
+                  <div className="text-center text-trading-accent text-[12px] mt-12 animate-pulse">Simulating strategy on historical data...</div>
+                )}
+                {btResult?.error && (
+                  <div className="text-center text-trading-down text-[12px] mt-12">{btResult.error}{btResult.candles != null && ` (${btResult.candles} candles found)`}</div>
+                )}
+                {btResult?.stats && (
+                  <div className="space-y-6">
+                    {/* Stats Grid */}
+                    <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
+                      {[
+                        { label: "Win Rate",     value: `${btResult.stats.winRate}%`,           color: btResult.stats.winRate >= 50 ? "text-trading-up" : "text-trading-down" },
+                        { label: "Total PnL",    value: `${btResult.stats.totalPnlPct > 0 ? "+" : ""}${btResult.stats.totalPnlPct}%`, color: btResult.stats.totalPnlPct >= 0 ? "text-trading-up" : "text-trading-down" },
+                        { label: "Total Trades", value: btResult.stats.total,                   color: "text-trading-text" },
+                        { label: "Max Drawdown", value: `-${btResult.stats.maxDrawdownPct}%`,   color: "text-trading-down" },
+                        { label: "Wins",         value: btResult.stats.wins,                    color: "text-trading-up" },
+                        { label: "Losses",       value: btResult.stats.losses,                  color: "text-trading-down" },
+                        { label: "Avg Win",      value: `+${btResult.stats.avgWinPct}%`,        color: "text-trading-up" },
+                        { label: "Avg Loss",     value: `${btResult.stats.avgLossPct}%`,        color: "text-trading-down" },
+                      ].map(s => (
+                        <div key={s.label} className="bg-trading-card border border-trading-border rounded p-3">
+                          <div className="text-[9px] text-trading-muted uppercase tracking-wider mb-1">{s.label}</div>
+                          <div className={cn("text-lg font-black", s.color)}>{s.value}</div>
+                        </div>
+                      ))}
+                    </div>
+
+                    {/* Trade Log */}
+                    {btResult.trades?.length > 0 && (
+                      <div>
+                        <div className="text-[10px] uppercase text-trading-muted tracking-wider mb-2">
+                          Simulated Trades (last {btResult.trades.length} · {btResult.stats.candles} candles · {btResult.days}d)
+                        </div>
+                        <div className="border border-trading-border rounded overflow-hidden">
+                          <table className="w-full text-[10px]">
+                            <thead>
+                              <tr className="border-b border-trading-border bg-trading-card/50">
+                                {["Time", "Type", "Entry", "Exit", "PnL%", "Reason", "Hold"].map(h => (
+                                  <th key={h} className="text-left px-3 py-2 text-trading-muted font-bold uppercase">{h}</th>
+                                ))}
+                              </tr>
+                            </thead>
+                            <tbody>
+                              {[...btResult.trades].reverse().map((t: any, i: number) => (
+                                <tr key={i} className="border-b border-trading-border/50 hover:bg-trading-card/30 transition-colors">
+                                  <td className="px-3 py-1.5 font-mono text-trading-muted">{new Date(t.entryTs).toLocaleTimeString()}</td>
+                                  <td className={cn("px-3 py-1.5 font-bold", t.type === "BUY" ? "text-trading-up" : "text-trading-down")}>{t.type === "BUY" ? "LONG" : "SHORT"}</td>
+                                  <td className="px-3 py-1.5 font-mono">{t.entry.toLocaleString()}</td>
+                                  <td className="px-3 py-1.5 font-mono">{t.exit.toLocaleString()}</td>
+                                  <td className={cn("px-3 py-1.5 font-black", t.pnlPct >= 0 ? "text-trading-up" : "text-trading-down")}>
+                                    {t.pnlPct >= 0 ? "+" : ""}{t.pnlPct}%
+                                  </td>
+                                  <td className={cn("px-3 py-1.5 font-bold text-[9px]", t.reason === "TP" ? "text-trading-up" : "text-orange-400")}>{t.reason}</td>
+                                  <td className="px-3 py-1.5 text-trading-muted">{t.holdMinutes}m</td>
+                                </tr>
+                              ))}
+                            </tbody>
+                          </table>
+                        </div>
+                      </div>
+                    )}
+                    {btResult.stats.total === 0 && (
+                      <div className="text-center text-trading-muted text-[11px] py-6">
+                        No trades fired in this period — signals + trend + volume filters may be too strict, or not enough data yet.
+                      </div>
+                    )}
+                  </div>
+                )}
               </div>
             </motion.div>
           </div>
