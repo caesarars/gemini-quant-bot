@@ -33,6 +33,7 @@ interface ScanResult {
   price: number;
   trend?: 'UP' | 'DOWN' | 'NEUTRAL';
   volumeRatio?: number;
+  atrPct?: number;
   reason?: string;
 }
 
@@ -67,7 +68,8 @@ export default function App() {
   const [lastSync, setLastSync] = useState<string | null>(null);
   const [isSyncing, setIsSyncing] = useState(false);
   const [logs, setLogs] = useState<{ id: string; msg: string; time: string; type: string }[]>([]);
-  const [isAutoPilot, setIsAutoPilot] = useState(false);
+  const [isAutoPilot, setIsAutoPilot]         = useState(false);
+  const [activeStrategy, setActiveStrategy]   = useState("ULTRA-SCALP");
   const [aiConfirmations, setAiConfirmations] = useState<Record<string, AIResult>>({});
   const [loadingAi, setLoadingAi] = useState<string | null>(null);
   const [expandedCard, setExpandedCard] = useState<string | null>(null);
@@ -106,9 +108,20 @@ export default function App() {
       .then((r) => r.json())
       .then((s) => {
         if (typeof s.is_auto_pilot === "boolean") setIsAutoPilot(s.is_auto_pilot);
+        if (s.active_strategy) setActiveStrategy(s.active_strategy);
       })
       .catch(() => {});
   }, []);
+
+  const switchStrategy = async (id: string) => {
+    setActiveStrategy(id);
+    await fetch("/api/settings", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ activeStrategyVal: id }),
+    });
+    addLog(`Strategy switched to ${id}`, "info");
+  };
 
   useEffect(() => {
     const fetchData = async () => {
@@ -233,22 +246,38 @@ export default function App() {
             Strategies
           </div>
           <div className="space-y-3">
-            {[
-              { name: 'ULTRA-SCALP v2.1', desc: 'High freq, 0.5% profit target', active: true },
-              { name: 'MOMENTUM ARB', desc: 'Inter-exchange spread capture', active: false },
-              { name: 'VOLATILITY CORE', desc: 'Standard Deviation ±3 triggers', active: false }
-            ].map(strat => (
-              <div 
-                key={strat.name}
-                className={cn(
-                  "p-3 rounded border transition-all cursor-pointer",
-                  strat.active ? "bg-trading-card border-trading-accent shadow-[0_0_15px_rgba(0,209,255,0.1)]" : "bg-trading-card/50 border-trading-border hover:border-trading-muted"
-                )}
-              >
-                <div className="text-[12px] font-bold mb-1">{strat.name}</div>
-                <div className="text-[10px] text-trading-muted leading-tight">{strat.desc}</div>
-              </div>
-            ))}
+            {([
+              { id: 'ULTRA-SCALP',   name: 'ULTRA-SCALP v2.1', desc: '1m · RSI+MACD+BB+EMA · Vol 1.5×',        available: true },
+              { id: 'MOMENTUM-ARB',  name: 'MOMENTUM ARB',      desc: '5m · EMA9/21 crossover · Vol 1.2×',     available: true },
+              { id: 'VOLATILITY-CORE', name: 'VOLATILITY CORE', desc: 'Coming soon — BB squeeze + ATR expansion', available: false },
+            ] as const).map(strat => {
+              const isActive = activeStrategy === strat.id;
+              return (
+                <div
+                  key={strat.id}
+                  onClick={() => strat.available && switchStrategy(strat.id)}
+                  className={cn(
+                    "p-3 rounded border transition-all",
+                    strat.available ? "cursor-pointer" : "cursor-not-allowed opacity-40",
+                    isActive
+                      ? "bg-trading-card border-trading-accent shadow-[0_0_15px_rgba(0,209,255,0.1)]"
+                      : strat.available
+                        ? "bg-trading-card/50 border-trading-border hover:border-trading-muted"
+                        : "bg-trading-card/30 border-trading-border"
+                  )}
+                >
+                  <div className="flex items-center justify-between mb-1">
+                    <div className="text-[12px] font-bold">{strat.name}</div>
+                    {isActive && (
+                      <span className="text-[8px] font-black uppercase tracking-wider text-trading-accent border border-trading-accent/40 px-1.5 py-0.5 rounded">
+                        ACTIVE
+                      </span>
+                    )}
+                  </div>
+                  <div className="text-[10px] text-trading-muted leading-tight">{strat.desc}</div>
+                </div>
+              );
+            })}
           </div>
 
           <div className="mt-8 flex-1 flex flex-col">
@@ -358,6 +387,16 @@ export default function App() {
                     :                            "bg-trading-muted/10 text-trading-muted"
                     )}>
                       VOL {coin.volumeRatio.toFixed(1)}×
+                    </div>
+                  )}
+                  {coin.atrPct !== undefined && coin.atrPct > 0 && (
+                    <div className={cn(
+                      "px-1.5 py-0.5 rounded text-[10px] font-bold",
+                      coin.atrPct >= 0.3 ? "bg-trading-down/10 text-trading-down"
+                    : coin.atrPct >= 0.15 ? "bg-orange-400/10 text-orange-400"
+                    :                        "bg-trading-muted/10 text-trading-muted"
+                    )}>
+                      ATR {coin.atrPct.toFixed(2)}%
                     </div>
                   )}
                   <div className="ml-auto flex gap-1">
@@ -811,7 +850,7 @@ export default function App() {
                   onChange={e => setBtSymbol(e.target.value)}
                   className="bg-trading-bg border border-trading-border rounded px-2 py-1.5 text-[11px] font-bold text-trading-text"
                 >
-                  {["BTC/USDT","ETH/USDT","SOL/USDT","DOGE/USDT","BNB/USDT"].map(s => (
+                  {["BTC/USDT","ETH/USDT","SOL/USDT","XRP/USDT","BNB/USDT","AVAX/USDT","ARB/USDT","OP/USDT"].map(s => (
                     <option key={s} value={s}>{s}</option>
                   ))}
                 </select>

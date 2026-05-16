@@ -31,7 +31,7 @@ CREATE TABLE IF NOT EXISTS bot_settings (
   leverage         INTEGER       DEFAULT 10,
   take_profit_pct  NUMERIC(5, 2) DEFAULT 1.5,
   stop_loss_pct    NUMERIC(5, 2) DEFAULT 0.8,
-  symbols          TEXT[]        DEFAULT '{BTC/USDT,ETH/USDT,SOL/USDT,DOGE/USDT,BNB/USDT}'
+  symbols          TEXT[]        DEFAULT '{BTC/USDT,ETH/USDT,SOL/USDT,XRP/USDT,BNB/USDT,AVAX/USDT,ARB/USDT,OP/USDT}'
 );
 
 CREATE TABLE IF NOT EXISTS ohlcv (
