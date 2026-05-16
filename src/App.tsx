@@ -1,17 +1,18 @@
 import { useState, useEffect } from "react";
-import { 
-  TrendingUp, 
-  TrendingDown, 
-  Activity, 
-  ShieldCheck, 
-  Bot, 
-  Settings, 
+import {
+  TrendingUp,
+  TrendingDown,
+  Activity,
+  ShieldCheck,
+  Bot,
+  Settings,
   History,
   Zap,
   Info,
   AlertTriangle,
   LineChart as LineChartIcon,
-  X
+  X,
+  BarChart2
 } from "lucide-react";
 import { motion, AnimatePresence } from "motion/react";
 import { cn } from "./lib/utils";
@@ -39,12 +40,30 @@ interface AIResult {
   reason: string;
 }
 
+interface OpenPosition {
+  id: string;
+  symbol: string;
+  type: string;
+  side: 'LONG' | 'SHORT';
+  entry_price: number;
+  current_price: number;
+  amount: number;
+  leverage: number;
+  pnl_usdt: number;
+  pnl_pct: number;
+  opened_at: string;
+}
+
 export default function App() {
   const [scanResults, setScanResults] = useState<ScanResult[]>([]);
   const [balance, setBalance] = useState<Record<string, number>>({});
   const [pnlData, setPnlData] = useState<any[]>([]);
   const [tradeHistory, setTradeHistory] = useState<any[]>([]);
   const [isHistoryOpen, setIsHistoryOpen] = useState(false);
+  const [isPositionsOpen, setIsPositionsOpen] = useState(false);
+  const [openPositions, setOpenPositions] = useState<OpenPosition[]>([]);
+  const [lastSync, setLastSync] = useState<string | null>(null);
+  const [isSyncing, setIsSyncing] = useState(false);
   const [logs, setLogs] = useState<{ id: string; msg: string; time: string; type: string }[]>([]);
   const [isAutoPilot, setIsAutoPilot] = useState(false);
   const [aiConfirmations, setAiConfirmations] = useState<Record<string, AIResult>>({});
@@ -97,6 +116,11 @@ export default function App() {
         const historyRes = await fetch("/api/trade-history");
         const historyData = await historyRes.json();
         setTradeHistory(historyData);
+
+        const posRes = await fetch("/api/open-positions");
+        const posData = await posRes.json();
+        setOpenPositions(posData.positions ?? []);
+        if (posData.last_sync) setLastSync(posData.last_sync);
       } catch (err) {
         console.error("Failed to fetch data", err);
       }
@@ -153,7 +177,19 @@ export default function App() {
           </div>
           <div className="text-trading-muted">LATENCY: <span className="text-trading-up">14ms</span></div>
           <div className="text-trading-muted">BAL: <span className="text-trading-text">{balance['USDT']?.toLocaleString() || '0.00'} USDT</span></div>
-          <button 
+          <button
+            onClick={() => setIsPositionsOpen(true)}
+            className="relative flex items-center gap-2 p-2 px-3 bg-trading-card border border-trading-border rounded hover:border-trading-muted transition-colors"
+          >
+            <BarChart2 className="w-4 h-4 text-trading-up" />
+            <span className="text-[10px] font-bold uppercase tracking-widest">Positions</span>
+            {openPositions.length > 0 && (
+              <span className="absolute -top-1.5 -right-1.5 w-4 h-4 bg-trading-up text-trading-bg text-[9px] font-black rounded-full flex items-center justify-center">
+                {openPositions.length}
+              </span>
+            )}
+          </button>
+          <button
             onClick={() => setIsHistoryOpen(true)}
             className="flex items-center gap-2 p-2 px-3 bg-trading-card border border-trading-border rounded hover:border-trading-muted transition-colors"
           >
@@ -504,6 +540,130 @@ export default function App() {
 
       </main>
 
+      {/* ── Open Positions Modal ── */}
+      <AnimatePresence>
+        {isPositionsOpen && (
+          <div className="fixed inset-0 z-[100] flex items-center justify-center p-4 md:p-10">
+            <motion.div
+              initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }}
+              onClick={() => setIsPositionsOpen(false)}
+              className="absolute inset-0 bg-trading-bg/90 backdrop-blur-sm"
+            />
+            <motion.div
+              initial={{ opacity: 0, scale: 0.95, y: 20 }}
+              animate={{ opacity: 1, scale: 1, y: 0 }}
+              exit={{ opacity: 0, scale: 0.95, y: 20 }}
+              className="relative w-full max-w-4xl max-h-[80vh] bg-trading-card border border-trading-border rounded-lg shadow-2xl flex flex-col overflow-hidden"
+            >
+              <div className="p-6 border-b border-trading-border flex items-center justify-between">
+                <div className="flex items-center gap-3">
+                  <BarChart2 className="w-5 h-5 text-trading-up" />
+                  <h2 className="text-sm font-bold uppercase tracking-[2px]">Open Positions</h2>
+                  <span className="text-[9px] px-2 py-0.5 bg-trading-up/10 text-trading-up border border-trading-up/30 rounded-full font-bold uppercase">
+                    {openPositions.length} Active
+                  </span>
+                </div>
+                <button onClick={() => setIsPositionsOpen(false)} className="p-2 hover:bg-trading-border rounded transition-colors text-trading-muted hover:text-white">
+                  <X className="w-5 h-5" />
+                </button>
+              </div>
+
+              <div className="flex-1 overflow-auto">
+                {openPositions.length === 0 ? (
+                  <div className="flex flex-col items-center justify-center h-48 opacity-30">
+                    <BarChart2 className="w-8 h-8 mb-3" />
+                    <div className="text-[10px] uppercase tracking-widest">No open positions</div>
+                  </div>
+                ) : (
+                  <table className="w-full text-left text-[11px]">
+                    <thead className="sticky top-0 bg-trading-card border-b border-trading-border">
+                      <tr className="text-trading-muted uppercase tracking-wider">
+                        <th className="px-6 py-4 font-medium">Symbol</th>
+                        <th className="px-6 py-4 font-medium">Side</th>
+                        <th className="px-6 py-4 font-medium">Entry</th>
+                        <th className="px-6 py-4 font-medium">Current</th>
+                        <th className="px-6 py-4 font-medium">Amount</th>
+                        <th className="px-6 py-4 font-medium">Leverage</th>
+                        <th className="px-6 py-4 font-medium">Unrealized PnL</th>
+                        <th className="px-6 py-4 font-medium text-right">Opened</th>
+                      </tr>
+                    </thead>
+                    <tbody className="divide-y divide-trading-border">
+                      {openPositions.map(pos => (
+                        <tr key={pos.id} className="hover:bg-white/[0.02] transition-colors">
+                          <td className="px-6 py-4 font-bold">{pos.symbol}</td>
+                          <td className="px-6 py-4">
+                            <span className={cn(
+                              "px-2 py-0.5 rounded text-[9px] font-black uppercase",
+                              pos.side === 'LONG' ? "bg-trading-up/10 text-trading-up" : "bg-trading-down/10 text-trading-down"
+                            )}>
+                              {pos.side}
+                            </span>
+                          </td>
+                          <td className="px-6 py-4 font-mono">${pos.entry_price.toLocaleString()}</td>
+                          <td className="px-6 py-4 font-mono">${pos.current_price.toLocaleString()}</td>
+                          <td className="px-6 py-4 font-mono text-trading-muted">{pos.amount}</td>
+                          <td className="px-6 py-4 font-mono text-trading-muted">{pos.leverage}x</td>
+                          <td className="px-6 py-4">
+                            <div className={cn("font-bold font-mono", pos.pnl_usdt >= 0 ? "text-trading-up" : "text-trading-down")}>
+                              {pos.pnl_usdt >= 0 ? "+" : ""}{pos.pnl_usdt.toFixed(2)} USDT
+                            </div>
+                            <div className={cn("text-[9px] font-mono mt-0.5", pos.pnl_pct >= 0 ? "text-trading-up" : "text-trading-down")}>
+                              {pos.pnl_pct >= 0 ? "+" : ""}{pos.pnl_pct.toFixed(3)}%
+                            </div>
+                          </td>
+                          <td className="px-6 py-4 text-right text-trading-muted font-mono">{pos.opened_at}</td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                )}
+              </div>
+
+              <div className="p-4 bg-trading-bg/50 border-t border-trading-border flex items-center justify-between text-[10px]">
+                <div className="flex items-center gap-3">
+                  <button
+                    onClick={async () => {
+                      setIsSyncing(true);
+                      try {
+                        const r = await fetch("/api/sync-positions", { method: "POST" });
+                        const d = await r.json();
+                        if (d.last_sync) setLastSync(d.last_sync);
+                        const posRes = await fetch("/api/open-positions");
+                        const posData = await posRes.json();
+                        setOpenPositions(posData.positions ?? []);
+                      } finally {
+                        setIsSyncing(false);
+                      }
+                    }}
+                    disabled={isSyncing}
+                    className="flex items-center gap-1.5 px-3 py-1.5 bg-trading-card border border-trading-border rounded hover:border-trading-muted transition-colors disabled:opacity-50 uppercase font-bold tracking-widest text-[9px]"
+                  >
+                    <Activity className={cn("w-3 h-3", isSyncing && "animate-spin")} />
+                    {isSyncing ? "Syncing..." : "Sync Binance"}
+                  </button>
+                  {lastSync && (
+                    <span className="text-trading-muted">
+                      Last sync: {new Date(lastSync).toLocaleTimeString()}
+                    </span>
+                  )}
+                </div>
+                {openPositions.length > 0 && (
+                  <span className={cn(
+                    "font-bold font-mono",
+                    openPositions.reduce((s, p) => s + p.pnl_usdt, 0) >= 0 ? "text-trading-up" : "text-trading-down"
+                  )}>
+                    Total Unrealized: {openPositions.reduce((s, p) => s + p.pnl_usdt, 0) >= 0 ? "+" : ""}
+                    {openPositions.reduce((s, p) => s + p.pnl_usdt, 0).toFixed(2)} USDT
+                  </span>
+                )}
+              </div>
+            </motion.div>
+          </div>
+        )}
+      </AnimatePresence>
+
+      {/* ── Trade History Modal ── */}
       <AnimatePresence>
         {isHistoryOpen && (
           <div className="fixed inset-0 z-[100] flex items-center justify-center p-4 md:p-10">
