@@ -239,7 +239,8 @@ async function seedCandleBuffer() {
 
 function initWebSocket() {
   const streams = SYMBOLS.map(s => `${toWsSym(s)}@kline_1m`).join("/");
-  const ws = new WebSocket(`wss://fstream.binance.com/stream?streams=${streams}`);
+  // fstream1.binance.com is the Asia-optimized endpoint (lower latency from Tokyo VPS)
+  const ws = new WebSocket(`wss://fstream1.binance.com/stream?streams=${streams}`);
 
   ws.on("open", () => console.log("[WS] Connected to Binance Futures kline stream"));
 
