@@ -263,7 +263,8 @@ export default function App() {
       });
       const d = await res.json();
       if (!res.ok) { addLog(`Manual ${action} ${symbol} failed: ${d.error}`, "error"); return; }
-      addLog(`Manual ${action} ${symbol} @ ${price} x${d.leverage}`, "success");
+      addLog(`Manual ${action} ${symbol} @ ${d.fillPrice} x${d.leverage}${d.tpPrice ? ` TP:${d.tpPrice}` : ''} SL:${d.slCallback ?? '-'}%`, "success");
+      if (d.warnings?.length) d.warnings.forEach((w: string) => addLog(w, "warning"));
       await refreshPositions();
     } catch {
       addLog(`Manual trade error for ${symbol}`, "error");

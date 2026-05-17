@@ -987,12 +987,42 @@ app.post("/api/manual-trade", async (req, res) => {
       const tpPrice  = parseFloat((binance as any).priceToPrecision(symbol, isLong ? fillPrice * (1 + dynTpPct) : fillPrice * (1 - dynTpPct)));
       const cbRate   = parseFloat(Math.min(Math.max(dynSlPct * 100, 0.1), 5.0).toFixed(1));
 
+      const warnings: string[] = [];
+
       try {
-        await binance.createOrder(symbol, "TAKE_PROFIT_MARKET", closeSide, amount, undefined, { stopPrice: tpPrice, reduceOnly: true, workingType: "MARK_PRICE" });
-      } catch { /* non-fatal */ }
+        await binance.createOrder(symbol, "TAKE_PROFIT_MARKET", closeSide, amount, undefined, {
+          stopPrice:    tpPrice,
+          reduceOnly:   true,
+          workingType:  "MARK_PRICE",
+          priceProtect: true,
+        });
+        console.log(`[MANUAL] TP placed @ ${tpPrice}`);
+      } catch (e: any) {
+        const msg = `TP order failed: ${e?.message}`;
+        console.error(`[MANUAL] ${msg}`);
+        warnings.push(msg);
+      }
+
       try {
-        await binance.createOrder(symbol, "TRAILING_STOP_MARKET", closeSide, amount, undefined, { callbackRate: cbRate, reduceOnly: true, workingType: "MARK_PRICE" });
-      } catch { /* non-fatal */ }
+        await binance.createOrder(symbol, "TRAILING_STOP_MARKET", closeSide, amount, undefined, {
+          callbackRate: cbRate,
+          reduceOnly:   true,
+          workingType:  "MARK_PRICE",
+        });
+        console.log(`[MANUAL] Trailing SL placed @ ${cbRate}% callback`);
+      } catch (e: any) {
+        const msg = `Trailing SL failed: ${e?.message}`;
+        console.error(`[MANUAL] ${msg}`);
+        warnings.push(msg);
+      }
+
+      await pool.query(
+        `INSERT INTO trades (symbol, type, entry_price, amount, strategy, status, leverage, fee_usdt)
+         VALUES ($1, $2, $3, $4, 'MANUAL', 'OPEN', $5, $6)`,
+        [symbol, action, fillPrice, amount, leverage, feeUsdt]
+      );
+      console.log(`[MANUAL] ${action} ${symbol} @ ${fillPrice} x${leverage}`);
+      return res.json({ ok: true, symbol, action, fillPrice, amount, leverage, tpPrice, slCallback: cbRate, warnings });
     }
 
     await pool.query(
@@ -1000,8 +1030,8 @@ app.post("/api/manual-trade", async (req, res) => {
        VALUES ($1, $2, $3, $4, 'MANUAL', 'OPEN', $5, $6)`,
       [symbol, action, fillPrice, amount, leverage, feeUsdt]
     );
-    console.log(`[MANUAL] ${action} ${symbol} @ ${fillPrice} x${leverage}`);
-    res.json({ ok: true, symbol, action, fillPrice, amount, leverage });
+    console.log(`[MANUAL] ${action} ${symbol} @ ${fillPrice} x${leverage} (paper)`);
+    res.json({ ok: true, symbol, action, fillPrice, amount, leverage, tpPrice: null, slCallback: null, warnings: [] });
   } catch (e: any) {
     console.error("[MANUAL] Error:", e?.message);
     res.status(500).json({ error: e?.message });
