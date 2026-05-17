@@ -461,8 +461,7 @@ function initWebSocket() {
   const streams5m  = SYMBOLS.map(s => `${toWsSym(s)}@kline_5m`);
   const streams15m = SYMBOLS.map(s => `${toWsSym(s)}@kline_15m`);
   const allStreams  = [...streams1m, ...streams5m, ...streams15m].join("/");
-  // fstream1.binance.com is the Asia-optimized endpoint (lower latency from Tokyo VPS)
-  const ws = new WebSocket(`wss://fstream1.binance.com/stream?streams=${allStreams}`);
+  const ws = new WebSocket(`wss://fstream.binance.com/stream?streams=${allStreams}`);
 
   ws.on("open", () => console.log("[WS] Connected — 1m + 5m + 15m streams"));
 
