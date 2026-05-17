@@ -157,6 +157,17 @@ function calcVolumeRatio(ohlcv: number[], period = 20): number {
   return avg > 0 ? ohlcv[ohlcv.length - 1] / avg : 1;
 }
 
+function calcVWAP(ohlcv: number[][]): number {
+  if (!ohlcv.length) return 0;
+  let pv = 0, vol = 0;
+  for (const c of ohlcv) {
+    const typical = (c[2] + c[3] + c[4]) / 3;
+    pv  += typical * c[5];
+    vol += c[5];
+  }
+  return vol > 0 ? pv / vol : 0;
+}
+
 function calculateSignal(ohlcv: number[][]) {
   if (!ohlcv || ohlcv.length < 26) return { action: "HOLD" as const, rsi: 50, price: 0, macd: null, bb: null, ema9: null, ema21: null, volumeRatio: 1, atr: 0, atrPct: 0 };
   const closes  = ohlcv.map(c => c[4]);
@@ -307,6 +318,53 @@ function safeTpPrice(
   return parseFloat((binance as any).priceToPrecision(symbol, tp));
 }
 
+// Adjusts TP/SL multipliers based on all market context signals.
+// tpBonus > 1.0 = extend TP; slMult < 1.0 = tighten SL.
+function calcContextMultipliers(
+  action: string, strategyName: string,
+  fundingRate: number | undefined,
+  fearGreed: { value: number } | null,
+  vwap = 0, price = 0,
+  oiChangePct?: number,
+  lsRatio?: number
+): { tpBonus: number; slMult: number } {
+  let tpBonus = 1.0;
+  let slMult  = 1.0;
+
+  // Funding: favorable side (you receive it) → extend TP; crowded side → tighten SL
+  if (fundingRate !== undefined) {
+    if (action === "BUY"  && fundingRate < -0.0002) tpBonus += 0.2;
+    if (action === "SELL" && fundingRate >  0.0002) tpBonus += 0.2;
+    if (action === "BUY"  && fundingRate >  0.0003) slMult = 0.8;
+    if (action === "SELL" && fundingRate < -0.0002) slMult = 0.8;
+  }
+
+  // F&G: MEAN-REV only — extreme sentiment = larger potential snap-back
+  if (fearGreed && strategyName === "MEAN-REV") {
+    const fg = fearGreed.value;
+    if (action === "BUY"  && fg < 40) tpBonus += Math.min((40 - fg) / 40 * 0.4, 0.4);
+    if (action === "SELL" && fg > 60) tpBonus += Math.min((fg - 60) / 40 * 0.4, 0.4);
+  }
+
+  // VWAP: entry at discount (below VWAP for BUY) = more room to mean-revert → extend TP
+  if (vwap > 0 && price > 0) {
+    const pctFromVwap = (price - vwap) / vwap;
+    if (action === "BUY"  && pctFromVwap < -0.001) tpBonus += Math.min(Math.abs(pctFromVwap) * 8, 0.2);
+    if (action === "SELL" && pctFromVwap >  0.001) tpBonus += Math.min(pctFromVwap * 8, 0.2);
+  }
+
+  // OI rising = real money confirming direction → extend TP
+  if (oiChangePct !== undefined && oiChangePct > 1.0) tpBonus += 0.15;
+
+  // L/S: market crowded against you = unwind fuel → extend TP
+  if (lsRatio !== undefined) {
+    if (action === "SELL" && lsRatio > 1.5) tpBonus += Math.min((lsRatio - 1.5) / 2 * 0.25, 0.25);
+    if (action === "BUY"  && lsRatio < 0.8) tpBonus += Math.min((0.8 - lsRatio) / 0.8 * 0.25, 0.25);
+  }
+
+  return { tpBonus: Math.min(tpBonus, 1.8), slMult };
+}
+
 // ── Auto-Execute ───────────────────────────────────────────────────────────────
 
 type AnySignal = { action: "BUY" | "SELL" | "HOLD"; price: number; rsi: number; volumeRatio: number; atr: number; atrPct: number };
@@ -334,6 +392,60 @@ async function checkAutoExecute(symbol: string, signal: AnySignal, strategyName:
   if (volRatio < volThreshold) {
     console.log(`[VOL] ${symbol} blocked — ${volRatio}× < ${volThreshold}× threshold`);
     return;
+  }
+
+  // Funding rate filter — high positive = market overleveraged long; high negative = overleveraged short
+  const fundingRate = fundingRateCache.get(symbol);
+  if (fundingRate !== undefined) {
+    if (signal.action === "BUY" && fundingRate > 0.0005) {
+      console.log(`[FUNDING] ${symbol} BUY blocked — ${(fundingRate * 100).toFixed(4)}% > 0.05% (longs paying too much)`);
+      return;
+    }
+    if (signal.action === "SELL" && fundingRate < -0.0003) {
+      console.log(`[FUNDING] ${symbol} SELL blocked — ${(fundingRate * 100).toFixed(4)}% < -0.03% (shorts paying too much)`);
+      return;
+    }
+  }
+
+  // Fear & Greed filter
+  if (fearGreedCache) {
+    const fg = fearGreedCache.value;
+    // MEAN-REV has no trend filter so is most exposed to regime risk — apply stricter F&G gates
+    if (strategyName === "MEAN-REV") {
+      if (signal.action === "BUY" && fg > 75)  { console.log(`[F&G] ${symbol} MEAN-REV BUY blocked — Extreme Greed (${fg})`);  return; }
+      if (signal.action === "SELL" && fg < 25)  { console.log(`[F&G] ${symbol} MEAN-REV SELL blocked — Extreme Fear (${fg})`);  return; }
+    }
+    // All strategies: block at absolute extremes
+    if (signal.action === "BUY"  && fg > 85) { console.log(`[F&G] ${symbol} ${strategyName} BUY blocked — F&G ${fg} (extreme greed)`);  return; }
+    if (signal.action === "SELL" && fg < 15) { console.log(`[F&G] ${symbol} ${strategyName} SELL blocked — F&G ${fg} (extreme fear)`); return; }
+  }
+
+  // Open Interest filter
+  const oiData = openInterestCache.get(symbol);
+  if (oiData) {
+    // MOMENTUM-ARB BUY on falling OI = short covering (no real demand), not a conviction rally
+    if (strategyName === "MOMENTUM-ARB" && signal.action === "BUY" && oiData.oiChangePct < -2.0) {
+      console.log(`[OI] ${symbol} MOMENTUM-ARB BUY blocked — OI ${oiData.oiChangePct.toFixed(2)}% (short covering, not real demand)`);
+      return;
+    }
+    // MEAN-REV SELL on falling OI = long liquidation nearing exhaustion → reversal risk
+    if (strategyName === "MEAN-REV" && signal.action === "SELL" && oiData.oiChangePct < -2.0) {
+      console.log(`[OI] ${symbol} MEAN-REV SELL blocked — OI ${oiData.oiChangePct.toFixed(2)}% (liquidation exhaustion near)`);
+      return;
+    }
+  }
+
+  // Long/Short Ratio filter — extreme one-sided positioning
+  const lsRatio = longShortCache.get(symbol);
+  if (lsRatio !== undefined) {
+    if (signal.action === "BUY"  && lsRatio > 2.5) {
+      console.log(`[LS] ${symbol} BUY blocked — L/S ${lsRatio.toFixed(2)} (market over-long, reversal risk)`);
+      return;
+    }
+    if (signal.action === "SELL" && lsRatio < 0.4) {
+      console.log(`[LS] ${symbol} SELL blocked — L/S ${lsRatio.toFixed(2)} (market over-short, reversal risk)`);
+      return;
+    }
   }
 
   // Cooldown: ULTRA-SCALP 5m, MOMENTUM-ARB 15m, MEAN-REV 30m
@@ -369,57 +481,76 @@ async function checkAutoExecute(symbol: string, signal: AnySignal, strategyName:
   const TAKER_RATE = 0.0004;
   let feeUsdt = parseFloat((fillPrice * amount * TAKER_RATE).toFixed(6));
 
+  // Variables hoisted so Telegram notification at the end can reference them
+  const orderWarnings: string[] = [];
+  let tpPrice      = 0;
+  let callbackRate = 0;
+  let tpBonus      = 1.0;
+
   if (hasKeys) {
     try {
       await binance.setLeverage(leverage, symbol);
       const order = await binance.createOrder(symbol, "market", side, amount);
       fillPrice = parseFloat(String((order as any).average || (order as any).price || signal.price));
-      // Prefer actual fee from API; ccxt normalises to USDT for same-currency fees
       const orderFee = (order as any).fee;
       if (orderFee?.cost && orderFee?.currency === "USDT") {
         feeUsdt = parseFloat(Math.abs(orderFee.cost).toFixed(6));
       } else {
-        // Fallback: estimate from fill price (covers BNB-fee case where ccxt doesn't convert)
         feeUsdt = parseFloat((fillPrice * amount * TAKER_RATE).toFixed(6));
       }
       console.log(`[AUTO-FUTURES] ✓ ${signal.action} ${symbol} x${leverage} fill:${fillPrice} fee:${feeUsdt} USDT`);
     } catch (e: any) {
       console.error(`[AUTO-FUTURES] ✗ Market order failed [${symbol}]:`, e?.message);
-      return; // abort — don't record a trade that didn't execute
+      await sendTelegram(
+        `❌ <b>AUTO TRADE FAILED</b>\n` +
+        `Symbol: <code>${symbol}</code>  Side: <b>${isLong ? "LONG" : "SHORT"}</b>\n` +
+        `Strategy: <code>${strategyName}</code>\n` +
+        `Reason: <code>${(e?.message ?? "unknown error").slice(0, 300)}</code>`
+      );
+      return;
     }
 
-    // ── ATR-based dynamic levels ──
-    const atrPctFill = (signal.atr ?? 0) / fillPrice;          // ATR as fraction of fill price
-    const dynSlPct   = Math.min(Math.max(atrPctFill * slMult, 0.001), 0.05);  // clamp 0.1% – 5%
-    const dynTpPct   = Math.min(Math.max(atrPctFill * tpMult, 0.01), 0.10);  // clamp 0.2% – 10%
-    const callbackRate = parseFloat(Math.min(Math.max(dynSlPct * 100, 0.5), 5.0).toFixed(1));
-    const tpPrice      = safeTpPrice(isLong, fillPrice, amount, dynTpPct, feeUsdt, symbol);
+    // ── ATR-based dynamic levels with market-context adjustment ──
+    const atrPctFill = (signal.atr ?? 0) / fillPrice;
+    const vwap       = parseFloat(calcVWAP(candleBuffer.get(symbol) || []).toFixed(6));
+    const oiD        = openInterestCache.get(symbol);
+    const { tpBonus: tb, slMult: ctxSlMult } = calcContextMultipliers(
+      signal.action, strategyName,
+      fundingRateCache.get(symbol), fearGreedCache,
+      vwap, fillPrice,
+      oiD?.oiChangePct, longShortCache.get(symbol)
+    );
+    tpBonus = tb;
+    const dynSlPct = Math.min(Math.max(atrPctFill * slMult * ctxSlMult, 0.001), 0.05);
+    const dynTpPct = Math.min(Math.max(atrPctFill * tpMult * tpBonus,   0.01),  0.15);
+    callbackRate   = parseFloat(Math.min(Math.max(dynSlPct * 100, 0.5), 5.0).toFixed(1));
+    tpPrice        = safeTpPrice(isLong, fillPrice, amount, dynTpPct, feeUsdt, symbol);
 
+    if (tpBonus !== 1.0 || ctxSlMult !== 1.0) {
+      console.log(`[CTX] ${symbol} TP×${tpBonus.toFixed(2)} SL×${ctxSlMult.toFixed(2)} | FR:${((fundingRateCache.get(symbol) ?? 0)*100).toFixed(4)}% F&G:${fearGreedCache?.value ?? 'N/A'}`);
+    }
     console.log(`[AUTO] ATR-SL:${(dynSlPct*100).toFixed(3)}% (cb:${callbackRate}%)  ATR-TP:${(dynTpPct*100).toFixed(3)}% @ ${tpPrice}`);
 
-    // ── Native TP order (server-side, survives bot restart) ──
+    // ── Native TP order ──
     try {
       await binance.createOrder(symbol, "TAKE_PROFIT_MARKET", closeSide, amount, undefined, {
-        stopPrice:    tpPrice,
-        reduceOnly:   true,
-        workingType:  "MARK_PRICE",
-        priceProtect: true,
+        stopPrice: tpPrice, reduceOnly: true, workingType: "MARK_PRICE", priceProtect: true,
       });
       console.log(`[AUTO] TP order placed @ ${tpPrice}`);
     } catch (e: any) {
       console.error(`[AUTO] TP order failed [${symbol}]:`, e?.message);
+      orderWarnings.push(`TP failed: ${(e?.message ?? "").slice(0, 150)}`);
     }
 
-    // ── Native Trailing SL (Binance manages server-side) ──
+    // ── Native Trailing SL ──
     try {
       await binance.createOrder(symbol, "TRAILING_STOP_MARKET", closeSide, amount, undefined, {
-        callbackRate,
-        reduceOnly:  true,
-        workingType: "MARK_PRICE",
+        callbackRate, reduceOnly: true, workingType: "MARK_PRICE",
       });
       console.log(`[AUTO] Trailing SL placed @ ${callbackRate}% callback`);
     } catch (e: any) {
       console.error(`[AUTO] Trailing SL order failed [${symbol}]:`, e?.message);
+      orderWarnings.push(`SL failed: ${(e?.message ?? "").slice(0, 150)}`);
     }
   }
 
@@ -429,6 +560,19 @@ async function checkAutoExecute(symbol: string, signal: AnySignal, strategyName:
     [symbol, signal.action, fillPrice, amount, strategyName, leverage, feeUsdt]
   );
   console.log(`[AUTO] DB recorded: ${signal.action} ${symbol} @ ${fillPrice} fee:${feeUsdt} USDT [${strategyName}]`);
+
+  if (hasKeys) {
+    const icon   = orderWarnings.length ? "⚠️" : "✅";
+    const status = orderWarnings.length ? "EXECUTED (warnings)" : "EXECUTED";
+    await sendTelegram(
+      `${icon} <b>AUTO TRADE ${status}</b>\n` +
+      `<code>${symbol}</code>  <b>${isLong ? "LONG 🟢" : "SHORT 🔴"}</b>  <code>${strategyName}</code>\n` +
+      `Fill: <code>$${fillPrice.toLocaleString()}</code>  Lev: <code>${leverage}×</code>  Fee: <code>${feeUsdt} USDT</code>\n` +
+      `TP: <code>$${tpPrice > 0 ? tpPrice.toLocaleString() : "N/A"}</code>  SL: <code>${callbackRate}% callback</code>\n` +
+      `RSI: <code>${signal.rsi}</code>  ATR: <code>${signal.atrPct?.toFixed(3)}%</code>  TP×: <code>${tpBonus.toFixed(2)}</code>` +
+      (orderWarnings.length ? `\n\n⚠️ <b>Warnings:</b>\n<code>${orderWarnings.join("\n")}</code>` : "")
+    );
+  }
 }
 
 // ── WebSocket — Binance Futures Kline Stream ───────────────────────────────────
@@ -463,6 +607,9 @@ async function seedCandleBuffer() {
         symbol,
         price:       sig1m.price || sig5m.price,
         trend,
+        vwap:        parseFloat(calcVWAP(buf1m).toFixed(6)),
+        oiChangePct: openInterestCache.get(symbol)?.oiChangePct ?? null,
+        lsRatio:     longShortCache.get(symbol) ?? null,
         ultraScalp:  { action: sig1m.action, rsi: sig1m.rsi, volumeRatio: sig1m.volumeRatio, atrPct: sig1m.atrPct },
         momentumArb: { action: sig5m.action, rsi: sig5m.rsi, volumeRatio: sig5m.volumeRatio, atrPct: sig5m.atrPct, cross: sig5m.cross },
         meanRev:     { action: sigMR.action, rsi: sigMR.rsi, volumeRatio: sigMR.volumeRatio, atrPct: sigMR.atrPct, bbPos: sigMR.bbPos },
@@ -566,9 +713,12 @@ function initWebSocket() {
         const trend  = getTrend(symbol);
         const idx    = scanResults.findIndex(r => r.symbol === symbol);
         const entry  = scanResults[idx] || { symbol, price: signal.price, trend };
-        entry.trend      = trend;
-        entry.price      = signal.price;
-        entry.ultraScalp = { action: signal.action, rsi: signal.rsi, volumeRatio: signal.volumeRatio, atrPct: signal.atrPct };
+        entry.trend       = trend;
+        entry.price       = signal.price;
+        entry.vwap        = parseFloat(calcVWAP(liveBuffer).toFixed(6));
+        entry.oiChangePct = openInterestCache.get(symbol)?.oiChangePct ?? null;
+        entry.lsRatio     = longShortCache.get(symbol) ?? null;
+        entry.ultraScalp  = { action: signal.action, rsi: signal.rsi, volumeRatio: signal.volumeRatio, atrPct: signal.atrPct };
         if (idx >= 0) scanResults[idx] = entry; else scanResults.push(entry);
 
         // Only fire on HOLD→BUY/SELL transition — prevents flooding DB on every tick
@@ -632,6 +782,81 @@ const runMockTradeMonitor = async () => {
     console.error("[MOCK-MONITOR] Error:", err);
   }
 };
+
+// ── Market Context (Funding Rate + Fear & Greed) ────────────────────────────────
+
+const fundingRateCache = new Map<string, number>(); // symbol → rate (e.g. 0.0001 = 0.01% per 8h)
+let fearGreedCache: { value: number; classification: string } | null = null;
+
+interface OIData { oi: number; oiChangePct: number }
+const openInterestCache = new Map<string, OIData>(); // symbol → latest OI snapshot
+const longShortCache    = new Map<string, number>(); // symbol → L/S ratio (e.g. 1.45 = 59% long)
+
+async function fetchFundingRates() {
+  try {
+    const res  = await fetch("https://fapi.binance.com/fapi/v1/premiumIndex");
+    const data = (await res.json()) as any[];
+    for (const item of data) {
+      const ccxtSym = toCcxtSym(item.symbol);
+      if (SYMBOLS.includes(ccxtSym)) {
+        fundingRateCache.set(ccxtSym, parseFloat(item.lastFundingRate));
+      }
+    }
+    console.log(`[FUNDING] Updated — BTC: ${((fundingRateCache.get("BTC/USDT") ?? 0) * 100).toFixed(4)}%`);
+  } catch (e: any) {
+    console.error("[FUNDING] Fetch error:", e?.message);
+  }
+}
+
+async function fetchFearGreed() {
+  try {
+    const res  = await fetch("https://api.alternative.me/fng/?limit=1");
+    const data = (await res.json()) as any;
+    const item = data.data?.[0];
+    if (item) {
+      fearGreedCache = { value: parseInt(item.value), classification: item.value_classification };
+      console.log(`[F&G] ${fearGreedCache.value} — ${fearGreedCache.classification}`);
+    }
+  } catch (e: any) {
+    console.error("[F&G] Fetch error:", e?.message);
+  }
+}
+
+async function sendTelegram(message: string): Promise<void> {
+  const token  = process.env.TELEGRAM_BOT_TOKEN;
+  const chatId = process.env.TELEGRAM_CHAT_ID;
+  if (!token || !chatId) return;
+  try {
+    await fetch(`https://api.telegram.org/bot${token}/sendMessage`, {
+      method:  "POST",
+      headers: { "Content-Type": "application/json" },
+      body:    JSON.stringify({ chat_id: chatId, text: message, parse_mode: "HTML" }),
+    });
+  } catch (e: any) {
+    console.error("[TELEGRAM] Send failed:", e?.message);
+  }
+}
+
+async function fetchFuturesData() {
+  await Promise.all(SYMBOLS.map(async symbol => {
+    const binSym = symbol.replace("/", ""); // BTC/USDT → BTCUSDT
+    try {
+      const r    = await fetch(`https://fapi.binance.com/futures/data/openInterestStat?symbol=${binSym}&period=5m&limit=2`);
+      const data = (await r.json()) as any[];
+      if (Array.isArray(data) && data.length >= 2) {
+        const cur  = parseFloat(data[data.length - 1].sumOpenInterest);
+        const prev = parseFloat(data[data.length - 2].sumOpenInterest);
+        openInterestCache.set(symbol, { oi: cur, oiChangePct: prev > 0 ? (cur - prev) / prev * 100 : 0 });
+      }
+    } catch { /* non-fatal — Binance may rate-limit some symbols */ }
+    try {
+      const r    = await fetch(`https://fapi.binance.com/futures/data/globalLongShortAccountRatio?symbol=${binSym}&period=5m&limit=1`);
+      const data = (await r.json()) as any[];
+      if (Array.isArray(data) && data.length > 0) longShortCache.set(symbol, parseFloat(data[0].longShortRatio));
+    } catch { /* non-fatal */ }
+  }));
+  console.log(`[FUTURES-DATA] OI/LS updated for ${openInterestCache.size} symbols`);
+}
 
 // ── Binance Position Sync ──────────────────────────────────────────────────────
 
@@ -739,6 +964,16 @@ app.get("/api/cooldown-status", async (_req, res) => {
   } catch (err: any) {
     res.status(500).json({ error: err?.message });
   }
+});
+
+app.get("/api/market-context", (_req, res) => {
+  const rates: Record<string, number> = {};
+  fundingRateCache.forEach((v, k) => { rates[k] = v; });
+  const oi: Record<string, { oiChangePct: number }> = {};
+  openInterestCache.forEach((v, k) => { oi[k] = { oiChangePct: v.oiChangePct }; });
+  const ls: Record<string, number> = {};
+  longShortCache.forEach((v, k) => { ls[k] = v; });
+  res.json({ fearGreed: fearGreedCache, fundingRates: rates, openInterest: oi, longShortRatios: ls });
 });
 
 app.get("/api/scan", (req, res) => res.json({ results: scanResults, timestamp: Date.now() }));
@@ -967,93 +1202,6 @@ app.get("/api/trade-history", async (req, res) => {
   } catch { res.status(500).json({ error: "Failed to fetch trade history" }); }
 });
 
-app.post("/api/manual-trade", async (req, res) => {
-  const { symbol, action, price } = req.body;
-  if (!symbol || !action || !price) return res.status(400).json({ error: "symbol, action, price required" });
-  try {
-    const cfgRow  = await pool.query("SELECT leverage, atr_sl_mult::float, atr_tp_mult::float FROM bot_settings WHERE id = 'bot_config'");
-    const leverage  = cfgRow.rows[0]?.leverage || 10;
-    const slMult    = cfgRow.rows[0]?.atr_sl_mult ?? 1.5;
-    const tpMult    = cfgRow.rows[0]?.atr_tp_mult ?? 2.5;
-    const side      = action === "BUY" ? "buy" : "sell";
-    const closeSide = action === "BUY" ? "sell" : "buy";
-    const isLong    = action === "BUY";
-    const hasKeys   = !!(process.env.BINANCE_API_KEY && process.env.BINANCE_SECRET_KEY);
-    const amount    = parseFloat((binance as any).amountToPrecision(symbol, 25 / price));
-    const TAKER_RATE = 0.0004;
-
-    let fillPrice = price;
-    let feeUsdt   = parseFloat((fillPrice * amount * TAKER_RATE).toFixed(6));
-
-    // Get ATR from live buffer for SL/TP calculation
-    const buf = candleBuffer.get(symbol) || [];
-    const atr = buf.length >= 14 ? calcATR(buf) : 0;
-
-    if (hasKeys) {
-      await binance.setLeverage(leverage, symbol);
-      const order = await binance.createOrder(symbol, "market", side, amount);
-      fillPrice = parseFloat(String((order as any).average || (order as any).price || price));
-      const orderFee = (order as any).fee;
-      feeUsdt = orderFee?.cost && orderFee?.currency === "USDT"
-        ? parseFloat(Math.abs(orderFee.cost).toFixed(6))
-        : parseFloat((fillPrice * amount * TAKER_RATE).toFixed(6));
-
-      const atrF     = atr / fillPrice;
-      const dynSlPct = Math.min(Math.max(atrF * slMult, 0.001), 0.05);
-      const dynTpPct = Math.min(Math.max(atrF * tpMult, 0.01), 0.10);
-      const tpPrice  = safeTpPrice(isLong, fillPrice, amount, dynTpPct, feeUsdt, symbol);
-      const cbRate   = parseFloat(Math.min(Math.max(dynSlPct * 100, 0.5), 5.0).toFixed(1));
-
-      const warnings: string[] = [];
-
-      try {
-        await binance.createOrder(symbol, "TAKE_PROFIT_MARKET", closeSide, amount, undefined, {
-          stopPrice:    tpPrice,
-          reduceOnly:   true,
-          workingType:  "MARK_PRICE",
-          priceProtect: true,
-        });
-        console.log(`[MANUAL] TP placed @ ${tpPrice}`);
-      } catch (e: any) {
-        const msg = `TP order failed: ${e?.message}`;
-        console.error(`[MANUAL] ${msg}`);
-        warnings.push(msg);
-      }
-
-      try {
-        await binance.createOrder(symbol, "TRAILING_STOP_MARKET", closeSide, amount, undefined, {
-          callbackRate: cbRate,
-          reduceOnly:   true,
-          workingType:  "MARK_PRICE",
-        });
-        console.log(`[MANUAL] Trailing SL placed @ ${cbRate}% callback`);
-      } catch (e: any) {
-        const msg = `Trailing SL failed: ${e?.message}`;
-        console.error(`[MANUAL] ${msg}`);
-        warnings.push(msg);
-      }
-
-      await pool.query(
-        `INSERT INTO trades (symbol, type, entry_price, amount, strategy, status, leverage, fee_usdt)
-         VALUES ($1, $2, $3, $4, 'MANUAL', 'OPEN', $5, $6)`,
-        [symbol, action, fillPrice, amount, leverage, feeUsdt]
-      );
-      console.log(`[MANUAL] ${action} ${symbol} @ ${fillPrice} x${leverage}`);
-      return res.json({ ok: true, symbol, action, fillPrice, amount, leverage, tpPrice, slCallback: cbRate, warnings });
-    }
-
-    await pool.query(
-      `INSERT INTO trades (symbol, type, entry_price, amount, strategy, status, leverage, fee_usdt)
-       VALUES ($1, $2, $3, $4, 'MANUAL', 'OPEN', $5, $6)`,
-      [symbol, action, fillPrice, amount, leverage, feeUsdt]
-    );
-    console.log(`[MANUAL] ${action} ${symbol} @ ${fillPrice} x${leverage} (paper)`);
-    res.json({ ok: true, symbol, action, fillPrice, amount, leverage, tpPrice: null, slCallback: null, warnings: [] });
-  } catch (e: any) {
-    console.error("[MANUAL] Error:", e?.message);
-    res.status(500).json({ error: e?.message });
-  }
-});
 
 app.post("/api/execute", async (req, res) => {
   const { symbol, type, entryPrice, amount, strategy } = req.body;
@@ -1281,6 +1429,13 @@ async function startServer() {
 
   await binance.loadMarkets();
   console.log("Markets loaded");
+
+  await fetchFundingRates();
+  await fetchFearGreed();
+  await fetchFuturesData();
+  setInterval(fetchFundingRates, 5 * 60 * 1000);
+  setInterval(fetchFearGreed, 30 * 60 * 1000);
+  setInterval(fetchFuturesData, 5 * 60 * 1000);
 
   // Seed candle buffer via REST, then hand off to WebSocket
   await seedCandleBuffer();

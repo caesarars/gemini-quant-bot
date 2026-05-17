@@ -39,6 +39,9 @@ interface ScanResult {
   symbol: string;
   price: number;
   trend?: 'UP' | 'DOWN' | 'NEUTRAL';
+  vwap?: number;
+  oiChangePct?: number | null;
+  lsRatio?: number | null;
   ultraScalp?: StrategySignal;
   momentumArb?: StrategySignal;
   meanRev?: StrategySignal;
@@ -72,7 +75,12 @@ function getBlockReason(
   volumeRatio: number | undefined,
   volThreshold: number,
   isAutoPilot: boolean,
-  skipTrend = false
+  skipTrend = false,
+  fundingRate?: number,
+  fearGreed?: number | null,
+  strategyId?: string,
+  oiChangePct?: number | null,
+  lsRatio?: number | null
 ): { label: string; color: string } {
   if (!isAutoPilot) return { label: 'Auto-pilot OFF', color: 'text-trading-muted' };
   if (action === 'HOLD') return { label: 'No signal', color: 'text-trading-muted' };
@@ -82,6 +90,28 @@ function getBlockReason(
     if (action === 'SELL' && trend === 'UP')   return { label: 'SELL blocked — trend ↑', color: 'text-trading-down' };
   }
   if ((volumeRatio ?? 1) < volThreshold) return { label: `Vol ${volumeRatio?.toFixed(1)}× < ${volThreshold}×`, color: 'text-orange-400' };
+  if (fundingRate !== undefined) {
+    if (action === 'BUY'  && fundingRate >  0.0005) return { label: `Funding +${(fundingRate*100).toFixed(3)}% — overbought`, color: 'text-trading-down' };
+    if (action === 'SELL' && fundingRate < -0.0003) return { label: `Funding ${(fundingRate*100).toFixed(3)}% — oversold`,    color: 'text-trading-down' };
+  }
+  if (fearGreed != null) {
+    if (strategyId === 'MEAN-REV') {
+      if (action === 'BUY'  && fearGreed > 75) return { label: `F&G ${fearGreed} Extreme Greed — BUY blocked`,  color: 'text-trading-down' };
+      if (action === 'SELL' && fearGreed < 25) return { label: `F&G ${fearGreed} Extreme Fear — SELL blocked`, color: 'text-trading-down' };
+    }
+    if (action === 'BUY'  && fearGreed > 85) return { label: `F&G ${fearGreed} — too greedy`, color: 'text-orange-400' };
+    if (action === 'SELL' && fearGreed < 15) return { label: `F&G ${fearGreed} — too fearful`, color: 'text-orange-400' };
+  }
+  if (oiChangePct != null) {
+    if (strategyId === 'MOMENTUM-ARB' && action === 'BUY'  && oiChangePct < -2.0)
+      return { label: `OI ${oiChangePct.toFixed(1)}% — short covering`, color: 'text-trading-down' };
+    if (strategyId === 'MEAN-REV'     && action === 'SELL' && oiChangePct < -2.0)
+      return { label: `OI ${oiChangePct.toFixed(1)}% — liq exhaustion near`, color: 'text-trading-down' };
+  }
+  if (lsRatio != null) {
+    if (action === 'BUY'  && lsRatio > 2.5) return { label: `L/S ${lsRatio.toFixed(2)} — market over-long`,  color: 'text-trading-down' };
+    if (action === 'SELL' && lsRatio < 0.4) return { label: `L/S ${lsRatio.toFixed(2)} — market over-short`, color: 'text-trading-down' };
+  }
   return { label: 'All clear — monitoring', color: 'text-trading-up' };
 }
 
@@ -102,7 +132,12 @@ export default function App() {
   const [activeStrategies, setActiveStrategies]   = useState<string[]>(["ULTRA-SCALP", "MOMENTUM-ARB"]);
   const [cooldownStatus, setCooldownStatus]       = useState<Record<string, { inCooldown: boolean; strategy: string }>>({});
   const [loadingAi, setLoadingAi] = useState<string | null>(null);
-  const [manualTrading, setManualTrading] = useState<string | null>(null);
+  const [marketContext, setMarketContext] = useState<{
+    fearGreed: { value: number; classification: string } | null;
+    fundingRates: Record<string, number>;
+    openInterest: Record<string, { oiChangePct: number }>;
+    longShortRatios: Record<string, number>;
+  }>({ fearGreed: null, fundingRates: {}, openInterest: {}, longShortRatios: {} });
   const [expandedCard, setExpandedCard] = useState<string | null>(null);
   const [isBacktestOpen, setIsBacktestOpen]   = useState(false);
   const [btSymbol, setBtSymbol]               = useState("BTC/USDT");
@@ -220,6 +255,9 @@ export default function App() {
         const cdRes = await fetch("/api/cooldown-status");
         if (cdRes.ok) setCooldownStatus(await cdRes.json());
 
+        const ctxRes = await fetch("/api/market-context");
+        if (ctxRes.ok) setMarketContext(await ctxRes.json());
+
         const posRes = await fetch("/api/open-positions");
         const posData = await posRes.json();
         setOpenPositions(posData.positions ?? []);
@@ -252,26 +290,6 @@ export default function App() {
     }
   };
 
-  const manualTrade = async (symbol: string, action: 'BUY' | 'SELL', price: number) => {
-    const key = `${symbol}-${action}`;
-    setManualTrading(key);
-    try {
-      const res = await fetch("/api/manual-trade", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ symbol, action, price }),
-      });
-      const d = await res.json();
-      if (!res.ok) { addLog(`Manual ${action} ${symbol} failed: ${d.error}`, "error"); return; }
-      addLog(`Manual ${action} ${symbol} @ ${d.fillPrice} x${d.leverage}${d.tpPrice ? ` TP:${d.tpPrice}` : ''} SL:${d.slCallback ?? '-'}%`, "success");
-      if (d.warnings?.length) d.warnings.forEach((w: string) => addLog(w, "warning"));
-      await refreshPositions();
-    } catch {
-      addLog(`Manual trade error for ${symbol}`, "error");
-    } finally {
-      setManualTrading(null);
-    }
-  };
 
   return (
     <div className="min-h-screen flex flex-col overflow-hidden">
@@ -470,6 +488,15 @@ export default function App() {
                         )}
                       </div>
                       <div className="text-xl font-bold mt-1">${coin.price?.toLocaleString()}</div>
+                      {marketContext.fundingRates[coin.symbol] !== undefined && (
+                        <div className={cn("text-[9px] font-mono mt-0.5",
+                          marketContext.fundingRates[coin.symbol] >  0.0005 ? "text-trading-down"
+                        : marketContext.fundingRates[coin.symbol] < -0.0003 ? "text-trading-up"
+                        : "text-trading-muted"
+                        )}>
+                          FR {marketContext.fundingRates[coin.symbol] >= 0 ? "+" : ""}{(marketContext.fundingRates[coin.symbol] * 100).toFixed(4)}%/8h
+                        </div>
+                      )}
                     </div>
                     {coin.trend && (
                       <div className={cn(
@@ -486,7 +513,7 @@ export default function App() {
                   {/* Strategy signal rows */}
                   <div className="space-y-1.5 mb-3">
                     {coin.ultraScalp && (() => {
-                      const r = getBlockReason(coin.ultraScalp.action, coin.trend, coin.ultraScalp.volumeRatio, 1.0, isAutoPilot, true);
+                      const r = getBlockReason(coin.ultraScalp.action, coin.trend, coin.ultraScalp.volumeRatio, 1.0, isAutoPilot, true, marketContext.fundingRates[coin.symbol], marketContext.fearGreed?.value, 'ULTRA-SCALP', coin.oiChangePct, coin.lsRatio);
                       return (
                         <div className="rounded overflow-hidden">
                           <div className="flex items-center gap-1.5 bg-trading-bg/40 px-2 py-1.5">
@@ -510,7 +537,7 @@ export default function App() {
                       );
                     })()}
                     {coin.momentumArb && (() => {
-                      const r = getBlockReason(coin.momentumArb.action, coin.trend, coin.momentumArb.volumeRatio, 1.0, isAutoPilot);
+                      const r = getBlockReason(coin.momentumArb.action, coin.trend, coin.momentumArb.volumeRatio, 1.0, isAutoPilot, false, marketContext.fundingRates[coin.symbol], marketContext.fearGreed?.value, 'MOMENTUM-ARB', coin.oiChangePct, coin.lsRatio);
                       return (
                         <div className="rounded overflow-hidden">
                           <div className="flex items-center gap-1.5 bg-trading-bg/40 px-2 py-1.5">
@@ -539,7 +566,7 @@ export default function App() {
                       );
                     })()}
                     {coin.meanRev && (() => {
-                      const r = getBlockReason(coin.meanRev.action, coin.trend, coin.meanRev.volumeRatio, 0.8, isAutoPilot, true);
+                      const r = getBlockReason(coin.meanRev.action, coin.trend, coin.meanRev.volumeRatio, 0.8, isAutoPilot, true, marketContext.fundingRates[coin.symbol], marketContext.fearGreed?.value, 'MEAN-REV', coin.oiChangePct, coin.lsRatio);
                       const bbColor = coin.meanRev.bbPos === 'LOWER' ? 'text-trading-up'
                                     : coin.meanRev.bbPos === 'UPPER' ? 'text-trading-down'
                                     : 'text-trading-muted';
@@ -572,6 +599,39 @@ export default function App() {
                     })()}
                   </div>
 
+                  {/* Futures Context Row — OI, L/S, VWAP */}
+                  {(coin.oiChangePct != null || coin.lsRatio != null || (coin.vwap && coin.vwap > 0)) && (
+                    <div className="flex gap-1.5 flex-wrap mb-2">
+                      {coin.oiChangePct != null && (
+                        <span className={cn("px-1.5 py-0.5 rounded text-[8px] font-bold font-mono",
+                          coin.oiChangePct >  1.0 ? "bg-trading-up/10 text-trading-up"
+                        : coin.oiChangePct < -1.0 ? "bg-trading-down/10 text-trading-down"
+                        : "bg-trading-muted/10 text-trading-muted"
+                        )}>
+                          OI {coin.oiChangePct >= 0 ? "+" : ""}{coin.oiChangePct.toFixed(2)}%
+                        </span>
+                      )}
+                      {coin.lsRatio != null && (
+                        <span className={cn("px-1.5 py-0.5 rounded text-[8px] font-bold font-mono",
+                          coin.lsRatio > 1.8 ? "bg-trading-down/10 text-trading-down"
+                        : coin.lsRatio < 0.6 ? "bg-trading-up/10 text-trading-up"
+                        : "bg-trading-muted/10 text-trading-muted"
+                        )}>
+                          L/S {coin.lsRatio.toFixed(2)}
+                        </span>
+                      )}
+                      {coin.vwap != null && coin.vwap > 0 && (
+                        <span className={cn("px-1.5 py-0.5 rounded text-[8px] font-bold font-mono",
+                          coin.price > coin.vwap * 1.001 ? "bg-trading-down/10 text-trading-down"
+                        : coin.price < coin.vwap * 0.999 ? "bg-trading-up/10 text-trading-up"
+                        : "bg-trading-muted/10 text-trading-muted"
+                        )}>
+                          VWAP {coin.price > coin.vwap ? "↑" : "↓"}{Math.abs((coin.price - coin.vwap) / coin.vwap * 100).toFixed(2)}%
+                        </span>
+                      )}
+                    </div>
+                  )}
+
                   {/* ATR + action buttons */}
                   <div className="flex gap-1 items-center flex-wrap">
                     {(coin.ultraScalp?.atrPct ?? 0) > 0 && (
@@ -582,20 +642,6 @@ export default function App() {
                       )}>ATR {coin.ultraScalp?.atrPct?.toFixed(2)}%</div>
                     )}
                     <div className="ml-auto flex gap-1">
-                      <button
-                        onClick={() => manualTrade(coin.symbol, 'BUY', coin.price)}
-                        disabled={manualTrading !== null}
-                        className="px-2 py-1 bg-trading-up/10 text-trading-up border border-trading-up/30 rounded text-[9px] font-black uppercase tracking-widest hover:bg-trading-up/20 transition-colors disabled:opacity-40"
-                      >
-                        {manualTrading === `${coin.symbol}-BUY` ? <Activity className="w-3 h-3 animate-spin inline" /> : 'L'}
-                      </button>
-                      <button
-                        onClick={() => manualTrade(coin.symbol, 'SELL', coin.price)}
-                        disabled={manualTrading !== null}
-                        className="px-2 py-1 bg-trading-down/10 text-trading-down border border-trading-down/30 rounded text-[9px] font-black uppercase tracking-widest hover:bg-trading-down/20 transition-colors disabled:opacity-40"
-                      >
-                        {manualTrading === `${coin.symbol}-SELL` ? <Activity className="w-3 h-3 animate-spin inline" /> : 'S'}
-                      </button>
                       <button
                         onClick={() => setExpandedCard(expandedCard === coin.symbol ? null : coin.symbol)}
                         className={cn(
@@ -690,6 +736,56 @@ export default function App() {
             >
               Clear
             </button>
+          </div>
+
+          {/* Market Sentiment widget */}
+          <div className="mb-4 p-3 bg-trading-card border border-trading-border rounded space-y-2">
+            <div className="flex items-center justify-between">
+              <span className="text-[9px] uppercase text-trading-muted font-bold tracking-wider">Fear & Greed</span>
+              {marketContext.fearGreed ? (
+                <div className={cn(
+                  "flex items-center gap-1.5 px-2 py-0.5 rounded text-[10px] font-black",
+                  marketContext.fearGreed.value < 25 ? "bg-trading-down/10 text-trading-down"
+                : marketContext.fearGreed.value > 75 ? "bg-orange-400/10 text-orange-400"
+                : marketContext.fearGreed.value > 50 ? "bg-trading-up/10 text-trading-up"
+                : "bg-trading-muted/10 text-trading-muted"
+                )}>
+                  <span>{marketContext.fearGreed.value}</span>
+                  <span className="text-[8px] font-medium">{marketContext.fearGreed.classification}</span>
+                </div>
+              ) : (
+                <span className="text-[9px] text-trading-muted font-mono">loading…</span>
+              )}
+            </div>
+            {marketContext.fearGreed && (
+              <div className="h-1 bg-trading-border rounded-full overflow-hidden">
+                <div
+                  className={cn("h-full rounded-full transition-all",
+                    marketContext.fearGreed.value < 25 ? "bg-trading-down"
+                  : marketContext.fearGreed.value > 75 ? "bg-orange-400"
+                  : marketContext.fearGreed.value > 50 ? "bg-trading-up"
+                  : "bg-trading-muted"
+                  )}
+                  style={{ width: `${marketContext.fearGreed.value}%` }}
+                />
+              </div>
+            )}
+            {Object.keys(marketContext.fundingRates).length > 0 && (() => {
+              const rates = Object.values(marketContext.fundingRates);
+              const avg   = rates.reduce((a, b) => a + b, 0) / rates.length;
+              return (
+                <div className="flex items-center justify-between">
+                  <span className="text-[9px] uppercase text-trading-muted font-bold tracking-wider">Avg Funding/8h</span>
+                  <span className={cn("text-[10px] font-black font-mono",
+                    avg >  0.0005 ? "text-trading-down"
+                  : avg < -0.0003 ? "text-trading-up"
+                  : "text-trading-muted"
+                  )}>
+                    {avg >= 0 ? "+" : ""}{(avg * 100).toFixed(4)}%
+                  </span>
+                </div>
+              );
+            })()}
           </div>
 
           <div className="flex-1 overflow-y-auto mb-4 min-h-0">
