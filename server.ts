@@ -301,8 +301,9 @@ async function checkAutoExecute(symbol: string, signal: AnySignal, strategyName:
 
   if (!isAutoPilot || signal.action === "HOLD") return;
 
-  // Trend filter — MEAN-REV intentionally skips this (range/neutral market strategy)
-  if (strategyName !== "MEAN-REV") {
+  // Trend filter — only MOMENTUM-ARB uses this (crossover strategy benefits from trend alignment)
+  // ULTRA-SCALP and MEAN-REV skip trend filter: 1m scalps are too short for 15m trend to matter
+  if (strategyName === "MOMENTUM-ARB") {
     if (signal.action === "BUY"  && trend === "DOWN") { console.log(`[TREND] ${symbol} BUY blocked — DOWN`);    return; }
     if (signal.action === "SELL" && trend === "UP")   { console.log(`[TREND] ${symbol} SELL blocked — UP`);     return; }
     if (trend === "NEUTRAL")                           { console.log(`[TREND] ${symbol} blocked — NEUTRAL`);     return; }
