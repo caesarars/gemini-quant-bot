@@ -82,7 +82,7 @@ function getBlockReason(
     if (action === 'SELL' && trend === 'UP')   return { label: 'SELL blocked — trend ↑', color: 'text-trading-down' };
   }
   if ((volumeRatio ?? 1) < volThreshold) return { label: `Vol ${volumeRatio?.toFixed(1)}× < ${volThreshold}×`, color: 'text-orange-400' };
-  return { label: 'Queued — cooldown check', color: 'text-trading-up' };
+  return { label: 'All clear — fires on candle close', color: 'text-trading-up' };
 }
 
 export default function App() {
