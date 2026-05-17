@@ -697,6 +697,33 @@ const takePnLSnapshot = async () => {
 
 app.get("/api/health", (req, res) => res.json({ status: "ok", timestamp: Date.now() }));
 
+// Returns per-symbol cooldown status so the frontend can show if a trade was just fired
+app.get("/api/cooldown-status", async (_req, res) => {
+  try {
+    const result = await pool.query(`
+      SELECT symbol, strategy, timestamp,
+        CASE strategy
+          WHEN 'MOMENTUM-ARB' THEN timestamp > NOW() - INTERVAL '15 minutes'
+          WHEN 'MEAN-REV'     THEN timestamp > NOW() - INTERVAL '30 minutes'
+          ELSE                     timestamp > NOW() - INTERVAL '5 minutes'
+        END AS in_cooldown
+      FROM trades
+      WHERE status = 'OPEN'
+        AND timestamp > NOW() - INTERVAL '30 minutes'
+      ORDER BY timestamp DESC
+    `);
+    const map: Record<string, { inCooldown: boolean; strategy: string; since: string }> = {};
+    for (const row of result.rows) {
+      if (!map[row.symbol]) {
+        map[row.symbol] = { inCooldown: row.in_cooldown, strategy: row.strategy, since: row.timestamp };
+      }
+    }
+    res.json(map);
+  } catch (err: any) {
+    res.status(500).json({ error: err?.message });
+  }
+});
+
 app.get("/api/scan", (req, res) => res.json({ results: scanResults, timestamp: Date.now() }));
 
 app.get("/api/open-positions", async (_req, res) => {
@@ -921,6 +948,64 @@ app.get("/api/trade-history", async (req, res) => {
     );
     res.json(r.rows);
   } catch { res.status(500).json({ error: "Failed to fetch trade history" }); }
+});
+
+app.post("/api/manual-trade", async (req, res) => {
+  const { symbol, action, price } = req.body;
+  if (!symbol || !action || !price) return res.status(400).json({ error: "symbol, action, price required" });
+  try {
+    const cfgRow  = await pool.query("SELECT leverage, atr_sl_mult::float, atr_tp_mult::float FROM bot_settings WHERE id = 'bot_config'");
+    const leverage  = cfgRow.rows[0]?.leverage || 10;
+    const slMult    = cfgRow.rows[0]?.atr_sl_mult ?? 1.5;
+    const tpMult    = cfgRow.rows[0]?.atr_tp_mult ?? 2.5;
+    const side      = action === "BUY" ? "buy" : "sell";
+    const closeSide = action === "BUY" ? "sell" : "buy";
+    const isLong    = action === "BUY";
+    const hasKeys   = !!(process.env.BINANCE_API_KEY && process.env.BINANCE_SECRET_KEY);
+    const amount    = parseFloat((binance as any).amountToPrecision(symbol, 25 / price));
+    const TAKER_RATE = 0.0004;
+
+    let fillPrice = price;
+    let feeUsdt   = parseFloat((fillPrice * amount * TAKER_RATE).toFixed(6));
+
+    // Get ATR from live buffer for SL/TP calculation
+    const buf = candleBuffer.get(symbol) || [];
+    const atr = buf.length >= 14 ? calcATR(buf) : 0;
+
+    if (hasKeys) {
+      await binance.setLeverage(leverage, symbol);
+      const order = await binance.createOrder(symbol, "market", side, amount);
+      fillPrice = parseFloat(String((order as any).average || (order as any).price || price));
+      const orderFee = (order as any).fee;
+      feeUsdt = orderFee?.cost && orderFee?.currency === "USDT"
+        ? parseFloat(Math.abs(orderFee.cost).toFixed(6))
+        : parseFloat((fillPrice * amount * TAKER_RATE).toFixed(6));
+
+      const atrF     = atr / fillPrice;
+      const dynSlPct = Math.min(Math.max(atrF * slMult, 0.001), 0.05);
+      const dynTpPct = Math.min(Math.max(atrF * tpMult, 0.002), 0.10);
+      const tpPrice  = parseFloat((binance as any).priceToPrecision(symbol, isLong ? fillPrice * (1 + dynTpPct) : fillPrice * (1 - dynTpPct)));
+      const cbRate   = parseFloat(Math.min(Math.max(dynSlPct * 100, 0.1), 5.0).toFixed(1));
+
+      try {
+        await binance.createOrder(symbol, "TAKE_PROFIT_MARKET", closeSide, amount, undefined, { stopPrice: tpPrice, reduceOnly: true, workingType: "MARK_PRICE" });
+      } catch { /* non-fatal */ }
+      try {
+        await binance.createOrder(symbol, "TRAILING_STOP_MARKET", closeSide, amount, undefined, { callbackRate: cbRate, reduceOnly: true, workingType: "MARK_PRICE" });
+      } catch { /* non-fatal */ }
+    }
+
+    await pool.query(
+      `INSERT INTO trades (symbol, type, entry_price, amount, strategy, status, leverage, fee_usdt)
+       VALUES ($1, $2, $3, $4, 'MANUAL', 'OPEN', $5, $6)`,
+      [symbol, action, fillPrice, amount, leverage, feeUsdt]
+    );
+    console.log(`[MANUAL] ${action} ${symbol} @ ${fillPrice} x${leverage}`);
+    res.json({ ok: true, symbol, action, fillPrice, amount, leverage });
+  } catch (e: any) {
+    console.error("[MANUAL] Error:", e?.message);
+    res.status(500).json({ error: e?.message });
+  }
 });
 
 app.post("/api/execute", async (req, res) => {

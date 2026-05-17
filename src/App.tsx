@@ -82,7 +82,7 @@ function getBlockReason(
     if (action === 'SELL' && trend === 'UP')   return { label: 'SELL blocked — trend ↑', color: 'text-trading-down' };
   }
   if ((volumeRatio ?? 1) < volThreshold) return { label: `Vol ${volumeRatio?.toFixed(1)}× < ${volThreshold}×`, color: 'text-orange-400' };
-  return { label: 'All clear — fires on candle close', color: 'text-trading-up' };
+  return { label: 'All clear — monitoring', color: 'text-trading-up' };
 }
 
 export default function App() {
@@ -100,8 +100,9 @@ export default function App() {
   const [logs, setLogs] = useState<{ id: string; msg: string; time: string; type: string }[]>([]);
   const [isAutoPilot, setIsAutoPilot]             = useState(false);
   const [activeStrategies, setActiveStrategies]   = useState<string[]>(["ULTRA-SCALP", "MOMENTUM-ARB"]);
-  const [aiConfirmations, setAiConfirmations] = useState<Record<string, AIResult>>({});
+  const [cooldownStatus, setCooldownStatus]       = useState<Record<string, { inCooldown: boolean; strategy: string }>>({});
   const [loadingAi, setLoadingAi] = useState<string | null>(null);
+  const [manualTrading, setManualTrading] = useState<string | null>(null);
   const [expandedCard, setExpandedCard] = useState<string | null>(null);
   const [isBacktestOpen, setIsBacktestOpen]   = useState(false);
   const [btSymbol, setBtSymbol]               = useState("BTC/USDT");
@@ -216,6 +217,9 @@ export default function App() {
         const historyData = await historyRes.json();
         setTradeHistory(historyData);
 
+        const cdRes = await fetch("/api/cooldown-status");
+        if (cdRes.ok) setCooldownStatus(await cdRes.json());
+
         const posRes = await fetch("/api/open-positions");
         const posData = await posRes.json();
         setOpenPositions(posData.positions ?? []);
@@ -232,7 +236,7 @@ export default function App() {
 
   const getAiConfirmation = async (symbol: string, data: any) => {
     setLoadingAi(symbol);
-    addLog(`AI analyzing ${symbol} structure...`, "ai");
+    addLog(`AI analyzing ${symbol}...`, "ai");
     try {
       const res = await fetch("/api/ai-confirm", {
         method: "POST",
@@ -240,12 +244,31 @@ export default function App() {
         body: JSON.stringify({ symbol, data })
       });
       const result = await res.json();
-      setAiConfirmations(prev => ({ ...prev, [symbol]: result }));
-      addLog(`AI Verdict for ${symbol}: ${result.verdict} (${result.confidence}%)`, "ai");
-    } catch (e) {
+      addLog(`AI ${symbol}: ${result.verdict} ${result.confidence}% — ${result.reason}`, "ai");
+    } catch {
       addLog(`AI analysis failed for ${symbol}`, "error");
     } finally {
       setLoadingAi(null);
+    }
+  };
+
+  const manualTrade = async (symbol: string, action: 'BUY' | 'SELL', price: number) => {
+    const key = `${symbol}-${action}`;
+    setManualTrading(key);
+    try {
+      const res = await fetch("/api/manual-trade", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ symbol, action, price }),
+      });
+      const d = await res.json();
+      if (!res.ok) { addLog(`Manual ${action} ${symbol} failed: ${d.error}`, "error"); return; }
+      addLog(`Manual ${action} ${symbol} @ ${price} x${d.leverage}`, "success");
+      await refreshPositions();
+    } catch {
+      addLog(`Manual trade error for ${symbol}`, "error");
+    } finally {
+      setManualTrading(null);
     }
   };
 
@@ -437,7 +460,14 @@ export default function App() {
                   {/* Symbol + Price + Trend */}
                   <div className="flex justify-between items-start mb-3">
                     <div>
-                      <div className="text-[11px] font-bold text-trading-muted">{coin.symbol}</div>
+                      <div className="flex items-center gap-1.5">
+                        <span className="text-[11px] font-bold text-trading-muted">{coin.symbol}</span>
+                        {cooldownStatus[coin.symbol]?.inCooldown && (
+                          <span className="text-[8px] px-1.5 py-0.5 bg-trading-up/15 text-trading-up border border-trading-up/30 rounded font-black uppercase tracking-wider animate-pulse">
+                            ✓ TRADE FIRED
+                          </span>
+                        )}
+                      </div>
                       <div className="text-xl font-bold mt-1">${coin.price?.toLocaleString()}</div>
                     </div>
                     {coin.trend && (
@@ -552,6 +582,20 @@ export default function App() {
                     )}
                     <div className="ml-auto flex gap-1">
                       <button
+                        onClick={() => manualTrade(coin.symbol, 'BUY', coin.price)}
+                        disabled={manualTrading !== null}
+                        className="px-2 py-1 bg-trading-up/10 text-trading-up border border-trading-up/30 rounded text-[9px] font-black uppercase tracking-widest hover:bg-trading-up/20 transition-colors disabled:opacity-40"
+                      >
+                        {manualTrading === `${coin.symbol}-BUY` ? <Activity className="w-3 h-3 animate-spin inline" /> : 'L'}
+                      </button>
+                      <button
+                        onClick={() => manualTrade(coin.symbol, 'SELL', coin.price)}
+                        disabled={manualTrading !== null}
+                        className="px-2 py-1 bg-trading-down/10 text-trading-down border border-trading-down/30 rounded text-[9px] font-black uppercase tracking-widest hover:bg-trading-down/20 transition-colors disabled:opacity-40"
+                      >
+                        {manualTrading === `${coin.symbol}-SELL` ? <Activity className="w-3 h-3 animate-spin inline" /> : 'S'}
+                      </button>
+                      <button
                         onClick={() => setExpandedCard(expandedCard === coin.symbol ? null : coin.symbol)}
                         className={cn(
                           "p-1.5 rounded transition-colors text-[10px] font-bold uppercase flex items-center gap-1",
@@ -627,108 +671,76 @@ export default function App() {
           </div>
         </section>
 
-        {/* Right Column: AI Analysis & Logs */}
+        {/* Right Column: Bot Activity Log */}
         <aside className="bg-trading-bg p-5 flex flex-col overflow-y-auto">
-          <div className="flex items-center justify-between gap-3 mb-4">
-            <div className="flex items-center gap-3 text-[10px] uppercase text-trading-muted tracking-[2px] after:content-[''] after:w-8 after:h-[1px] after:bg-trading-border after:ml-3">
-              Neural Insight
+          <div className="flex items-center justify-between mb-4">
+            <div className="flex items-center gap-2 text-[10px] uppercase text-trading-muted tracking-[2px]">
+              <Activity className="w-3 h-3" />
+              <span>Bot Activity Log</span>
+              {logs.length > 0 && (
+                <span className="px-1.5 py-0.5 bg-trading-card rounded text-[8px] font-black text-trading-muted">
+                  {logs.length}
+                </span>
+              )}
             </div>
-            <button 
-              onClick={() => setAiConfirmations({})} 
-              className="text-[9px] text-trading-muted hover:text-trading-accent transition-colors uppercase font-bold tracking-widest"
+            <button
+              onClick={() => setLogs([])}
+              className="text-[9px] text-trading-muted hover:text-trading-down transition-colors uppercase font-bold tracking-widest"
             >
               Clear
             </button>
           </div>
-          
-          <div className="space-y-3 mb-6">
-            <AnimatePresence mode="popLayout">
-              {loadingAi && (
-                <motion.div 
-                  initial={{ opacity: 0, y: -10 }}
-                  animate={{ opacity: 1, y: 0 }}
-                  className="p-3 bg-trading-accent/5 border border-trading-accent/30 border-dashed rounded flex gap-3 items-center"
-                >
-                  <div className="w-3 h-3 border-2 border-trading-accent/30 border-t-trading-accent rounded-full animate-spin" />
-                  <div className="text-[10px] font-bold text-trading-accent uppercase animate-pulse">Analyzing {loadingAi}...</div>
-                </motion.div>
-              )}
-              {Object.entries(aiConfirmations).map(([symbol, result]) => {
-                const res = result as AIResult;
-                const isBuy = res.verdict.toUpperCase().includes('BUY');
-                const isSell = res.verdict.toUpperCase().includes('SELL');
-                
-                return (
-                  <motion.div 
-                    key={symbol}
-                    initial={{ opacity: 0, x: 20 }}
+
+          <div className="flex-1 overflow-y-auto mb-4 min-h-0">
+            {logs.length === 0 ? (
+              <div className="flex flex-col items-center justify-center h-full opacity-20 py-12">
+                <Activity className="w-6 h-6 mb-2" />
+                <div className="text-[9px] uppercase tracking-widest text-center leading-relaxed">
+                  No activity yet<br/>Bot is monitoring
+                </div>
+              </div>
+            ) : (
+              <AnimatePresence mode="popLayout" initial={false}>
+                {logs.map((log) => (
+                  <motion.div
+                    key={log.id}
+                    initial={{ opacity: 0, x: 16 }}
                     animate={{ opacity: 1, x: 0 }}
-                    exit={{ opacity: 0, scale: 0.9 }}
-                    className="p-4 bg-trading-card border border-trading-border rounded relative overflow-hidden shadow-xl"
+                    exit={{ opacity: 0, height: 0 }}
+                    transition={{ duration: 0.15 }}
+                    className="flex gap-2 items-start py-2 border-b border-trading-border/30"
                   >
-                    {/* Background Glow */}
-                    <div className={cn(
-                      "absolute -right-4 -top-4 w-12 h-12 blur-2xl opacity-10 rounded-full",
-                      isBuy ? "bg-trading-up" : isSell ? "bg-trading-down" : "bg-trading-accent"
-                    )} />
-
-                    <div className="flex justify-between items-center mb-2">
-                      <div className="flex items-center gap-2">
-                        <div className={cn(
-                          "w-1.5 h-1.5 rounded-full",
-                          isBuy ? "bg-trading-up shadow-[0_0_8px_var(--color-trading-up)]" : 
-                          isSell ? "bg-trading-down shadow-[0_0_8px_var(--color-trading-down)]" : 
-                          "bg-trading-muted"
-                        )} />
-                        <span className="font-bold text-[11px] tracking-tight">{symbol}</span>
-                      </div>
-                      <span className="text-[9px] font-mono font-bold text-trading-accent px-1.5 py-0.5 bg-trading-accent/10 rounded">
-                        {res.confidence}% CONFIDENCE
-                      </span>
-                    </div>
-
-                    <div className={cn(
-                      "text-[12px] font-black mb-1.5 uppercase tracking-wider",
-                      isBuy ? "text-trading-up" : isSell ? "text-trading-down" : "text-trading-muted"
+                    <span className="text-[8px] font-mono text-trading-muted shrink-0 mt-0.5 w-[38px]">
+                      {log.time.split(' ')[0]}
+                    </span>
+                    <span className={cn(
+                      "text-[7px] font-black px-1 py-0.5 rounded shrink-0 uppercase tracking-wider mt-0.5",
+                      log.type === 'success' && "bg-trading-up/15 text-trading-up",
+                      log.type === 'error'   && "bg-trading-down/15 text-trading-down",
+                      log.type === 'ai'      && "bg-trading-accent/15 text-trading-accent",
+                      log.type === 'warning' && "bg-orange-400/15 text-orange-400",
+                      log.type === 'info'    && "bg-trading-muted/15 text-trading-muted",
                     )}>
-                      VERDICT: {res.verdict}
-                    </div>
-
-                    <div className="relative">
-                      <div className="absolute left-0 top-0 bottom-0 w-[1px] bg-trading-border" />
-                      <p className="text-[10px] text-trading-muted italic leading-relaxed pl-3 py-1">
-                        "{res.reason}"
-                      </p>
-                    </div>
+                      {log.type === 'success' ? 'TRADE'
+                       : log.type === 'error'   ? 'ERR'
+                       : log.type === 'ai'      ? 'AI'
+                       : log.type === 'warning' ? 'WARN'
+                       : 'SYS'}
+                    </span>
+                    <span className={cn(
+                      "text-[10px] leading-snug break-words min-w-0",
+                      log.type === 'success' && "text-trading-up",
+                      log.type === 'error'   && "text-trading-down",
+                      log.type === 'ai'      && "text-trading-accent",
+                      log.type === 'warning' && "text-orange-400",
+                      log.type === 'info'    && "text-trading-muted",
+                    )}>
+                      {log.msg}
+                    </span>
                   </motion.div>
-                );
-              })}
-            </AnimatePresence>
-            {Object.keys(aiConfirmations).length === 0 && !loadingAi && (
-              <div className="text-center py-12 opacity-30 border border-trading-border border-dashed rounded">
-                <Bot className="w-8 h-8 mx-auto mb-3 opacity-20" />
-                <div className="text-[9px] uppercase tracking-widest leading-relaxed">Neural Core Idle<br/>Await Confirmation Request</div>
-              </div>
+                ))}
+              </AnimatePresence>
             )}
-          </div>
-
-          <div className="flex items-center gap-3 text-[10px] uppercase text-trading-muted tracking-[2px] mb-4 after:content-[''] after:flex-1 after:h-[1px] after:bg-trading-border after:ml-3">
-            Execution Log
-          </div>
-          <div className="flex-1 space-y-1.5 overflow-y-auto mb-6">
-            {logs.map((log) => (
-              <div key={log.id} className="text-[9px] flex justify-between border-b border-trading-border/50 pb-1 font-medium">
-                <span className="text-trading-muted">{log.time.split(' ')[0]}</span>
-                <span className={cn(
-                  "uppercase",
-                  log.type === 'error' && "text-trading-down",
-                  log.type === 'success' && "text-trading-up",
-                  log.type === 'ai' && "text-trading-accent"
-                )}>
-                  {log.msg.length > 60 ? log.msg.slice(0, 60) + '...' : log.msg}
-                </span>
-              </div>
-            ))}
           </div>
 
           <div className="space-y-4 pt-4 border-t border-trading-border">
