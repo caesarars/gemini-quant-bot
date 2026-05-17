@@ -266,6 +266,8 @@ const candleBuffer   = new Map<string, number[][]>(SYMBOLS.map(s => [s, []]));
 const momentumBuffer = new Map<string, number[][]>(SYMBOLS.map(s => [s, []]));
 // 200-candle buffer (15m) for trend filter — EMA200 direction
 const trendBuffer    = new Map<string, number[][]>(SYMBOLS.map(s => [s, []]));
+// Last ULTRA-SCALP action per symbol — detect HOLD→BUY/SELL transition to avoid flooding checkAutoExecute
+const lastUltraScalpAction = new Map<string, string>(SYMBOLS.map(s => [s, "HOLD"]));
 
 let scanResults: any[] = [];
 // Set of currently enabled strategies — all three active by default
@@ -530,27 +532,33 @@ function initWebSocket() {
         return;
       }
 
-      // ── 1m: ULTRA-SCALP — always compute, gate only auto-execute ──
+      // ── 1m: ULTRA-SCALP — compute on every tick, execute on HOLD→BUY/SELL transition ──
       const buffer = candleBuffer.get(symbol) || [];
       if (k.x) {
         buffer.push(candle);
         if (buffer.length > 50) buffer.shift();
         candleBuffer.set(symbol, buffer);
         await saveOHLCV(symbol, [candle]);
+      }
 
-        if (buffer.length >= 26) {
-          const signal = calculateSignal(buffer);
-          const trend  = getTrend(symbol);
-          const idx    = scanResults.findIndex(r => r.symbol === symbol);
-          const entry  = scanResults[idx] || { symbol, price: signal.price, trend };
-          entry.trend     = trend;
-          entry.price     = signal.price;
-          entry.ultraScalp = { action: signal.action, rsi: signal.rsi, volumeRatio: signal.volumeRatio, atrPct: signal.atrPct };
-          if (idx >= 0) scanResults[idx] = entry; else scanResults.push(entry);
-          if (activeStrategies.has("ULTRA-SCALP")) {
-            await checkAutoExecute(symbol, signal, "ULTRA-SCALP");
-          }
+      // Append live in-progress candle so signal reacts in real-time, not at candle close
+      const liveBuffer = buffer.length > 0 ? (k.x ? buffer : [...buffer, candle]) : buffer;
+      if (liveBuffer.length >= 26) {
+        const signal = calculateSignal(liveBuffer);
+        const trend  = getTrend(symbol);
+        const idx    = scanResults.findIndex(r => r.symbol === symbol);
+        const entry  = scanResults[idx] || { symbol, price: signal.price, trend };
+        entry.trend      = trend;
+        entry.price      = signal.price;
+        entry.ultraScalp = { action: signal.action, rsi: signal.rsi, volumeRatio: signal.volumeRatio, atrPct: signal.atrPct };
+        if (idx >= 0) scanResults[idx] = entry; else scanResults.push(entry);
+
+        // Only fire on HOLD→BUY/SELL transition — prevents flooding DB on every tick
+        const prevAction = lastUltraScalpAction.get(symbol) || "HOLD";
+        if (activeStrategies.has("ULTRA-SCALP") && signal.action !== "HOLD" && prevAction === "HOLD") {
+          await checkAutoExecute(symbol, signal, "ULTRA-SCALP");
         }
+        lastUltraScalpAction.set(symbol, signal.action);
       } else {
         const idx = scanResults.findIndex(r => r.symbol === symbol);
         if (idx >= 0) scanResults[idx] = { ...scanResults[idx], price: +k.c };
