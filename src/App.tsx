@@ -455,7 +455,7 @@ export default function App() {
                   {/* Strategy signal rows */}
                   <div className="space-y-1.5 mb-3">
                     {coin.ultraScalp && (() => {
-                      const r = getBlockReason(coin.ultraScalp.action, coin.trend, coin.ultraScalp.volumeRatio, 1.2, isAutoPilot);
+                      const r = getBlockReason(coin.ultraScalp.action, coin.trend, coin.ultraScalp.volumeRatio, 1.0, isAutoPilot);
                       return (
                         <div className="rounded overflow-hidden">
                           <div className="flex items-center gap-1.5 bg-trading-bg/40 px-2 py-1.5">
@@ -479,7 +479,7 @@ export default function App() {
                       );
                     })()}
                     {coin.momentumArb && (() => {
-                      const r = getBlockReason(coin.momentumArb.action, coin.trend, coin.momentumArb.volumeRatio, 1.2, isAutoPilot);
+                      const r = getBlockReason(coin.momentumArb.action, coin.trend, coin.momentumArb.volumeRatio, 1.0, isAutoPilot);
                       return (
                         <div className="rounded overflow-hidden">
                           <div className="flex items-center gap-1.5 bg-trading-bg/40 px-2 py-1.5">

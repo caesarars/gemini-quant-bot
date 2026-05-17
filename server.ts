@@ -307,7 +307,7 @@ async function checkAutoExecute(symbol: string, signal: AnySignal, strategyName:
   }
 
   // Volume threshold: MEAN-REV uses 0.8× (range markets have subdued volume)
-  const volThreshold = strategyName === "MEAN-REV" ? 0.8 : 1.2;
+  const volThreshold = strategyName === "MEAN-REV" ? 0.8 : 1.0;
   const volRatio     = signal.volumeRatio ?? 1;
   if (volRatio < volThreshold) {
     console.log(`[VOL] ${symbol} blocked — ${volRatio}× < ${volThreshold}× threshold`);
