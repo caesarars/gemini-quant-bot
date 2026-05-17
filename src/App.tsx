@@ -32,6 +32,7 @@ interface StrategySignal {
   volumeRatio?: number;
   atrPct?: number;
   cross?: string | null;
+  bbPos?: string | null;
 }
 
 interface ScanResult {
@@ -40,6 +41,7 @@ interface ScanResult {
   trend?: 'UP' | 'DOWN' | 'NEUTRAL';
   ultraScalp?: StrategySignal;
   momentumArb?: StrategySignal;
+  meanRev?: StrategySignal;
 }
 
 interface AIResult {
@@ -62,6 +64,25 @@ interface OpenPosition {
   pnl_pct: number;
   fee_usdt: number;
   opened_at: string;
+}
+
+function getBlockReason(
+  action: 'BUY' | 'SELL' | 'HOLD',
+  trend: 'UP' | 'DOWN' | 'NEUTRAL' | undefined,
+  volumeRatio: number | undefined,
+  volThreshold: number,
+  isAutoPilot: boolean,
+  skipTrend = false
+): { label: string; color: string } {
+  if (!isAutoPilot) return { label: 'Auto-pilot OFF', color: 'text-trading-muted' };
+  if (action === 'HOLD') return { label: 'No signal', color: 'text-trading-muted' };
+  if (!skipTrend) {
+    if (trend === 'NEUTRAL') return { label: 'Trend neutral', color: 'text-orange-400' };
+    if (action === 'BUY'  && trend === 'DOWN') return { label: 'BUY blocked — trend ↓', color: 'text-trading-down' };
+    if (action === 'SELL' && trend === 'UP')   return { label: 'SELL blocked — trend ↑', color: 'text-trading-down' };
+  }
+  if ((volumeRatio ?? 1) < volThreshold) return { label: `Vol ${volumeRatio?.toFixed(1)}× < ${volThreshold}×`, color: 'text-orange-400' };
+  return { label: 'Queued — cooldown check', color: 'text-trading-up' };
 }
 
 export default function App() {
@@ -294,9 +315,10 @@ export default function App() {
           </div>
           <div className="space-y-3">
             {([
-              { id: 'ULTRA-SCALP',     name: 'ULTRA-SCALP v2.1', desc: '1m · RSI+MACD+BB+EMA · Vol 1.5×',          available: true },
-              { id: 'MOMENTUM-ARB',    name: 'MOMENTUM ARB',      desc: '5m · EMA9/21 crossover · Vol 1.2×',       available: true },
-              { id: 'VOLATILITY-CORE', name: 'VOLATILITY CORE',   desc: 'Coming soon — BB squeeze + ATR expansion', available: false },
+              { id: 'ULTRA-SCALP',     name: 'ULTRA-SCALP v2.1', desc: '1m · RSI+MACD+BB+EMA · Vol 1.5×',             available: true },
+              { id: 'MOMENTUM-ARB',    name: 'MOMENTUM ARB',      desc: '5m · EMA9/21 crossover · Vol 1.2×',          available: true },
+              { id: 'MEAN-REV',        name: 'MEAN REVERSION',    desc: '15m · BB band touch + RSI · No trend filter', available: true },
+              { id: 'VOLATILITY-CORE', name: 'VOLATILITY CORE',   desc: 'Coming soon — BB squeeze + ATR expansion',    available: false },
             ] as const).map(strat => {
               const isEnabled = activeStrategies.includes(strat.id);
               return (
@@ -432,43 +454,91 @@ export default function App() {
 
                   {/* Strategy signal rows */}
                   <div className="space-y-1.5 mb-3">
-                    {coin.ultraScalp && (
-                      <div className="flex items-center gap-1.5 bg-trading-bg/40 px-2 py-1.5 rounded">
-                        <span className="text-trading-muted font-mono w-[68px] shrink-0 text-[9px] uppercase">Scalp 1m</span>
-                        <span className={cn("px-1 py-0.5 rounded font-bold text-[9px]",
-                          coin.ultraScalp.action === 'BUY'  ? "bg-trading-up/10 text-trading-up"
-                        : coin.ultraScalp.action === 'SELL' ? "bg-trading-down/10 text-trading-down"
-                        :                                      "bg-trading-muted/10 text-trading-muted"
-                        )}>{coin.ultraScalp.action}</span>
-                        <span className="text-[10px] text-trading-muted">RSI {coin.ultraScalp.rsi.toFixed(0)}</span>
-                        {coin.ultraScalp.volumeRatio !== undefined && (
-                          <span className={cn("ml-auto text-[9px] font-bold",
-                            coin.ultraScalp.volumeRatio >= 1.5 ? "text-trading-up" : "text-trading-muted"
-                          )}>V {coin.ultraScalp.volumeRatio.toFixed(1)}×</span>
-                        )}
-                      </div>
-                    )}
-                    {coin.momentumArb && (
-                      <div className="flex items-center gap-1.5 bg-trading-bg/40 px-2 py-1.5 rounded">
-                        <span className="text-trading-muted font-mono w-[68px] shrink-0 text-[9px] uppercase">Moment 5m</span>
-                        <span className={cn("px-1 py-0.5 rounded font-bold text-[9px]",
-                          coin.momentumArb.action === 'BUY'  ? "bg-trading-up/10 text-trading-up"
-                        : coin.momentumArb.action === 'SELL' ? "bg-trading-down/10 text-trading-down"
-                        :                                       "bg-trading-muted/10 text-trading-muted"
-                        )}>{coin.momentumArb.action}</span>
-                        <span className="text-[10px] text-trading-muted">RSI {coin.momentumArb.rsi.toFixed(0)}</span>
-                        {coin.momentumArb.cross && (
-                          <span className={cn("text-[9px] font-bold",
-                            coin.momentumArb.cross === 'GOLDEN' ? "text-trading-up" : "text-trading-down"
-                          )}>{coin.momentumArb.cross === 'GOLDEN' ? '↑GX' : '↓DX'}</span>
-                        )}
-                        {coin.momentumArb.volumeRatio !== undefined && (
-                          <span className={cn("ml-auto text-[9px] font-bold",
-                            coin.momentumArb.volumeRatio >= 1.2 ? "text-trading-up" : "text-trading-muted"
-                          )}>V {coin.momentumArb.volumeRatio.toFixed(1)}×</span>
-                        )}
-                      </div>
-                    )}
+                    {coin.ultraScalp && (() => {
+                      const r = getBlockReason(coin.ultraScalp.action, coin.trend, coin.ultraScalp.volumeRatio, 1.2, isAutoPilot);
+                      return (
+                        <div className="rounded overflow-hidden">
+                          <div className="flex items-center gap-1.5 bg-trading-bg/40 px-2 py-1.5">
+                            <span className="text-trading-muted font-mono w-[68px] shrink-0 text-[9px] uppercase">Scalp 1m</span>
+                            <span className={cn("px-1 py-0.5 rounded font-bold text-[9px]",
+                              coin.ultraScalp.action === 'BUY'  ? "bg-trading-up/10 text-trading-up"
+                            : coin.ultraScalp.action === 'SELL' ? "bg-trading-down/10 text-trading-down"
+                            :                                      "bg-trading-muted/10 text-trading-muted"
+                            )}>{coin.ultraScalp.action}</span>
+                            <span className="text-[10px] text-trading-muted">RSI {coin.ultraScalp.rsi.toFixed(0)}</span>
+                            {coin.ultraScalp.volumeRatio !== undefined && (
+                              <span className={cn("ml-auto text-[9px] font-bold",
+                                coin.ultraScalp.volumeRatio >= 1.5 ? "text-trading-up" : "text-trading-muted"
+                              )}>V {coin.ultraScalp.volumeRatio.toFixed(1)}×</span>
+                            )}
+                          </div>
+                          <div className={cn("px-2 pb-1.5 text-[8px] font-mono bg-trading-bg/40", r.color)}>
+                            ↳ {r.label}
+                          </div>
+                        </div>
+                      );
+                    })()}
+                    {coin.momentumArb && (() => {
+                      const r = getBlockReason(coin.momentumArb.action, coin.trend, coin.momentumArb.volumeRatio, 1.2, isAutoPilot);
+                      return (
+                        <div className="rounded overflow-hidden">
+                          <div className="flex items-center gap-1.5 bg-trading-bg/40 px-2 py-1.5">
+                            <span className="text-trading-muted font-mono w-[68px] shrink-0 text-[9px] uppercase">Moment 5m</span>
+                            <span className={cn("px-1 py-0.5 rounded font-bold text-[9px]",
+                              coin.momentumArb.action === 'BUY'  ? "bg-trading-up/10 text-trading-up"
+                            : coin.momentumArb.action === 'SELL' ? "bg-trading-down/10 text-trading-down"
+                            :                                       "bg-trading-muted/10 text-trading-muted"
+                            )}>{coin.momentumArb.action}</span>
+                            <span className="text-[10px] text-trading-muted">RSI {coin.momentumArb.rsi.toFixed(0)}</span>
+                            {coin.momentumArb.cross && (
+                              <span className={cn("text-[9px] font-bold",
+                                coin.momentumArb.cross === 'GOLDEN' ? "text-trading-up" : "text-trading-down"
+                              )}>{coin.momentumArb.cross === 'GOLDEN' ? '↑GX' : '↓DX'}</span>
+                            )}
+                            {coin.momentumArb.volumeRatio !== undefined && (
+                              <span className={cn("ml-auto text-[9px] font-bold",
+                                coin.momentumArb.volumeRatio >= 1.2 ? "text-trading-up" : "text-trading-muted"
+                              )}>V {coin.momentumArb.volumeRatio.toFixed(1)}×</span>
+                            )}
+                          </div>
+                          <div className={cn("px-2 pb-1.5 text-[8px] font-mono bg-trading-bg/40", r.color)}>
+                            ↳ {r.label}
+                          </div>
+                        </div>
+                      );
+                    })()}
+                    {coin.meanRev && (() => {
+                      const r = getBlockReason(coin.meanRev.action, coin.trend, coin.meanRev.volumeRatio, 0.8, isAutoPilot, true);
+                      const bbColor = coin.meanRev.bbPos === 'LOWER' ? 'text-trading-up'
+                                    : coin.meanRev.bbPos === 'UPPER' ? 'text-trading-down'
+                                    : 'text-trading-muted';
+                      return (
+                        <div className="rounded overflow-hidden">
+                          <div className="flex items-center gap-1.5 bg-trading-accent/5 border border-trading-accent/10 px-2 py-1.5">
+                            <span className="text-trading-accent/70 font-mono w-[68px] shrink-0 text-[9px] uppercase">MeanRev 15m</span>
+                            <span className={cn("px-1 py-0.5 rounded font-bold text-[9px]",
+                              coin.meanRev.action === 'BUY'  ? "bg-trading-up/10 text-trading-up"
+                            : coin.meanRev.action === 'SELL' ? "bg-trading-down/10 text-trading-down"
+                            :                                   "bg-trading-muted/10 text-trading-muted"
+                            )}>{coin.meanRev.action}</span>
+                            <span className="text-[10px] text-trading-muted">RSI {coin.meanRev.rsi.toFixed(0)}</span>
+                            {coin.meanRev.bbPos && (
+                              <span className={cn("text-[9px] font-bold", bbColor)}>
+                                BB:{coin.meanRev.bbPos}
+                              </span>
+                            )}
+                            {coin.meanRev.volumeRatio !== undefined && (
+                              <span className={cn("ml-auto text-[9px] font-bold",
+                                coin.meanRev.volumeRatio >= 0.8 ? "text-trading-up" : "text-trading-muted"
+                              )}>V {coin.meanRev.volumeRatio.toFixed(1)}×</span>
+                            )}
+                          </div>
+                          <div className={cn("px-2 pb-1.5 text-[8px] font-mono bg-trading-accent/5", r.color)}>
+                            ↳ {r.label}
+                          </div>
+                        </div>
+                      );
+                    })()}
                   </div>
 
                   {/* ATR + action buttons */}

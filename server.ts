@@ -52,6 +52,10 @@ async function runMigrations() {
   await pool.query(`ALTER TABLE bot_settings ADD COLUMN IF NOT EXISTS arb_tp_mult      NUMERIC(5,2) DEFAULT 3.0`);
   await pool.query(`ALTER TABLE bot_settings ADD COLUMN IF NOT EXISTS active_strategies TEXT[]       DEFAULT '{ULTRA-SCALP,MOMENTUM-ARB}'`);
   await pool.query(`ALTER TABLE trades ADD COLUMN IF NOT EXISTS fee_usdt NUMERIC(20,8) DEFAULT 0`);
+  await pool.query(`ALTER TABLE bot_settings ADD COLUMN IF NOT EXISTS mr_sl_mult NUMERIC(5,2) DEFAULT 1.0`);
+  await pool.query(`ALTER TABLE bot_settings ADD COLUMN IF NOT EXISTS mr_tp_mult NUMERIC(5,2) DEFAULT 2.0`);
+  await pool.query(`UPDATE bot_settings SET active_strategies = array_append(active_strategies, 'MEAN-REV') WHERE id = 'bot_config' AND NOT ('MEAN-REV' = ANY(COALESCE(active_strategies, '{}')))`);
+
 }
 
 // ── Exchange ───────────────────────────────────────────────────────────────────
@@ -212,6 +216,29 @@ function calculateMomentumSignal(ohlcv: number[][]) {
   return { action, rsi, price, volumeRatio, atr, atrPct, cross };
 }
 
+// Returns signal for MEAN-REVERSION: BB band touch + RSI on 15m candles.
+// Intentionally ignores trend direction — designed for range/neutral markets.
+function calculateMeanRevSignal(ohlcv: number[][]) {
+  const empty = { action: "HOLD" as const, rsi: 50, price: 0, volumeRatio: 1, atr: 0, atrPct: 0, bbPos: null as string | null };
+  if (!ohlcv || ohlcv.length < 20) return empty;
+  const closes  = ohlcv.map(c => c[4]);
+  const volumes = ohlcv.map(c => c[5]);
+  const price   = closes[closes.length - 1];
+  const rsi     = parseFloat(calcRSI(closes).toFixed(2));
+  const bb      = calcBollingerBands(closes, 20, 2);
+  const atr     = parseFloat(calcATR(ohlcv).toFixed(6));
+  const atrPct  = price > 0 ? parseFloat((atr / price * 100).toFixed(4)) : 0;
+  const volumeRatio = parseFloat(calcVolumeRatio(volumes).toFixed(2));
+
+  const bbPos = price <= bb.lower ? "LOWER" : price >= bb.upper ? "UPPER" : "MID";
+
+  let action: "BUY" | "SELL" | "HOLD" = "HOLD";
+  if (price <= bb.lower * 1.003 && rsi < 38) action = "BUY";  // oversold at lower band
+  if (price >= bb.upper * 0.997 && rsi > 62) action = "SELL"; // overbought at upper band
+
+  return { action, rsi, price, volumeRatio, atr, atrPct, bbPos };
+}
+
 // ── OHLCV Persistence ──────────────────────────────────────────────────────────
 
 async function saveOHLCV(symbol: string, candles: number[][], timeframe = "1m") {
@@ -241,8 +268,8 @@ const momentumBuffer = new Map<string, number[][]>(SYMBOLS.map(s => [s, []]));
 const trendBuffer    = new Map<string, number[][]>(SYMBOLS.map(s => [s, []]));
 
 let scanResults: any[] = [];
-// Set of currently enabled strategies — both active by default
-let activeStrategies = new Set<string>(["ULTRA-SCALP", "MOMENTUM-ARB"]);
+// Set of currently enabled strategies — all three active by default
+let activeStrategies = new Set<string>(["ULTRA-SCALP", "MOMENTUM-ARB", "MEAN-REV"]);
 
 // ── Trend Filter (EMA 200 on 15m) ─────────────────────────────────────────────
 
@@ -272,21 +299,23 @@ async function checkAutoExecute(symbol: string, signal: AnySignal, strategyName:
 
   if (!isAutoPilot || signal.action === "HOLD") return;
 
-  // Block if trade direction opposes higher-timeframe trend
-  if (signal.action === "BUY"  && trend === "DOWN") { console.log(`[TREND] ${symbol} BUY blocked — DOWN`);    return; }
-  if (signal.action === "SELL" && trend === "UP")   { console.log(`[TREND] ${symbol} SELL blocked — UP`);     return; }
-  if (trend === "NEUTRAL")                           { console.log(`[TREND] ${symbol} blocked — NEUTRAL`);     return; }
+  // Trend filter — MEAN-REV intentionally skips this (range/neutral market strategy)
+  if (strategyName !== "MEAN-REV") {
+    if (signal.action === "BUY"  && trend === "DOWN") { console.log(`[TREND] ${symbol} BUY blocked — DOWN`);    return; }
+    if (signal.action === "SELL" && trend === "UP")   { console.log(`[TREND] ${symbol} SELL blocked — UP`);     return; }
+    if (trend === "NEUTRAL")                           { console.log(`[TREND] ${symbol} blocked — NEUTRAL`);     return; }
+  }
 
-  // Volume threshold: both strategies use 1.2× minimum
-  const volThreshold = 1.2;
+  // Volume threshold: MEAN-REV uses 0.8× (range markets have subdued volume)
+  const volThreshold = strategyName === "MEAN-REV" ? 0.8 : 1.2;
   const volRatio     = signal.volumeRatio ?? 1;
   if (volRatio < volThreshold) {
     console.log(`[VOL] ${symbol} blocked — ${volRatio}× < ${volThreshold}× threshold`);
     return;
   }
 
-  // Cooldown: ULTRA-SCALP 5m, MOMENTUM-ARB 15m
-  const cooldown = strategyName === "MOMENTUM-ARB" ? "15 minutes" : "5 minutes";
+  // Cooldown: ULTRA-SCALP 5m, MOMENTUM-ARB 15m, MEAN-REV 30m
+  const cooldown = strategyName === "MOMENTUM-ARB" ? "15 minutes" : strategyName === "MEAN-REV" ? "30 minutes" : "5 minutes";
   const recent   = await pool.query(
     `SELECT id FROM trades WHERE symbol = $1 AND status = 'OPEN'
      AND timestamp > NOW() - INTERVAL '${cooldown}' LIMIT 1`, [symbol]
@@ -297,10 +326,14 @@ async function checkAutoExecute(symbol: string, signal: AnySignal, strategyName:
   }
 
   // ATR multipliers differ per strategy
-  const cfgRow   = await pool.query("SELECT leverage, atr_sl_mult::float, atr_tp_mult::float, arb_sl_mult::float, arb_tp_mult::float FROM bot_settings WHERE id = 'bot_config'");
+  const cfgRow   = await pool.query("SELECT leverage, atr_sl_mult::float, atr_tp_mult::float, arb_sl_mult::float, arb_tp_mult::float, mr_sl_mult::float, mr_tp_mult::float FROM bot_settings WHERE id = 'bot_config'");
   const leverage = cfgRow.rows[0]?.leverage || 10;
-  const slMult   = strategyName === "MOMENTUM-ARB" ? (cfgRow.rows[0]?.arb_sl_mult ?? 1.0) : (cfgRow.rows[0]?.atr_sl_mult ?? 1.5);
-  const tpMult   = strategyName === "MOMENTUM-ARB" ? (cfgRow.rows[0]?.arb_tp_mult ?? 3.0) : (cfgRow.rows[0]?.atr_tp_mult ?? 2.5);
+  const slMult   = strategyName === "MOMENTUM-ARB" ? (cfgRow.rows[0]?.arb_sl_mult ?? 1.0)
+                 : strategyName === "MEAN-REV"      ? (cfgRow.rows[0]?.mr_sl_mult  ?? 1.0)
+                 :                                    (cfgRow.rows[0]?.atr_sl_mult ?? 1.5);
+  const tpMult   = strategyName === "MOMENTUM-ARB" ? (cfgRow.rows[0]?.arb_tp_mult ?? 3.0)
+                 : strategyName === "MEAN-REV"      ? (cfgRow.rows[0]?.mr_tp_mult  ?? 2.0)
+                 :                                    (cfgRow.rows[0]?.atr_tp_mult ?? 2.5);
   const side      = signal.action === "BUY" ? "buy" : "sell";
   const closeSide = signal.action === "BUY" ? "sell" : "buy";
   const isLong    = signal.action === "BUY";
@@ -401,20 +434,22 @@ async function seedCandleBuffer() {
       trendBuffer.set(symbol, buf15m);
       await saveOHLCV(symbol, buf15m, "15m");
 
-      // Build initial scanResult for BOTH strategies simultaneously
+      // Build initial scanResult for ALL strategies simultaneously
       const trend  = getTrend(symbol);
       const sig1m  = calculateSignal(buf1m);
       const sig5m  = calculateMomentumSignal(buf5m);
+      const sigMR  = calculateMeanRevSignal(buf15m);
       const entry  = {
         symbol,
         price:       sig1m.price || sig5m.price,
         trend,
         ultraScalp:  { action: sig1m.action, rsi: sig1m.rsi, volumeRatio: sig1m.volumeRatio, atrPct: sig1m.atrPct },
         momentumArb: { action: sig5m.action, rsi: sig5m.rsi, volumeRatio: sig5m.volumeRatio, atrPct: sig5m.atrPct, cross: sig5m.cross },
+        meanRev:     { action: sigMR.action, rsi: sigMR.rsi, volumeRatio: sigMR.volumeRatio, atrPct: sigMR.atrPct, bbPos: sigMR.bbPos },
       };
       const idx = scanResults.findIndex(r => r.symbol === symbol);
       if (idx >= 0) scanResults[idx] = entry; else scanResults.push(entry);
-      console.log(`[SEED] ${symbol} US:${sig1m.action} MA:${sig5m.action} trend:${trend}`);
+      console.log(`[SEED] ${symbol} US:${sig1m.action} MA:${sig5m.action} MR:${sigMR.action} trend:${trend}`);
     } catch (e: any) {
       console.error(`[SEED] ${symbol}:`, e?.message);
     }
@@ -439,7 +474,7 @@ function initWebSocket() {
       const symbol = toCcxtSym(k.s);
       const candle: number[] = [k.t, +k.o, +k.h, +k.l, +k.c, +k.v];
 
-      // ── 15m: trend filter buffer ──
+      // ── 15m: trend filter buffer + MEAN-REV signal ──
       if (k.i === "15m") {
         const buf15 = trendBuffer.get(symbol) || [];
         if (k.x) {
@@ -447,6 +482,18 @@ function initWebSocket() {
           if (buf15.length > 200) buf15.shift();
           trendBuffer.set(symbol, buf15);
           await saveOHLCV(symbol, [candle], "15m");
+
+          if (buf15.length >= 20) {
+            const signal = calculateMeanRevSignal(buf15);
+            const trend  = getTrend(symbol);
+            const idx    = scanResults.findIndex(r => r.symbol === symbol);
+            const entry  = scanResults[idx] || { symbol, price: signal.price, trend };
+            entry.meanRev = { action: signal.action, rsi: signal.rsi, volumeRatio: signal.volumeRatio, atrPct: signal.atrPct, bbPos: signal.bbPos };
+            if (idx >= 0) scanResults[idx] = entry; else scanResults.push(entry);
+            if (activeStrategies.has("MEAN-REV")) {
+              await checkAutoExecute(symbol, signal, "MEAN-REV");
+            }
+          }
         } else {
           if (buf15.length > 0) buf15[buf15.length - 1] = candle;
           trendBuffer.set(symbol, buf15);
@@ -785,7 +832,7 @@ app.get("/api/settings", async (req, res) => {
 
 app.post("/api/settings", async (req, res) => {
   const { isAutoPilot, riskLevel, maxSlippage, takeProfitPct, stopLossPct, leverage,
-          atrSlMult, atrTpMult, arbSlMult, arbTpMult, activeStrategiesVal } = req.body;
+          atrSlMult, atrTpMult, arbSlMult, arbTpMult, mrSlMult, mrTpMult, activeStrategiesVal } = req.body;
   const strategiesParam = Array.isArray(activeStrategiesVal) ? activeStrategiesVal : null;
   try {
     const r = await pool.query(
@@ -800,12 +847,14 @@ app.post("/api/settings", async (req, res) => {
            atr_tp_mult      = COALESCE($8,  atr_tp_mult),
            arb_sl_mult      = COALESCE($9,  arb_sl_mult),
            arb_tp_mult      = COALESCE($10, arb_tp_mult),
-           active_strategies = COALESCE($11, active_strategies)
+           active_strategies = COALESCE($11, active_strategies),
+           mr_sl_mult       = COALESCE($12, mr_sl_mult),
+           mr_tp_mult       = COALESCE($13, mr_tp_mult)
        WHERE id = 'bot_config' RETURNING *`,
       [isAutoPilot ?? null, riskLevel ?? null, maxSlippage ?? null,
        takeProfitPct ?? null, stopLossPct ?? null, leverage ?? null,
        atrSlMult ?? null, atrTpMult ?? null, arbSlMult ?? null, arbTpMult ?? null,
-       strategiesParam]
+       strategiesParam, mrSlMult ?? null, mrTpMult ?? null]
     );
     // Sync in-memory Set so WebSocket handlers react immediately
     if (strategiesParam) {
@@ -1087,7 +1136,7 @@ async function startServer() {
 
   // Load persisted active strategies before seeding
   const stRow = await pool.query("SELECT active_strategies FROM bot_settings WHERE id = 'bot_config'");
-  activeStrategies = new Set(stRow.rows[0]?.active_strategies || ["ULTRA-SCALP", "MOMENTUM-ARB"]);
+  activeStrategies = new Set(stRow.rows[0]?.active_strategies || ["ULTRA-SCALP", "MOMENTUM-ARB", "MEAN-REV"]);
   console.log(`Active strategies: ${[...activeStrategies].join(", ")}`);
 
   await binance.loadMarkets();
