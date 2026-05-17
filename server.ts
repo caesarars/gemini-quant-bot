@@ -288,6 +288,25 @@ function getTrend(symbol: string): "UP" | "DOWN" | "NEUTRAL" {
   return "NEUTRAL"; // hanya tepat di EMA200 (sangat jarang)
 }
 
+// Returns a TP price guaranteed to cover round-trip taker fees (entry + exit).
+// If ATR-based TP profit < total fee, bumps TP up by 10% above fee cost.
+function safeTpPrice(
+  isLong: boolean, fillPrice: number, amount: number,
+  rawTpPct: number, entryFeeUsdt: number, symbol: string
+): number {
+  const TAKER_RATE = 0.0004;
+  let tp = isLong ? fillPrice * (1 + rawTpPct) : fillPrice * (1 - rawTpPct);
+  const exitFee  = tp * amount * TAKER_RATE;
+  const totalFee = entryFeeUsdt + exitFee;
+  const profit   = Math.abs(tp - fillPrice) * amount;
+  if (profit < totalFee) {
+    const minDiff = (totalFee * 1.1) / amount; // 10% buffer above break-even
+    tp = isLong ? fillPrice + minDiff : fillPrice - minDiff;
+    console.log(`[TP-FEE] bumped TP → ${tp.toFixed(4)} (profit ${profit.toFixed(4)} < fee ${totalFee.toFixed(4)} USDT)`);
+  }
+  return parseFloat((binance as any).priceToPrecision(symbol, tp));
+}
+
 // ── Auto-Execute ───────────────────────────────────────────────────────────────
 
 type AnySignal = { action: "BUY" | "SELL" | "HOLD"; price: number; rsi: number; volumeRatio: number; atr: number; atrPct: number };
@@ -372,11 +391,9 @@ async function checkAutoExecute(symbol: string, signal: AnySignal, strategyName:
     // ── ATR-based dynamic levels ──
     const atrPctFill = (signal.atr ?? 0) / fillPrice;          // ATR as fraction of fill price
     const dynSlPct   = Math.min(Math.max(atrPctFill * slMult, 0.001), 0.05);  // clamp 0.1% – 5%
-    const dynTpPct   = Math.min(Math.max(atrPctFill * tpMult, 0.002), 0.10);  // clamp 0.2% – 10%
-    const callbackRate = parseFloat(Math.min(Math.max(dynSlPct * 100, 0.1), 5.0).toFixed(1));
-    const tpPrice      = parseFloat(
-      (binance as any).priceToPrecision(symbol, isLong ? fillPrice * (1 + dynTpPct) : fillPrice * (1 - dynTpPct))
-    );
+    const dynTpPct   = Math.min(Math.max(atrPctFill * tpMult, 0.01), 0.10);  // clamp 0.2% – 10%
+    const callbackRate = parseFloat(Math.min(Math.max(dynSlPct * 100, 0.5), 5.0).toFixed(1));
+    const tpPrice      = safeTpPrice(isLong, fillPrice, amount, dynTpPct, feeUsdt, symbol);
 
     console.log(`[AUTO] ATR-SL:${(dynSlPct*100).toFixed(3)}% (cb:${callbackRate}%)  ATR-TP:${(dynTpPct*100).toFixed(3)}% @ ${tpPrice}`);
 
@@ -983,9 +1000,9 @@ app.post("/api/manual-trade", async (req, res) => {
 
       const atrF     = atr / fillPrice;
       const dynSlPct = Math.min(Math.max(atrF * slMult, 0.001), 0.05);
-      const dynTpPct = Math.min(Math.max(atrF * tpMult, 0.002), 0.10);
-      const tpPrice  = parseFloat((binance as any).priceToPrecision(symbol, isLong ? fillPrice * (1 + dynTpPct) : fillPrice * (1 - dynTpPct)));
-      const cbRate   = parseFloat(Math.min(Math.max(dynSlPct * 100, 0.1), 5.0).toFixed(1));
+      const dynTpPct = Math.min(Math.max(atrF * tpMult, 0.01), 0.10);
+      const tpPrice  = safeTpPrice(isLong, fillPrice, amount, dynTpPct, feeUsdt, symbol);
+      const cbRate   = parseFloat(Math.min(Math.max(dynSlPct * 100, 0.5), 5.0).toFixed(1));
 
       const warnings: string[] = [];
 
@@ -1205,7 +1222,7 @@ app.get("/api/backtest", async (req, res) => {
         if (volOk && trendOk) {
           const atrF    = (signal.atr ?? 0) / currentPrice;
           const dynSlPct = Math.min(Math.max(atrF * slMult, 0.001), 0.05);
-          const dynTpPct = Math.min(Math.max(atrF * tpMult, 0.002), 0.10);
+          const dynTpPct = Math.min(Math.max(atrF * tpMult, 0.01), 0.10);
           position = {
             type: signal.action, entry: currentPrice,
             trailingHigh: currentPrice, trailingLow: currentPrice,
