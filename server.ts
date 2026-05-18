@@ -455,14 +455,14 @@ async function checkAutoExecute(symbol: string, signal: AnySignal, strategyName:
     }
   }
 
-  // Cooldown: ULTRA-SCALP 5m, MOMENTUM-ARB 15m, MEAN-REV 30m
+  // Cooldown per strategy — each strategy tracks its own independently so they can all fire on the same symbol.
   const cooldown = strategyName === "MOMENTUM-ARB" ? "15 minutes" : strategyName === "MEAN-REV" ? "30 minutes" : "5 minutes";
   const recent   = await pool.query(
-    `SELECT id FROM trades WHERE symbol = $1 AND status = 'OPEN'
-     AND timestamp > NOW() - INTERVAL '${cooldown}' LIMIT 1`, [symbol]
+    `SELECT id FROM trades WHERE symbol = $1 AND strategy = $2 AND status = 'OPEN'
+     AND timestamp > NOW() - INTERVAL '${cooldown}' LIMIT 1`, [symbol, strategyName]
   );
   if (recent.rows.length > 0) {
-    console.log(`[AUTO] ${symbol} skipped — open trade within ${cooldown}`);
+    console.log(`[AUTO] ${symbol} ${strategyName} skipped — open ${strategyName} trade within ${cooldown}`);
     return;
   }
 
@@ -969,10 +969,12 @@ app.get("/api/cooldown-status", async (_req, res) => {
         AND timestamp > NOW() - INTERVAL '30 minutes'
       ORDER BY timestamp DESC
     `);
+    // Keyed by "SYMBOL|STRATEGY" so each strategy has its own cooldown status
     const map: Record<string, { inCooldown: boolean; strategy: string; since: string }> = {};
     for (const row of result.rows) {
-      if (!map[row.symbol]) {
-        map[row.symbol] = { inCooldown: row.in_cooldown, strategy: row.strategy, since: row.timestamp };
+      const key = `${row.symbol}|${row.strategy}`;
+      if (!map[key]) {
+        map[key] = { inCooldown: row.in_cooldown, strategy: row.strategy, since: row.timestamp };
       }
     }
     res.json(map);
