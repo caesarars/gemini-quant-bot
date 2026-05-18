@@ -388,12 +388,14 @@ async function checkAutoExecute(symbol: string, signal: AnySignal, strategyName:
     if (trend === "NEUTRAL")                           { console.log(`[TREND] ${symbol} blocked — NEUTRAL`);     return; }
   }
 
-  // Volume threshold:
-  // ULTRA-SCALP fires on live in-progress candles — partial volume is always < completed candle,
-  // so 0.5× accounts for the candle being ~50% through when the signal first fires.
-  // MEAN-REV uses 0.8× (range markets have subdued volume). MOMENTUM-ARB uses 1.0×.
-  const volThreshold = strategyName === "MEAN-REV" ? 0.8 : strategyName === "ULTRA-SCALP" ? 0.5 : 1.0;
-  const volRatio     = signal.volumeRatio ?? 1;
+  // Volume threshold: MEAN-REV uses 0.8× (subdued range-market volume), others 1.0×.
+  // ULTRA-SCALP fires on live in-progress candle ticks — the partial candle's volume is always
+  // a fraction of a completed candle, so we recompute the ratio from the closed-candle buffer
+  // to get a fair apples-to-apples comparison against the 20-period average.
+  const volThreshold = strategyName === "MEAN-REV" ? 0.8 : 1.0;
+  const volRatio = strategyName === "ULTRA-SCALP"
+    ? parseFloat(calcVolumeRatio((candleBuffer.get(symbol) || []).map(c => c[5])).toFixed(2))
+    : signal.volumeRatio ?? 1;
   if (volRatio < volThreshold) {
     console.log(`[VOL] ${symbol} blocked — ${volRatio}× < ${volThreshold}× threshold`);
     return;
@@ -723,7 +725,10 @@ function initWebSocket() {
         entry.vwap        = parseFloat(calcVWAP(liveBuffer).toFixed(6));
         entry.oiChangePct = openInterestCache.get(symbol)?.oiChangePct ?? null;
         entry.lsRatio     = longShortCache.get(symbol) ?? null;
-        entry.ultraScalp  = { action: signal.action, rsi: signal.rsi, volumeRatio: signal.volumeRatio, atrPct: signal.atrPct };
+        // Use closed-candle volume ratio for the scan result so the frontend displays the same
+        // value that checkAutoExecute actually checks (not the partial in-progress candle's volume).
+        const closedVolumeRatio = parseFloat(calcVolumeRatio(buffer.map(c => c[5])).toFixed(2));
+        entry.ultraScalp  = { action: signal.action, rsi: signal.rsi, volumeRatio: closedVolumeRatio, atrPct: signal.atrPct };
         if (idx >= 0) scanResults[idx] = entry; else scanResults.push(entry);
 
         // Fire on HOLD→signal transition, OR retry every 3 min if the signal persists.
@@ -1303,7 +1308,23 @@ app.get("/api/diagnose", async (_req, res) => {
       return "PASS ✓ (cooldown not checked here — see /api/cooldown-status)";
     }
 
-    const results = SYMBOLS.map(symbol => {
+    // Also fetch cooldown status for each symbol
+    const cooldownRes = await pool.query(`
+      SELECT symbol, strategy, timestamp,
+        CASE strategy
+          WHEN 'MOMENTUM-ARB' THEN timestamp > NOW() - INTERVAL '15 minutes'
+          WHEN 'MEAN-REV'     THEN timestamp > NOW() - INTERVAL '30 minutes'
+          ELSE                     timestamp > NOW() - INTERVAL '5 minutes'
+        END AS in_cooldown
+      FROM trades WHERE status = 'OPEN' ORDER BY timestamp DESC
+    `);
+    const cooldownMap: Record<string, { inCooldown: boolean; strategy: string; since: string }[]> = {};
+    for (const row of cooldownRes.rows) {
+      if (!cooldownMap[row.symbol]) cooldownMap[row.symbol] = [];
+      cooldownMap[row.symbol].push({ inCooldown: row.in_cooldown, strategy: row.strategy, since: row.timestamp });
+    }
+
+    const results = await Promise.all(SYMBOLS.map(async symbol => {
       const buf1m  = candleBuffer.get(symbol)  || [];
       const buf5m  = momentumBuffer.get(symbol) || [];
       const buf15m = trendBuffer.get(symbol)    || [];
@@ -1313,22 +1334,35 @@ app.get("/api/diagnose", async (_req, res) => {
       const fr     = fundingRateCache.get(symbol);
       const oi     = openInterestCache.get(symbol);
       const ls     = longShortCache.get(symbol);
+      const openTrades = cooldownMap[symbol] || [];
+      const cooldownBlocking = openTrades.filter(t => t.inCooldown);
+
+      function addCooldownNote(base: string): string {
+        if (base.startsWith("PASS") && cooldownBlocking.length > 0) {
+          const t = openTrades[0];
+          return `COOLDOWN — open trade within window (${t.strategy} @ ${new Date(t.since).toLocaleTimeString()})`;
+        }
+        return base;
+      }
+
       return {
         symbol,
         trend: getTrend(symbol),
         buffers: { "1m": buf1m.length, "5m": buf5m.length, "15m": buf15m.length },
+        openTrades: openTrades.length,
+        cooldownBlocking: cooldownBlocking.length > 0,
         context: {
           fundingRate:  fr !== undefined ? `${(fr * 100).toFixed(4)}%` : null,
           oiChangePct:  oi?.oiChangePct ?? null,
           lsRatio:      ls ?? null,
         },
         strategies: {
-          "ULTRA-SCALP":  { action: sig1m.action,  rsi: sig1m.rsi,  vol: sig1m.volumeRatio,  atrPct: sig1m.atrPct,  block: filterBlock(sig1m,  "ULTRA-SCALP",  symbol) },
-          "MOMENTUM-ARB": { action: sig5m.action,  rsi: sig5m.rsi,  vol: sig5m.volumeRatio,  atrPct: sig5m.atrPct,  cross: (sig5m as any).cross, block: filterBlock(sig5m,  "MOMENTUM-ARB", symbol) },
-          "MEAN-REV":     { action: sig15m.action, rsi: sig15m.rsi, vol: sig15m.volumeRatio, atrPct: sig15m.atrPct, bbPos: (sig15m as any).bbPos, block: filterBlock(sig15m, "MEAN-REV",     symbol) },
+          "ULTRA-SCALP":  { action: sig1m.action,  rsi: sig1m.rsi,  vol: sig1m.volumeRatio,  atrPct: sig1m.atrPct,  block: addCooldownNote(filterBlock(sig1m,  "ULTRA-SCALP",  symbol)) },
+          "MOMENTUM-ARB": { action: sig5m.action,  rsi: sig5m.rsi,  vol: sig5m.volumeRatio,  atrPct: sig5m.atrPct,  cross: (sig5m as any).cross, block: addCooldownNote(filterBlock(sig5m,  "MOMENTUM-ARB", symbol)) },
+          "MEAN-REV":     { action: sig15m.action, rsi: sig15m.rsi, vol: sig15m.volumeRatio, atrPct: sig15m.atrPct, bbPos: (sig15m as any).bbPos, block: addCooldownNote(filterBlock(sig15m, "MEAN-REV",     symbol)) },
         },
       };
-    });
+    }));
 
     res.json({ isAutoPilot, fearGreed: fearGreedCache, timestamp: new Date().toISOString(), results });
   } catch (err: any) {
