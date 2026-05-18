@@ -278,7 +278,9 @@ const momentumBuffer = new Map<string, number[][]>(SYMBOLS.map(s => [s, []]));
 // 200-candle buffer (15m) for trend filter — EMA200 direction
 const trendBuffer    = new Map<string, number[][]>(SYMBOLS.map(s => [s, []]));
 // Last ULTRA-SCALP action per symbol — detect HOLD→BUY/SELL transition to avoid flooding checkAutoExecute
-const lastUltraScalpAction = new Map<string, string>(SYMBOLS.map(s => [s, "HOLD"]));
+const lastUltraScalpAction  = new Map<string, string>(SYMBOLS.map(s => [s, "HOLD"]));
+// Timestamp of last checkAutoExecute attempt per symbol — enables 3-min retry within an active signal streak
+const lastUltraScalpAttempt = new Map<string, number>(SYMBOLS.map(s => [s, 0]));
 
 let scanResults: any[] = [];
 // Set of currently enabled strategies — all three active by default
@@ -386,8 +388,11 @@ async function checkAutoExecute(symbol: string, signal: AnySignal, strategyName:
     if (trend === "NEUTRAL")                           { console.log(`[TREND] ${symbol} blocked — NEUTRAL`);     return; }
   }
 
-  // Volume threshold: MEAN-REV uses 0.8× (range markets have subdued volume)
-  const volThreshold = strategyName === "MEAN-REV" ? 0.8 : 1.0;
+  // Volume threshold:
+  // ULTRA-SCALP fires on live in-progress candles — partial volume is always < completed candle,
+  // so 0.5× accounts for the candle being ~50% through when the signal first fires.
+  // MEAN-REV uses 0.8× (range markets have subdued volume). MOMENTUM-ARB uses 1.0×.
+  const volThreshold = strategyName === "MEAN-REV" ? 0.8 : strategyName === "ULTRA-SCALP" ? 0.5 : 1.0;
   const volRatio     = signal.volumeRatio ?? 1;
   if (volRatio < volThreshold) {
     console.log(`[VOL] ${symbol} blocked — ${volRatio}× < ${volThreshold}× threshold`);
@@ -721,9 +726,14 @@ function initWebSocket() {
         entry.ultraScalp  = { action: signal.action, rsi: signal.rsi, volumeRatio: signal.volumeRatio, atrPct: signal.atrPct };
         if (idx >= 0) scanResults[idx] = entry; else scanResults.push(entry);
 
-        // Only fire on HOLD→BUY/SELL transition — prevents flooding DB on every tick
-        const prevAction = lastUltraScalpAction.get(symbol) || "HOLD";
-        if (activeStrategies.has("ULTRA-SCALP") && signal.action !== "HOLD" && prevAction === "HOLD") {
+        // Fire on HOLD→signal transition, OR retry every 3 min if the signal persists.
+        // Without retry, a single blocked shot (e.g. volume low at candle start) wastes the entire BUY streak.
+        const prevAction  = lastUltraScalpAction.get(symbol)  || "HOLD";
+        const lastAttempt = lastUltraScalpAttempt.get(symbol) ?? 0;
+        const isNewSignal = signal.action !== "HOLD" && prevAction === "HOLD";
+        const isRetry     = signal.action !== "HOLD" && (Date.now() - lastAttempt) > 3 * 60 * 1000;
+        if (activeStrategies.has("ULTRA-SCALP") && (isNewSignal || isRetry)) {
+          lastUltraScalpAttempt.set(symbol, Date.now());
           await checkAutoExecute(symbol, signal, "ULTRA-SCALP");
         }
         lastUltraScalpAction.set(symbol, signal.action);
@@ -1245,6 +1255,85 @@ app.get("/api/check-api", async (req, res) => {
     return res.json({ connected: false, reason: "Keys not found" });
   try { await binance.fetchBalance(); res.json({ connected: true }); }
   catch (e: any) { res.json({ connected: false, reason: e.message }); }
+});
+
+// ── Diagnose — real-time filter state per symbol ───────────────────────────────
+
+app.get("/api/diagnose", async (_req, res) => {
+  try {
+    const settingsRow = await pool.query("SELECT is_auto_pilot FROM bot_settings WHERE id = 'bot_config'");
+    const isAutoPilot = settingsRow.rows[0]?.is_auto_pilot ?? false;
+
+    function filterBlock(signal: any, strategyName: string, symbol: string): string {
+      if (!isAutoPilot) return "autopilot OFF";
+      if (signal.action === "HOLD") return "HOLD signal";
+      const trend = getTrend(symbol);
+      if (strategyName === "MOMENTUM-ARB") {
+        if (signal.action === "BUY"  && trend === "DOWN")    return `trend DOWN (need UP)`;
+        if (signal.action === "SELL" && trend === "UP")      return `trend UP (need DOWN)`;
+        if (trend === "NEUTRAL")                             return `trend NEUTRAL`;
+      }
+      const volThreshold = strategyName === "MEAN-REV" ? 0.8 : strategyName === "ULTRA-SCALP" ? 0.5 : 1.0;
+      if ((signal.volumeRatio ?? 1) < volThreshold)
+        return `vol ${(signal.volumeRatio ?? 0).toFixed(2)}× < ${volThreshold}×`;
+      const fr = fundingRateCache.get(symbol);
+      if (fr !== undefined) {
+        if (signal.action === "BUY"  && fr >  0.0005) return `funding +${(fr*100).toFixed(4)}% > 0.05%`;
+        if (signal.action === "SELL" && fr < -0.0003) return `funding ${(fr*100).toFixed(4)}% < -0.03%`;
+      }
+      if (fearGreedCache) {
+        const fg = fearGreedCache.value;
+        if (strategyName === "MEAN-REV" && signal.action === "BUY"  && fg > 75) return `F&G ${fg} > 75 (MEAN-REV BUY)`;
+        if (strategyName === "MEAN-REV" && signal.action === "SELL" && fg < 25) return `F&G ${fg} < 25 (MEAN-REV SELL)`;
+        if (signal.action === "BUY"  && fg > 85) return `F&G ${fg} > 85 extreme greed`;
+        if (signal.action === "SELL" && fg < 15) return `F&G ${fg} < 15 extreme fear`;
+      }
+      const oi = openInterestCache.get(symbol);
+      if (oi) {
+        if (strategyName === "MOMENTUM-ARB" && signal.action === "BUY"  && oi.oiChangePct < -2)
+          return `OI ${oi.oiChangePct.toFixed(2)}% falling (MOMENTUM-ARB BUY)`;
+        if (strategyName === "MEAN-REV"     && signal.action === "SELL" && oi.oiChangePct < -2)
+          return `OI ${oi.oiChangePct.toFixed(2)}% falling (MEAN-REV SELL)`;
+      }
+      const ls = longShortCache.get(symbol);
+      if (ls !== undefined) {
+        if (signal.action === "BUY"  && ls > 2.5) return `L/S ${ls.toFixed(2)} > 2.5 (over-long)`;
+        if (signal.action === "SELL" && ls < 0.4) return `L/S ${ls.toFixed(2)} < 0.4 (over-short)`;
+      }
+      return "PASS ✓ (cooldown not checked here — see /api/cooldown-status)";
+    }
+
+    const results = SYMBOLS.map(symbol => {
+      const buf1m  = candleBuffer.get(symbol)  || [];
+      const buf5m  = momentumBuffer.get(symbol) || [];
+      const buf15m = trendBuffer.get(symbol)    || [];
+      const sig1m  = calculateSignal(buf1m);
+      const sig5m  = calculateMomentumSignal(buf5m);
+      const sig15m = calculateMeanRevSignal(buf15m);
+      const fr     = fundingRateCache.get(symbol);
+      const oi     = openInterestCache.get(symbol);
+      const ls     = longShortCache.get(symbol);
+      return {
+        symbol,
+        trend: getTrend(symbol),
+        buffers: { "1m": buf1m.length, "5m": buf5m.length, "15m": buf15m.length },
+        context: {
+          fundingRate:  fr !== undefined ? `${(fr * 100).toFixed(4)}%` : null,
+          oiChangePct:  oi?.oiChangePct ?? null,
+          lsRatio:      ls ?? null,
+        },
+        strategies: {
+          "ULTRA-SCALP":  { action: sig1m.action,  rsi: sig1m.rsi,  vol: sig1m.volumeRatio,  atrPct: sig1m.atrPct,  block: filterBlock(sig1m,  "ULTRA-SCALP",  symbol) },
+          "MOMENTUM-ARB": { action: sig5m.action,  rsi: sig5m.rsi,  vol: sig5m.volumeRatio,  atrPct: sig5m.atrPct,  cross: (sig5m as any).cross, block: filterBlock(sig5m,  "MOMENTUM-ARB", symbol) },
+          "MEAN-REV":     { action: sig15m.action, rsi: sig15m.rsi, vol: sig15m.volumeRatio, atrPct: sig15m.atrPct, bbPos: (sig15m as any).bbPos, block: filterBlock(sig15m, "MEAN-REV",     symbol) },
+        },
+      };
+    });
+
+    res.json({ isAutoPilot, fearGreed: fearGreedCache, timestamp: new Date().toISOString(), results });
+  } catch (err: any) {
+    res.status(500).json({ error: err?.message });
+  }
 });
 
 // ── Backtest Engine ────────────────────────────────────────────────────────────
