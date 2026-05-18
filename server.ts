@@ -277,10 +277,13 @@ const candleBuffer   = new Map<string, number[][]>(SYMBOLS.map(s => [s, []]));
 const momentumBuffer = new Map<string, number[][]>(SYMBOLS.map(s => [s, []]));
 // 200-candle buffer (15m) for trend filter — EMA200 direction
 const trendBuffer    = new Map<string, number[][]>(SYMBOLS.map(s => [s, []]));
-// Last ULTRA-SCALP action per symbol — detect HOLD→BUY/SELL transition to avoid flooding checkAutoExecute
+// Per-strategy action + attempt trackers — transition detection + retry without flooding the exchange
 const lastUltraScalpAction  = new Map<string, string>(SYMBOLS.map(s => [s, "HOLD"]));
-// Timestamp of last checkAutoExecute attempt per symbol — enables 3-min retry within an active signal streak
 const lastUltraScalpAttempt = new Map<string, number>(SYMBOLS.map(s => [s, 0]));
+const lastMomentumAction    = new Map<string, string>(SYMBOLS.map(s => [s, "HOLD"]));
+const lastMomentumAttempt   = new Map<string, number>(SYMBOLS.map(s => [s, 0]));
+const lastMeanRevAction     = new Map<string, string>(SYMBOLS.map(s => [s, "HOLD"]));
+const lastMeanRevAttempt    = new Map<string, number>(SYMBOLS.map(s => [s, 0]));
 
 let scanResults: any[] = [];
 // Set of currently enabled strategies — all three active by default
@@ -655,51 +658,65 @@ function initWebSocket() {
           if (buf15.length > 200) buf15.shift();
           trendBuffer.set(symbol, buf15);
           await saveOHLCV(symbol, [candle], "15m");
-
-          if (buf15.length >= 20) {
-            const signal = calculateMeanRevSignal(buf15);
-            const trend  = getTrend(symbol);
-            const idx    = scanResults.findIndex(r => r.symbol === symbol);
-            const entry  = scanResults[idx] || { symbol, price: signal.price, trend };
-            entry.meanRev = { action: signal.action, rsi: signal.rsi, volumeRatio: signal.volumeRatio, atrPct: signal.atrPct, bbPos: signal.bbPos };
-            if (idx >= 0) scanResults[idx] = entry; else scanResults.push(entry);
-            if (activeStrategies.has("MEAN-REV")) {
-              await checkAutoExecute(symbol, signal, "MEAN-REV");
-            }
-          }
         } else {
           if (buf15.length > 0) buf15[buf15.length - 1] = candle;
           trendBuffer.set(symbol, buf15);
         }
+
+        // Evaluate MEAN-REV on every tick (close or live) — catches BB touches mid-candle
+        if (buf15.length >= 20) {
+          const signal = calculateMeanRevSignal(buf15);
+          const trend  = getTrend(symbol);
+          const idx    = scanResults.findIndex(r => r.symbol === symbol);
+          const entry  = scanResults[idx] || { symbol, price: signal.price, trend };
+          entry.meanRev = { action: signal.action, rsi: signal.rsi, volumeRatio: signal.volumeRatio, atrPct: signal.atrPct, bbPos: signal.bbPos };
+          if (idx >= 0) scanResults[idx] = entry; else scanResults.push(entry);
+
+          const prevMR  = lastMeanRevAction.get(symbol)  || "HOLD";
+          const lastMR  = lastMeanRevAttempt.get(symbol) ?? 0;
+          const isNewMR = signal.action !== "HOLD" && prevMR === "HOLD";
+          const isRetryMR = signal.action !== "HOLD" && (Date.now() - lastMR) > 2 * 60 * 1000;
+          if (activeStrategies.has("MEAN-REV") && (isNewMR || isRetryMR)) {
+            lastMeanRevAttempt.set(symbol, Date.now());
+            await checkAutoExecute(symbol, signal, "MEAN-REV");
+          }
+          lastMeanRevAction.set(symbol, signal.action);
+        }
         return;
       }
 
-      // ── 5m: MOMENTUM ARB — always compute, gate only auto-execute ──
+      // ── 5m: MOMENTUM ARB — evaluate on every tick, execute on crossover ──
       if (k.i === "5m") {
         const buf5 = momentumBuffer.get(symbol) || [];
         if (k.x) {
           buf5.push(candle);
           if (buf5.length > 50) buf5.shift();
           momentumBuffer.set(symbol, buf5);
-
-          if (buf5.length >= 22) {
-            const signal = calculateMomentumSignal(buf5);
-            const trend  = getTrend(symbol);
-            const idx    = scanResults.findIndex(r => r.symbol === symbol);
-            const entry  = scanResults[idx] || { symbol, price: signal.price, trend };
-            entry.trend       = trend;
-            entry.price       = signal.price;
-            entry.momentumArb = { action: signal.action, rsi: signal.rsi, volumeRatio: signal.volumeRatio, atrPct: signal.atrPct, cross: signal.cross };
-            if (idx >= 0) scanResults[idx] = entry; else scanResults.push(entry);
-            if (activeStrategies.has("MOMENTUM-ARB")) {
-              await checkAutoExecute(symbol, signal, "MOMENTUM-ARB");
-            }
-          }
         } else {
           if (buf5.length > 0) buf5[buf5.length - 1] = candle;
           momentumBuffer.set(symbol, buf5);
-          const idx = scanResults.findIndex(r => r.symbol === symbol);
-          if (idx >= 0) scanResults[idx] = { ...scanResults[idx], price: +k.c };
+        }
+
+        // Evaluate on every tick — catches EMA crossovers the moment they form, not at candle close
+        if (buf5.length >= 22) {
+          const signal = calculateMomentumSignal(buf5);
+          const trend  = getTrend(symbol);
+          const idx    = scanResults.findIndex(r => r.symbol === symbol);
+          const entry  = scanResults[idx] || { symbol, price: signal.price, trend };
+          entry.trend       = trend;
+          entry.price       = signal.price;
+          entry.momentumArb = { action: signal.action, rsi: signal.rsi, volumeRatio: signal.volumeRatio, atrPct: signal.atrPct, cross: signal.cross };
+          if (idx >= 0) scanResults[idx] = entry; else scanResults.push(entry);
+
+          const prevMA  = lastMomentumAction.get(symbol)  || "HOLD";
+          const lastMA  = lastMomentumAttempt.get(symbol) ?? 0;
+          const isNewMA = signal.action !== "HOLD" && prevMA === "HOLD";
+          const isRetryMA = signal.action !== "HOLD" && (Date.now() - lastMA) > 60 * 1000;
+          if (activeStrategies.has("MOMENTUM-ARB") && (isNewMA || isRetryMA)) {
+            lastMomentumAttempt.set(symbol, Date.now());
+            await checkAutoExecute(symbol, signal, "MOMENTUM-ARB");
+          }
+          lastMomentumAction.set(symbol, signal.action);
         }
         return;
       }
@@ -729,6 +746,7 @@ function initWebSocket() {
         // value that checkAutoExecute actually checks (not the partial in-progress candle's volume).
         const closedVolumeRatio = parseFloat(calcVolumeRatio(buffer.map(c => c[5])).toFixed(2));
         entry.ultraScalp  = { action: signal.action, rsi: signal.rsi, volumeRatio: closedVolumeRatio, atrPct: signal.atrPct };
+        entry.lastTickMs  = Date.now();
         if (idx >= 0) scanResults[idx] = entry; else scanResults.push(entry);
 
         // Fire on HOLD→signal transition, OR retry every 3 min if the signal persists.
@@ -736,7 +754,7 @@ function initWebSocket() {
         const prevAction  = lastUltraScalpAction.get(symbol)  || "HOLD";
         const lastAttempt = lastUltraScalpAttempt.get(symbol) ?? 0;
         const isNewSignal = signal.action !== "HOLD" && prevAction === "HOLD";
-        const isRetry     = signal.action !== "HOLD" && (Date.now() - lastAttempt) > 3 * 60 * 1000;
+        const isRetry     = signal.action !== "HOLD" && (Date.now() - lastAttempt) > 60 * 1000;
         if (activeStrategies.has("ULTRA-SCALP") && (isNewSignal || isRetry)) {
           lastUltraScalpAttempt.set(symbol, Date.now());
           await checkAutoExecute(symbol, signal, "ULTRA-SCALP");

@@ -42,6 +42,7 @@ interface ScanResult {
   vwap?: number;
   oiChangePct?: number | null;
   lsRatio?: number | null;
+  lastTickMs?: number;
   ultraScalp?: StrategySignal;
   momentumArb?: StrategySignal;
   meanRev?: StrategySignal;
@@ -144,6 +145,9 @@ export default function App() {
   const [btDays, setBtDays]                   = useState(7);
   const [btLoading, setBtLoading]             = useState(false);
   const [btResult, setBtResult]               = useState<any>(null);
+  // Increments every second so scan-age badges re-render without full data refresh
+  const [now, setNow] = useState(Date.now());
+  useEffect(() => { const t = setInterval(() => setNow(Date.now()), 1000); return () => clearInterval(t); }, []);
 
   const runBacktest = async () => {
     setBtLoading(true);
@@ -462,190 +466,248 @@ export default function App() {
           <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-3">
             {scanResults.map((coin) => {
               const bestAction = coin.ultraScalp?.action !== 'HOLD' ? coin.ultraScalp?.action
-                : coin.momentumArb?.action !== 'HOLD' ? coin.momentumArb?.action : 'HOLD';
+                : coin.momentumArb?.action !== 'HOLD' ? coin.momentumArb?.action
+                : coin.meanRev?.action !== 'HOLD' ? coin.meanRev?.action : 'HOLD';
+
+              const ageMs      = coin.lastTickMs ? now - coin.lastTickMs : Infinity;
+              const isLive     = ageMs < 15_000;
+              const isRecent   = ageMs < 60_000;
+              const ageLabel   = !coin.lastTickMs ? 'no data'
+                               : ageMs < 5_000    ? 'LIVE'
+                               : ageMs < 60_000   ? `${Math.floor(ageMs / 1000)}s ago`
+                               : `${Math.floor(ageMs / 60_000)}m ago`;
+
+              const hasTraded  = ['ULTRA-SCALP','MOMENTUM-ARB','MEAN-REV'].some(
+                s => cooldownStatus[`${coin.symbol}|${s}`]?.inCooldown
+              );
+              const tradedStrategy = ['ULTRA-SCALP','MOMENTUM-ARB','MEAN-REV'].find(
+                s => cooldownStatus[`${coin.symbol}|${s}`]?.inCooldown
+              );
+
               return (
                 <motion.div
                   key={coin.symbol}
-                  initial={{ opacity: 0, scale: 0.95 }}
-                  animate={{ opacity: 1, scale: 1 }}
-                  className="bg-trading-card border border-trading-border p-4 rounded relative overflow-hidden group"
+                  initial={{ opacity: 0, y: 8 }}
+                  animate={{ opacity: 1, y: 0 }}
+                  className="bg-trading-card border border-trading-border rounded relative overflow-hidden group"
                 >
-                  {/* Accent Top Bar */}
+                  {/* Left accent bar — colored by dominant signal */}
                   <div className={cn(
-                    "absolute top-0 left-0 w-full h-[2px] opacity-50",
-                    bestAction === 'BUY' ? "bg-trading-up" : bestAction === 'SELL' ? "bg-trading-down" : "bg-trading-accent"
+                    "absolute left-0 top-0 bottom-0 w-[3px]",
+                    bestAction === 'BUY'  ? "bg-trading-up"
+                  : bestAction === 'SELL' ? "bg-trading-down"
+                  :                         "bg-trading-border"
                   )} />
 
-                  {/* Symbol + Price + Trend */}
-                  <div className="flex justify-between items-start mb-3">
-                    <div>
-                      <div className="flex items-center gap-1.5">
-                        <span className="text-[11px] font-bold text-trading-muted">{coin.symbol}</span>
-                        {cooldownStatus[coin.symbol]?.inCooldown && (
-                          <span className="text-[8px] px-1.5 py-0.5 bg-trading-up/15 text-trading-up border border-trading-up/30 rounded font-black uppercase tracking-wider animate-pulse">
-                            ✓ TRADE FIRED
+                  <div className="pl-4 pr-4 pt-4 pb-3">
+                    {/* ── Header row ── */}
+                    <div className="flex items-start justify-between mb-3">
+                      <div className="flex-1 min-w-0">
+                        {/* Symbol row */}
+                        <div className="flex items-center gap-2 flex-wrap">
+                          {/* Live scanning dot */}
+                          <span
+                            title={isLive ? 'WebSocket active' : isRecent ? 'Slightly stale' : 'No data / disconnected'}
+                            className={cn(
+                              "w-2.5 h-2.5 rounded-full shrink-0 mt-px",
+                              isLive   ? "bg-green-400 animate-pulse"
+                            : isRecent ? "bg-yellow-400"
+                            :            "bg-trading-muted/40"
+                            )}
+                          />
+                          <span className="text-base font-bold text-white leading-none">
+                            {coin.symbol.replace('/USDT', '')}
                           </span>
+                          <span className="text-[11px] text-trading-muted">USDT</span>
+                          {/* Trend */}
+                          {coin.trend && (
+                            <span className={cn("text-[11px] font-bold px-1.5 py-0.5 rounded",
+                              coin.trend === 'UP'   ? "bg-trading-up/15 text-trading-up"
+                            : coin.trend === 'DOWN' ? "bg-trading-down/15 text-trading-down"
+                            :                         "bg-trading-muted/10 text-trading-muted"
+                            )}>
+                              {coin.trend === 'UP' ? '↑' : coin.trend === 'DOWN' ? '↓' : '—'}
+                            </span>
+                          )}
+                          {/* Trade fired badge */}
+                          {hasTraded && (
+                            <span className="text-[10px] px-2 py-0.5 bg-trading-up/15 text-trading-up border border-trading-up/30 rounded font-black uppercase tracking-wider animate-pulse">
+                              ✓ {tradedStrategy?.replace('MOMENTUM-ARB','MOM').replace('ULTRA-SCALP','SCALP').replace('MEAN-REV','MR')}
+                            </span>
+                          )}
+                        </div>
+                        {/* Price + funding */}
+                        <div className="flex items-baseline gap-2 mt-1.5">
+                          <span className="text-2xl font-bold leading-none">${coin.price?.toLocaleString()}</span>
+                          {marketContext.fundingRates[coin.symbol] !== undefined && (
+                            <span className={cn("text-[11px] font-mono",
+                              marketContext.fundingRates[coin.symbol] >  0.0005 ? "text-trading-down"
+                            : marketContext.fundingRates[coin.symbol] < -0.0003 ? "text-trading-up"
+                            :                                                      "text-trading-muted"
+                            )}>
+                              FR {marketContext.fundingRates[coin.symbol] >= 0 ? "+" : ""}
+                              {(marketContext.fundingRates[coin.symbol] * 100).toFixed(4)}%
+                            </span>
+                          )}
+                        </div>
+                      </div>
+
+                      {/* Scan status + ATR (top-right) */}
+                      <div className="flex flex-col items-end gap-1.5 ml-2 shrink-0">
+                        <span className={cn("text-[11px] font-mono font-bold",
+                          isLive   ? "text-green-400"
+                        : isRecent ? "text-yellow-400"
+                        :            "text-trading-muted"
+                        )}>{ageLabel}</span>
+                        {(coin.ultraScalp?.atrPct ?? 0) > 0 && (
+                          <span className={cn("text-[10px] font-bold px-2 py-0.5 rounded",
+                            (coin.ultraScalp?.atrPct ?? 0) >= 0.3  ? "bg-trading-down/10 text-trading-down"
+                          : (coin.ultraScalp?.atrPct ?? 0) >= 0.15 ? "bg-orange-400/10 text-orange-400"
+                          :                                            "bg-trading-muted/10 text-trading-muted"
+                          )}>ATR {coin.ultraScalp?.atrPct?.toFixed(2)}%</span>
                         )}
                       </div>
-                      <div className="text-xl font-bold mt-1">${coin.price?.toLocaleString()}</div>
-                      {marketContext.fundingRates[coin.symbol] !== undefined && (
-                        <div className={cn("text-[9px] font-mono mt-0.5",
-                          marketContext.fundingRates[coin.symbol] >  0.0005 ? "text-trading-down"
-                        : marketContext.fundingRates[coin.symbol] < -0.0003 ? "text-trading-up"
-                        : "text-trading-muted"
-                        )}>
-                          FR {marketContext.fundingRates[coin.symbol] >= 0 ? "+" : ""}{(marketContext.fundingRates[coin.symbol] * 100).toFixed(4)}%/8h
-                        </div>
-                      )}
                     </div>
-                    {coin.trend && (
-                      <div className={cn(
-                        "px-1.5 py-0.5 rounded text-[10px] font-bold uppercase flex items-center gap-0.5",
-                        coin.trend === 'UP'   ? "bg-trading-up/10 text-trading-up"
-                      : coin.trend === 'DOWN' ? "bg-trading-down/10 text-trading-down"
-                      :                         "bg-trading-muted/10 text-trading-muted"
-                      )}>
-                        {coin.trend === 'UP' ? '↑' : coin.trend === 'DOWN' ? '↓' : '—'} {coin.trend}
+
+                    {/* ── Strategy rows ── */}
+                    <div className="space-y-1.5 mb-3">
+                      {coin.ultraScalp && (() => {
+                        const r = getBlockReason(coin.ultraScalp.action, coin.trend, coin.ultraScalp.volumeRatio, 1.0, isAutoPilot, true, marketContext.fundingRates[coin.symbol], marketContext.fearGreed?.value, 'ULTRA-SCALP', coin.oiChangePct, coin.lsRatio);
+                        const active = coin.ultraScalp.action !== 'HOLD';
+                        return (
+                          <div className={cn("rounded overflow-hidden border",
+                            active ? "border-trading-border/60" : "border-transparent"
+                          )}>
+                            <div className={cn("flex items-center gap-2 px-2.5 py-2",
+                              active ? "bg-trading-bg/60" : "bg-trading-bg/30"
+                            )}>
+                              <span className="text-[11px] font-bold font-mono text-trading-muted w-[76px] shrink-0 uppercase tracking-wide">Scalp 1m</span>
+                              <span className={cn("px-2 py-0.5 rounded font-black text-[11px]",
+                                coin.ultraScalp.action === 'BUY'  ? "bg-trading-up/15 text-trading-up"
+                              : coin.ultraScalp.action === 'SELL' ? "bg-trading-down/15 text-trading-down"
+                              :                                      "bg-trading-muted/10 text-trading-muted"
+                              )}>{coin.ultraScalp.action}</span>
+                              <span className="text-[11px] text-trading-muted">RSI {coin.ultraScalp.rsi.toFixed(0)}</span>
+                              {coin.ultraScalp.volumeRatio !== undefined && (
+                                <span className={cn("ml-auto text-[11px] font-bold",
+                                  coin.ultraScalp.volumeRatio >= 1.5 ? "text-trading-up"
+                                : coin.ultraScalp.volumeRatio >= 1.0 ? "text-trading-muted"
+                                :                                       "text-trading-down/70"
+                                )}>V {coin.ultraScalp.volumeRatio.toFixed(1)}×</span>
+                              )}
+                            </div>
+                            <div className={cn("px-2.5 py-1.5 text-[11px] font-mono border-t border-trading-border/20",
+                              active ? "bg-trading-bg/50" : "bg-trading-bg/20", r.color
+                            )}>↳ {r.label}</div>
+                          </div>
+                        );
+                      })()}
+
+                      {coin.momentumArb && (() => {
+                        const r = getBlockReason(coin.momentumArb.action, coin.trend, coin.momentumArb.volumeRatio, 1.0, isAutoPilot, false, marketContext.fundingRates[coin.symbol], marketContext.fearGreed?.value, 'MOMENTUM-ARB', coin.oiChangePct, coin.lsRatio);
+                        const active = coin.momentumArb.action !== 'HOLD';
+                        return (
+                          <div className={cn("rounded overflow-hidden border",
+                            active ? "border-trading-border/60" : "border-transparent"
+                          )}>
+                            <div className={cn("flex items-center gap-2 px-2.5 py-2",
+                              active ? "bg-trading-bg/60" : "bg-trading-bg/30"
+                            )}>
+                              <span className="text-[11px] font-bold font-mono text-trading-muted w-[76px] shrink-0 uppercase tracking-wide">Mom 5m</span>
+                              <span className={cn("px-2 py-0.5 rounded font-black text-[11px]",
+                                coin.momentumArb.action === 'BUY'  ? "bg-trading-up/15 text-trading-up"
+                              : coin.momentumArb.action === 'SELL' ? "bg-trading-down/15 text-trading-down"
+                              :                                       "bg-trading-muted/10 text-trading-muted"
+                              )}>{coin.momentumArb.action}</span>
+                              <span className="text-[11px] text-trading-muted">RSI {coin.momentumArb.rsi.toFixed(0)}</span>
+                              {coin.momentumArb.cross && (
+                                <span className={cn("text-[11px] font-black",
+                                  coin.momentumArb.cross === 'GOLDEN' ? "text-trading-up" : "text-trading-down"
+                                )}>{coin.momentumArb.cross === 'GOLDEN' ? '↑GX' : '↓DX'}</span>
+                              )}
+                              {coin.momentumArb.volumeRatio !== undefined && (
+                                <span className={cn("ml-auto text-[11px] font-bold",
+                                  coin.momentumArb.volumeRatio >= 1.2 ? "text-trading-up" : "text-trading-muted"
+                                )}>V {coin.momentumArb.volumeRatio.toFixed(1)}×</span>
+                              )}
+                            </div>
+                            <div className={cn("px-2.5 py-1.5 text-[11px] font-mono border-t border-trading-border/20",
+                              active ? "bg-trading-bg/50" : "bg-trading-bg/20", r.color
+                            )}>↳ {r.label}</div>
+                          </div>
+                        );
+                      })()}
+
+                      {coin.meanRev && (() => {
+                        const r = getBlockReason(coin.meanRev.action, coin.trend, coin.meanRev.volumeRatio, 0.8, isAutoPilot, true, marketContext.fundingRates[coin.symbol], marketContext.fearGreed?.value, 'MEAN-REV', coin.oiChangePct, coin.lsRatio);
+                        const active = coin.meanRev.action !== 'HOLD';
+                        const bbColor = coin.meanRev.bbPos === 'LOWER' ? 'text-trading-up'
+                                      : coin.meanRev.bbPos === 'UPPER' ? 'text-trading-down'
+                                      : 'text-trading-muted';
+                        return (
+                          <div className={cn("rounded overflow-hidden border",
+                            active ? "border-trading-accent/30" : "border-transparent"
+                          )}>
+                            <div className={cn("flex items-center gap-2 px-2.5 py-2",
+                              active ? "bg-trading-accent/8" : "bg-trading-bg/30"
+                            )}>
+                              <span className="text-[11px] font-bold font-mono text-trading-accent/60 w-[76px] shrink-0 uppercase tracking-wide">MRev 15m</span>
+                              <span className={cn("px-2 py-0.5 rounded font-black text-[11px]",
+                                coin.meanRev.action === 'BUY'  ? "bg-trading-up/15 text-trading-up"
+                              : coin.meanRev.action === 'SELL' ? "bg-trading-down/15 text-trading-down"
+                              :                                   "bg-trading-muted/10 text-trading-muted"
+                              )}>{coin.meanRev.action}</span>
+                              <span className="text-[11px] text-trading-muted">RSI {coin.meanRev.rsi.toFixed(0)}</span>
+                              {coin.meanRev.bbPos && (
+                                <span className={cn("text-[11px] font-bold", bbColor)}>BB:{coin.meanRev.bbPos}</span>
+                              )}
+                              {coin.meanRev.volumeRatio !== undefined && (
+                                <span className={cn("ml-auto text-[11px] font-bold",
+                                  coin.meanRev.volumeRatio >= 0.8 ? "text-trading-up" : "text-trading-muted"
+                                )}>V {coin.meanRev.volumeRatio.toFixed(1)}×</span>
+                              )}
+                            </div>
+                            <div className={cn("px-2.5 py-1.5 text-[11px] font-mono border-t border-trading-border/20",
+                              active ? "bg-trading-accent/5" : "bg-trading-bg/20", r.color
+                            )}>↳ {r.label}</div>
+                          </div>
+                        );
+                      })()}
+                    </div>
+
+                    {/* ── Futures context row ── */}
+                    {(coin.oiChangePct != null || coin.lsRatio != null || (coin.vwap && coin.vwap > 0)) && (
+                      <div className="flex gap-2 flex-wrap mb-2.5">
+                        {coin.oiChangePct != null && (
+                          <span className={cn("px-2 py-0.5 rounded text-[11px] font-bold font-mono",
+                            coin.oiChangePct >  1.0 ? "bg-trading-up/10 text-trading-up"
+                          : coin.oiChangePct < -1.0 ? "bg-trading-down/10 text-trading-down"
+                          :                            "bg-trading-muted/10 text-trading-muted"
+                          )}>OI {coin.oiChangePct >= 0 ? "+" : ""}{coin.oiChangePct.toFixed(2)}%</span>
+                        )}
+                        {coin.lsRatio != null && (
+                          <span className={cn("px-2 py-0.5 rounded text-[11px] font-bold font-mono",
+                            coin.lsRatio > 1.8 ? "bg-trading-down/10 text-trading-down"
+                          : coin.lsRatio < 0.6 ? "bg-trading-up/10 text-trading-up"
+                          :                       "bg-trading-muted/10 text-trading-muted"
+                          )}>L/S {coin.lsRatio.toFixed(2)}</span>
+                        )}
+                        {coin.vwap != null && coin.vwap > 0 && (
+                          <span className={cn("px-2 py-0.5 rounded text-[11px] font-bold font-mono",
+                            coin.price > coin.vwap * 1.001 ? "bg-trading-down/10 text-trading-down"
+                          : coin.price < coin.vwap * 0.999 ? "bg-trading-up/10 text-trading-up"
+                          :                                   "bg-trading-muted/10 text-trading-muted"
+                          )}>VWAP {coin.price > coin.vwap ? "↑" : "↓"}{Math.abs((coin.price - coin.vwap) / coin.vwap * 100).toFixed(2)}%</span>
+                        )}
                       </div>
                     )}
-                  </div>
 
-                  {/* Strategy signal rows */}
-                  <div className="space-y-1.5 mb-3">
-                    {coin.ultraScalp && (() => {
-                      const r = getBlockReason(coin.ultraScalp.action, coin.trend, coin.ultraScalp.volumeRatio, 1.0, isAutoPilot, true, marketContext.fundingRates[coin.symbol], marketContext.fearGreed?.value, 'ULTRA-SCALP', coin.oiChangePct, coin.lsRatio);
-                      return (
-                        <div className="rounded overflow-hidden">
-                          <div className="flex items-center gap-1.5 bg-trading-bg/40 px-2 py-1.5">
-                            <span className="text-trading-muted font-mono w-[68px] shrink-0 text-[9px] uppercase">Scalp 1m</span>
-                            <span className={cn("px-1 py-0.5 rounded font-bold text-[9px]",
-                              coin.ultraScalp.action === 'BUY'  ? "bg-trading-up/10 text-trading-up"
-                            : coin.ultraScalp.action === 'SELL' ? "bg-trading-down/10 text-trading-down"
-                            :                                      "bg-trading-muted/10 text-trading-muted"
-                            )}>{coin.ultraScalp.action}</span>
-                            <span className="text-[10px] text-trading-muted">RSI {coin.ultraScalp.rsi.toFixed(0)}</span>
-                            {coin.ultraScalp.volumeRatio !== undefined && (
-                              <span className={cn("ml-auto text-[9px] font-bold",
-                                coin.ultraScalp.volumeRatio >= 1.5 ? "text-trading-up" : "text-trading-muted"
-                              )}>V {coin.ultraScalp.volumeRatio.toFixed(1)}×</span>
-                            )}
-                          </div>
-                          <div className={cn("px-2 pb-1.5 text-[8px] font-mono bg-trading-bg/40", r.color)}>
-                            ↳ {r.label}
-                          </div>
-                        </div>
-                      );
-                    })()}
-                    {coin.momentumArb && (() => {
-                      const r = getBlockReason(coin.momentumArb.action, coin.trend, coin.momentumArb.volumeRatio, 1.0, isAutoPilot, false, marketContext.fundingRates[coin.symbol], marketContext.fearGreed?.value, 'MOMENTUM-ARB', coin.oiChangePct, coin.lsRatio);
-                      return (
-                        <div className="rounded overflow-hidden">
-                          <div className="flex items-center gap-1.5 bg-trading-bg/40 px-2 py-1.5">
-                            <span className="text-trading-muted font-mono w-[68px] shrink-0 text-[9px] uppercase">Moment 5m</span>
-                            <span className={cn("px-1 py-0.5 rounded font-bold text-[9px]",
-                              coin.momentumArb.action === 'BUY'  ? "bg-trading-up/10 text-trading-up"
-                            : coin.momentumArb.action === 'SELL' ? "bg-trading-down/10 text-trading-down"
-                            :                                       "bg-trading-muted/10 text-trading-muted"
-                            )}>{coin.momentumArb.action}</span>
-                            <span className="text-[10px] text-trading-muted">RSI {coin.momentumArb.rsi.toFixed(0)}</span>
-                            {coin.momentumArb.cross && (
-                              <span className={cn("text-[9px] font-bold",
-                                coin.momentumArb.cross === 'GOLDEN' ? "text-trading-up" : "text-trading-down"
-                              )}>{coin.momentumArb.cross === 'GOLDEN' ? '↑GX' : '↓DX'}</span>
-                            )}
-                            {coin.momentumArb.volumeRatio !== undefined && (
-                              <span className={cn("ml-auto text-[9px] font-bold",
-                                coin.momentumArb.volumeRatio >= 1.2 ? "text-trading-up" : "text-trading-muted"
-                              )}>V {coin.momentumArb.volumeRatio.toFixed(1)}×</span>
-                            )}
-                          </div>
-                          <div className={cn("px-2 pb-1.5 text-[8px] font-mono bg-trading-bg/40", r.color)}>
-                            ↳ {r.label}
-                          </div>
-                        </div>
-                      );
-                    })()}
-                    {coin.meanRev && (() => {
-                      const r = getBlockReason(coin.meanRev.action, coin.trend, coin.meanRev.volumeRatio, 0.8, isAutoPilot, true, marketContext.fundingRates[coin.symbol], marketContext.fearGreed?.value, 'MEAN-REV', coin.oiChangePct, coin.lsRatio);
-                      const bbColor = coin.meanRev.bbPos === 'LOWER' ? 'text-trading-up'
-                                    : coin.meanRev.bbPos === 'UPPER' ? 'text-trading-down'
-                                    : 'text-trading-muted';
-                      return (
-                        <div className="rounded overflow-hidden">
-                          <div className="flex items-center gap-1.5 bg-trading-accent/5 border border-trading-accent/10 px-2 py-1.5">
-                            <span className="text-trading-accent/70 font-mono w-[68px] shrink-0 text-[9px] uppercase">MeanRev 15m</span>
-                            <span className={cn("px-1 py-0.5 rounded font-bold text-[9px]",
-                              coin.meanRev.action === 'BUY'  ? "bg-trading-up/10 text-trading-up"
-                            : coin.meanRev.action === 'SELL' ? "bg-trading-down/10 text-trading-down"
-                            :                                   "bg-trading-muted/10 text-trading-muted"
-                            )}>{coin.meanRev.action}</span>
-                            <span className="text-[10px] text-trading-muted">RSI {coin.meanRev.rsi.toFixed(0)}</span>
-                            {coin.meanRev.bbPos && (
-                              <span className={cn("text-[9px] font-bold", bbColor)}>
-                                BB:{coin.meanRev.bbPos}
-                              </span>
-                            )}
-                            {coin.meanRev.volumeRatio !== undefined && (
-                              <span className={cn("ml-auto text-[9px] font-bold",
-                                coin.meanRev.volumeRatio >= 0.8 ? "text-trading-up" : "text-trading-muted"
-                              )}>V {coin.meanRev.volumeRatio.toFixed(1)}×</span>
-                            )}
-                          </div>
-                          <div className={cn("px-2 pb-1.5 text-[8px] font-mono bg-trading-accent/5", r.color)}>
-                            ↳ {r.label}
-                          </div>
-                        </div>
-                      );
-                    })()}
-                  </div>
-
-                  {/* Futures Context Row — OI, L/S, VWAP */}
-                  {(coin.oiChangePct != null || coin.lsRatio != null || (coin.vwap && coin.vwap > 0)) && (
-                    <div className="flex gap-1.5 flex-wrap mb-2">
-                      {coin.oiChangePct != null && (
-                        <span className={cn("px-1.5 py-0.5 rounded text-[8px] font-bold font-mono",
-                          coin.oiChangePct >  1.0 ? "bg-trading-up/10 text-trading-up"
-                        : coin.oiChangePct < -1.0 ? "bg-trading-down/10 text-trading-down"
-                        : "bg-trading-muted/10 text-trading-muted"
-                        )}>
-                          OI {coin.oiChangePct >= 0 ? "+" : ""}{coin.oiChangePct.toFixed(2)}%
-                        </span>
-                      )}
-                      {coin.lsRatio != null && (
-                        <span className={cn("px-1.5 py-0.5 rounded text-[8px] font-bold font-mono",
-                          coin.lsRatio > 1.8 ? "bg-trading-down/10 text-trading-down"
-                        : coin.lsRatio < 0.6 ? "bg-trading-up/10 text-trading-up"
-                        : "bg-trading-muted/10 text-trading-muted"
-                        )}>
-                          L/S {coin.lsRatio.toFixed(2)}
-                        </span>
-                      )}
-                      {coin.vwap != null && coin.vwap > 0 && (
-                        <span className={cn("px-1.5 py-0.5 rounded text-[8px] font-bold font-mono",
-                          coin.price > coin.vwap * 1.001 ? "bg-trading-down/10 text-trading-down"
-                        : coin.price < coin.vwap * 0.999 ? "bg-trading-up/10 text-trading-up"
-                        : "bg-trading-muted/10 text-trading-muted"
-                        )}>
-                          VWAP {coin.price > coin.vwap ? "↑" : "↓"}{Math.abs((coin.price - coin.vwap) / coin.vwap * 100).toFixed(2)}%
-                        </span>
-                      )}
-                    </div>
-                  )}
-
-                  {/* ATR + action buttons */}
-                  <div className="flex gap-1 items-center flex-wrap">
-                    {(coin.ultraScalp?.atrPct ?? 0) > 0 && (
-                      <div className={cn("px-1.5 py-0.5 rounded text-[9px] font-bold",
-                        (coin.ultraScalp?.atrPct ?? 0) >= 0.3  ? "bg-trading-down/10 text-trading-down"
-                      : (coin.ultraScalp?.atrPct ?? 0) >= 0.15 ? "bg-orange-400/10 text-orange-400"
-                      :                                            "bg-trading-muted/10 text-trading-muted"
-                      )}>ATR {coin.ultraScalp?.atrPct?.toFixed(2)}%</div>
-                    )}
-                    <div className="ml-auto flex gap-1">
+                    {/* ── Buttons ── */}
+                    <div className="flex gap-1.5 justify-end">
                       <button
                         onClick={() => setExpandedCard(expandedCard === coin.symbol ? null : coin.symbol)}
                         className={cn(
-                          "p-1.5 rounded transition-colors text-[10px] font-bold uppercase flex items-center gap-1",
+                          "px-2.5 py-1.5 rounded transition-colors text-xs font-bold uppercase flex items-center gap-1.5",
                           expandedCard === coin.symbol ? "bg-trading-accent text-trading-bg" : "bg-trading-bg text-trading-muted hover:text-white"
                         )}
                       >
@@ -655,7 +717,7 @@ export default function App() {
                       <button
                         onClick={() => getAiConfirmation(coin.symbol, coin)}
                         disabled={loadingAi === coin.symbol}
-                        className="p-1.5 bg-trading-bg rounded text-trading-accent hover:text-white transition-colors disabled:opacity-50"
+                        className="px-2.5 py-1.5 bg-trading-bg rounded text-trading-accent hover:text-white transition-colors disabled:opacity-50"
                       >
                         <Activity className="w-3.5 h-3.5" />
                       </button>
@@ -670,7 +732,7 @@ export default function App() {
                         exit={{ height: 0, opacity: 0 }}
                         className="overflow-hidden"
                       >
-                        <div className="pt-4 mt-4 border-t border-trading-border space-y-3">
+                        <div className="pt-3 mt-0 border-t border-trading-border space-y-3 pl-4 pr-3 pb-3">
                           <div className="grid grid-cols-2 gap-2">
                             <div className="bg-trading-bg/40 p-2 rounded">
                               <div className="text-[8px] text-trading-muted uppercase mb-1">Scalp Signal (1m)</div>
