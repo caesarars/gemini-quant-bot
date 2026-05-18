@@ -11,6 +11,9 @@ services:
       DB_PORT: "5432"
       DB_NAME: quantbot
       DB_USER: quantbot
+    dns:
+      - 8.8.8.8
+      - 1.1.1.1
     depends_on:
       db:
         condition: service_healthy
