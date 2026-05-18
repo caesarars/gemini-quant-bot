@@ -46,7 +46,8 @@ async function runMigrations() {
   await pool.query(`ALTER TABLE trades ADD COLUMN IF NOT EXISTS trailing_high NUMERIC(20,8)`);
   await pool.query(`ALTER TABLE trades ADD COLUMN IF NOT EXISTS trailing_low  NUMERIC(20,8)`);
   await pool.query(`ALTER TABLE bot_settings ADD COLUMN IF NOT EXISTS atr_sl_mult      NUMERIC(5,2) DEFAULT 1.5`);
-  await pool.query(`ALTER TABLE bot_settings ADD COLUMN IF NOT EXISTS atr_tp_mult      NUMERIC(5,2) DEFAULT 2.5`);
+  await pool.query(`ALTER TABLE bot_settings ADD COLUMN IF NOT EXISTS atr_tp_mult      NUMERIC(5,2) DEFAULT 4.0`);
+  await pool.query(`UPDATE bot_settings SET atr_tp_mult = 4.0 WHERE id = 'bot_config' AND atr_tp_mult = 2.5`);
   await pool.query(`ALTER TABLE bot_settings ADD COLUMN IF NOT EXISTS active_strategy   VARCHAR(30)  DEFAULT 'ULTRA-SCALP'`);
   await pool.query(`ALTER TABLE bot_settings ADD COLUMN IF NOT EXISTS arb_sl_mult      NUMERIC(5,2) DEFAULT 1.0`);
   await pool.query(`ALTER TABLE bot_settings ADD COLUMN IF NOT EXISTS arb_tp_mult      NUMERIC(5,2) DEFAULT 3.0`);
@@ -192,7 +193,10 @@ function calculateSignal(ohlcv: number[][]) {
   if (ema9 > ema21)                                      buyScore++;
   if (ema9 < ema21)                                      sellScore++;
 
-  const action = buyScore >= 2 ? "BUY" as const : sellScore >= 2 ? "SELL" as const : "HOLD" as const;
+  // RSI veto: don't short when already oversold, don't long when already overbought
+  const action = buyScore >= 2 && rsi < 60  ? "BUY"  as const
+               : sellScore >= 2 && rsi > 40 ? "SELL" as const
+               : "HOLD" as const;
   return { action, rsi, price, macd, bb, ema9, ema21, volumeRatio, atr, atrPct };
 }
 
@@ -391,10 +395,9 @@ async function checkAutoExecute(symbol: string, signal: AnySignal, strategyName:
     if (trend === "NEUTRAL")                           { console.log(`[TREND] ${symbol} blocked — NEUTRAL`);     return; }
   }
 
-  // Volume threshold: MEAN-REV uses 0.8× (subdued range-market volume), others 1.0×.
-  // ULTRA-SCALP fires on live in-progress candle ticks — the partial candle's volume is always
-  // a fraction of a completed candle, so we recompute the ratio from the closed-candle buffer
-  // to get a fair apples-to-apples comparison against the 20-period average.
+  // Volume thresholds: MEAN-REV 0.8× (range markets have naturally subdued volume), others 1.0×.
+  // ULTRA-SCALP recomputes ratio from closed-candle buffer for a fair comparison
+  // (live partial candle volume is always a fraction of a completed candle).
   const volThreshold = strategyName === "MEAN-REV" ? 0.8 : 1.0;
   const volRatio = strategyName === "ULTRA-SCALP"
     ? parseFloat(calcVolumeRatio((candleBuffer.get(symbol) || []).map(c => c[5])).toFixed(2))
@@ -477,7 +480,7 @@ async function checkAutoExecute(symbol: string, signal: AnySignal, strategyName:
                  :                                    (cfgRow.rows[0]?.atr_sl_mult ?? 1.5);
   const tpMult   = strategyName === "MOMENTUM-ARB" ? (cfgRow.rows[0]?.arb_tp_mult ?? 3.0)
                  : strategyName === "MEAN-REV"      ? (cfgRow.rows[0]?.mr_tp_mult  ?? 2.0)
-                 :                                    (cfgRow.rows[0]?.atr_tp_mult ?? 2.5);
+                 :                                    (cfgRow.rows[0]?.atr_tp_mult ?? 4.0);
   const side      = signal.action === "BUY" ? "buy" : "sell";
   const closeSide = signal.action === "BUY" ? "sell" : "buy";
   const isLong    = signal.action === "BUY";
@@ -592,19 +595,21 @@ async function seedCandleBuffer() {
   await Promise.all(SYMBOLS.map(async symbol => {
     try {
       // 1m — ULTRA-SCALP signal indicators
-      const ohlcv1m = await binance.fetchOHLCV(symbol, "1m", undefined, 50);
-      const buf1m   = ohlcv1m.map((c: any[]) => c.map(Number) as number[]);
+      // Fetch +1 extra and drop the last candle — REST API always returns the currently-open
+      // (incomplete) candle as the final element, whose partial volume would skew the ratio.
+      const ohlcv1m = await binance.fetchOHLCV(symbol, "1m", undefined, 51);
+      const buf1m   = ohlcv1m.slice(0, -1).map((c: any[]) => c.map(Number) as number[]);
       candleBuffer.set(symbol, buf1m);
       await saveOHLCV(symbol, buf1m);
 
       // 5m — MOMENTUM ARB (50 candles ≈ 4 hours)
-      const ohlcv5m = await binance.fetchOHLCV(symbol, "5m", undefined, 50);
-      const buf5m   = ohlcv5m.map((c: any[]) => c.map(Number) as number[]);
+      const ohlcv5m = await binance.fetchOHLCV(symbol, "5m", undefined, 51);
+      const buf5m   = ohlcv5m.slice(0, -1).map((c: any[]) => c.map(Number) as number[]);
       momentumBuffer.set(symbol, buf5m);
 
       // 15m — trend filter (200 candles ≈ 50 hours)
-      const ohlcv15m = await binance.fetchOHLCV(symbol, "15m", undefined, 200);
-      const buf15m   = ohlcv15m.map((c: any[]) => c.map(Number) as number[]);
+      const ohlcv15m = await binance.fetchOHLCV(symbol, "15m", undefined, 201);
+      const buf15m   = ohlcv15m.slice(0, -1).map((c: any[]) => c.map(Number) as number[]);
       trendBuffer.set(symbol, buf15m);
       await saveOHLCV(symbol, buf15m, "15m");
 
