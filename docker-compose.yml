@@ -11,6 +11,7 @@ services:
       DB_PORT: "5432"
       DB_NAME: quantbot
       DB_USER: quantbot
+      NODE_OPTIONS: "--dns-result-order=ipv4first"
     dns:
       - 8.8.8.8
       - 1.1.1.1
