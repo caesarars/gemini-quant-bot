@@ -169,6 +169,48 @@ function calcVWAP(ohlcv: number[][]): number {
   return vol > 0 ? pv / vol : 0;
 }
 
+function calcADX(ohlcv: number[][], period = 14): { adx: number; plusDI: number; minusDI: number } {
+  if (ohlcv.length < period * 2 + 1) return { adx: 0, plusDI: 0, minusDI: 0 };
+  const highs = ohlcv.map(c => c[2]);
+  const lows  = ohlcv.map(c => c[3]);
+  const closes = ohlcv.map(c => c[4]);
+
+  let trSum = 0, plusDMSum = 0, minusDMSum = 0;
+  for (let i = 1; i <= period; i++) {
+    const high = highs[i], low = lows[i];
+    const prevHigh = highs[i - 1], prevLow = lows[i - 1], prevClose = closes[i - 1];
+    const tr = Math.max(high - low, Math.abs(high - prevClose), Math.abs(low - prevClose));
+    const plusDM  = high - prevHigh > prevLow - low ? Math.max(high - prevHigh, 0) : 0;
+    const minusDM = prevLow - low > high - prevHigh ? Math.max(prevLow - low, 0) : 0;
+    trSum += tr; plusDMSum += plusDM; minusDMSum += minusDM;
+  }
+
+  let trAvg = trSum / period;
+  let plusDMAvg = plusDMSum / period;
+  let minusDMAvg = minusDMSum / period;
+
+  let plusDI  = 100 * plusDMAvg / trAvg;
+  let minusDI = 100 * minusDMAvg / trAvg;
+  let dx = 100 * Math.abs(plusDI - minusDI) / (plusDI + minusDI || 1);
+  let adx = dx;
+
+  for (let i = period + 1; i < ohlcv.length; i++) {
+    const high = highs[i], low = lows[i];
+    const prevHigh = highs[i - 1], prevLow = lows[i - 1], prevClose = closes[i - 1];
+    const tr = Math.max(high - low, Math.abs(high - prevClose), Math.abs(low - prevClose));
+    const plusDM  = high - prevHigh > prevLow - low ? Math.max(high - prevHigh, 0) : 0;
+    const minusDM = prevLow - low > high - prevHigh ? Math.max(prevLow - low, 0) : 0;
+    trAvg = (trAvg * (period - 1) + tr) / period;
+    plusDMAvg  = (plusDMAvg  * (period - 1) + plusDM)  / period;
+    minusDMAvg = (minusDMAvg * (period - 1) + minusDM) / period;
+    plusDI  = 100 * plusDMAvg / trAvg;
+    minusDI = 100 * minusDMAvg / trAvg;
+    dx = 100 * Math.abs(plusDI - minusDI) / (plusDI + minusDI || 1);
+    adx = (adx * (period - 1) + dx) / period;
+  }
+  return { adx: parseFloat(adx.toFixed(2)), plusDI: parseFloat(plusDI.toFixed(2)), minusDI: parseFloat(minusDI.toFixed(2)) };
+}
+
 function calculateSignal(ohlcv: number[][]) {
   if (!ohlcv || ohlcv.length < 26) return { action: "HOLD" as const, rsi: 50, price: 0, macd: null, bb: null, ema9: null, ema21: null, volumeRatio: 1, atr: 0, atrPct: 0 };
   const closes  = ohlcv.map(c => c[4]);
@@ -308,6 +350,19 @@ function getTrend(symbol: string): "UP" | "DOWN" | "NEUTRAL" {
   return "NEUTRAL"; // hanya tepat di EMA200 (sangat jarang)
 }
 
+// Market regime detection using ADX on 15m trend buffer.
+// TRENDING = ADX > 25 (strong trend, disable mean-rev)
+// RANGING  = ADX < 20 (weak trend, disable momentum)
+// NEUTRAL  = ADX 20-25 (all strategies allowed)
+function getRegime(symbol: string): { regime: "TRENDING" | "RANGING" | "NEUTRAL"; adx: number; plusDI: number; minusDI: number } {
+  const buf = trendBuffer.get(symbol) || [];
+  if (buf.length < 29) return { regime: "NEUTRAL", adx: 0, plusDI: 0, minusDI: 0 };
+  const { adx, plusDI, minusDI } = calcADX(buf, 14);
+  if (adx > 25) return { regime: "TRENDING", adx, plusDI, minusDI };
+  if (adx < 20) return { regime: "RANGING", adx, plusDI, minusDI };
+  return { regime: "NEUTRAL", adx, plusDI, minusDI };
+}
+
 // Returns a TP price guaranteed to cover round-trip taker fees (entry + exit).
 // If ATR-based TP profit < total fee, bumps TP up by 10% above fee cost.
 function safeTpPrice(
@@ -374,6 +429,22 @@ function calcContextMultipliers(
   return { tpBonus: Math.min(tpBonus, 1.8), slMult };
 }
 
+// Fetch USDT balance from Binance futures (mock = 10,000 if no keys)
+let cachedBalance = 10000;
+let cachedBalanceAt = 0;
+async function getAccountBalance(): Promise<number> {
+  if (!process.env.BINANCE_API_KEY || !process.env.BINANCE_SECRET_KEY) return 10000;
+  if (Date.now() - cachedBalanceAt < 30_000) return cachedBalance; // cache 30s
+  try {
+    const bal = await binance.fetchBalance() as any;
+    cachedBalance = parseFloat(bal.total?.USDT || bal.USDT?.total || 10000);
+    cachedBalanceAt = Date.now();
+  } catch (e: any) {
+    console.error("[BALANCE] fetch error:", e?.message);
+  }
+  return cachedBalance;
+}
+
 // ── Auto-Execute ───────────────────────────────────────────────────────────────
 
 type AnySignal = { action: "BUY" | "SELL" | "HOLD"; price: number; rsi: number; volumeRatio: number; atr: number; atrPct: number };
@@ -383,9 +454,20 @@ async function checkAutoExecute(symbol: string, signal: AnySignal, strategyName:
   const isAutoPilot = settingsRow.rows[0]?.is_auto_pilot || false;
 
   const trend = getTrend(symbol);
-  console.log(`[${strategyName}] ${symbol} → ${signal.action} RSI:${signal.rsi} trend:${trend} autoPilot:${isAutoPilot}`);
+  const { regime, adx } = getRegime(symbol);
+  console.log(`[${strategyName}] ${symbol} → ${signal.action} RSI:${signal.rsi} trend:${trend} regime:${regime}(ADX:${adx}) autoPilot:${isAutoPilot}`);
 
   if (!isAutoPilot || signal.action === "HOLD") return;
+
+  // Regime-based strategy gating (ADX on 15m)
+  if (strategyName === "MEAN-REV" && regime === "TRENDING") {
+    console.log(`[REGIME] ${symbol} MEAN-REV blocked — ADX ${adx} (strong trend)`);
+    return;
+  }
+  if (strategyName === "MOMENTUM-ARB" && regime === "RANGING") {
+    console.log(`[REGIME] ${symbol} MOMENTUM-ARB blocked — ADX ${adx} (ranging market)`);
+    return;
+  }
 
   // Trend filter — only MOMENTUM-ARB uses this (crossover strategy benefits from trend alignment)
   // ULTRA-SCALP and MEAN-REV skip trend filter: 1m scalps are too short for 15m trend to matter
@@ -461,20 +543,31 @@ async function checkAutoExecute(symbol: string, signal: AnySignal, strategyName:
     }
   }
 
-  // Cooldown per strategy — each strategy tracks its own independently so they can all fire on the same symbol.
+  // 1. Prevent duplicate open positions for the same symbol+strategy
+  const openPos = await pool.query(
+    `SELECT id FROM trades WHERE symbol = $1 AND strategy = $2 AND status = 'OPEN' LIMIT 1`,
+    [symbol, strategyName]
+  );
+  if (openPos.rows.length > 0) {
+    console.log(`[AUTO] ${symbol} ${strategyName} skipped — already has an open position`);
+    return;
+  }
+
+  // 2. Cooldown per strategy — each strategy tracks its own independently so they can all fire on the same symbol.
   const cooldown = strategyName === "MOMENTUM-ARB" ? "15 minutes" : strategyName === "MEAN-REV" ? "30 minutes" : "5 minutes";
   const recent   = await pool.query(
-    `SELECT id FROM trades WHERE symbol = $1 AND strategy = $2 AND status = 'OPEN'
+    `SELECT id FROM trades WHERE symbol = $1 AND strategy = $2
      AND timestamp > NOW() - INTERVAL '${cooldown}' LIMIT 1`, [symbol, strategyName]
   );
   if (recent.rows.length > 0) {
-    console.log(`[AUTO] ${symbol} ${strategyName} skipped — open ${strategyName} trade within ${cooldown}`);
+    console.log(`[AUTO] ${symbol} ${strategyName} skipped — cooldown active (${cooldown})`);
     return;
   }
 
   // ATR multipliers differ per strategy
-  const cfgRow   = await pool.query("SELECT leverage, atr_sl_mult::float, atr_tp_mult::float, arb_sl_mult::float, arb_tp_mult::float, mr_sl_mult::float, mr_tp_mult::float FROM bot_settings WHERE id = 'bot_config'");
+  const cfgRow   = await pool.query("SELECT leverage, risk_level, atr_sl_mult::float, atr_tp_mult::float, arb_sl_mult::float, arb_tp_mult::float, mr_sl_mult::float, mr_tp_mult::float FROM bot_settings WHERE id = 'bot_config'");
   const leverage = cfgRow.rows[0]?.leverage || 10;
+  const riskPct  = (cfgRow.rows[0]?.risk_level ?? 1) / 100;
   const slMult   = strategyName === "MOMENTUM-ARB" ? (cfgRow.rows[0]?.arb_sl_mult ?? 1.0)
                  : strategyName === "MEAN-REV"      ? (cfgRow.rows[0]?.mr_sl_mult  ?? 1.0)
                  :                                    (cfgRow.rows[0]?.atr_sl_mult ?? 1.5);
@@ -485,9 +578,29 @@ async function checkAutoExecute(symbol: string, signal: AnySignal, strategyName:
   const closeSide = signal.action === "BUY" ? "sell" : "buy";
   const isLong    = signal.action === "BUY";
   const hasKeys   = !!(process.env.BINANCE_API_KEY && process.env.BINANCE_SECRET_KEY);
-  const amount    = parseFloat((binance as any).amountToPrecision(symbol, 25 / signal.price));
 
-  console.log(`[AUTO] ${signal.action} ${symbol} x${leverage} ATR:${signal.atrPct?.toFixed(3)}% amount:${amount}`);
+  // ── ATR-based position sizing ──
+  // riskAmount = balance * riskPct
+  // stopDistance = ATR * slMult  (in price units)
+  // amount = riskAmount / stopDistance  (base asset qty)
+  // notional = amount * price  (USDT)
+  const balance     = await getAccountBalance();
+  const riskAmount  = balance * riskPct;
+  const stopDistance = (signal.atr ?? 0) * slMult;
+  let amount = 0;
+  if (stopDistance > 0) {
+    amount = riskAmount / stopDistance;
+  }
+  // Fallback to fixed $25 sizing if calculation fails or below minimum notional
+  const notional = amount * signal.price;
+  if (notional < 10 || amount <= 0) {
+    amount = parseFloat((binance as any).amountToPrecision(symbol, 25 / signal.price));
+    console.log(`[AUTO-SIZE] ${symbol} fallback to fixed sizing (notional ${notional.toFixed(2)} < $10)`);
+  } else {
+    amount = parseFloat((binance as any).amountToPrecision(symbol, amount));
+  }
+
+  console.log(`[AUTO] ${signal.action} ${symbol} x${leverage} ATR:${signal.atrPct?.toFixed(3)}% risk:${(riskPct*100).toFixed(1)}% size:${amount.toFixed(4)} notional:$${(amount*signal.price).toFixed(2)}`);
 
   let fillPrice = signal.price;
   // Binance USDM futures taker rate: 0.04% — used as fallback when fee not in API response
@@ -615,6 +728,7 @@ async function seedCandleBuffer() {
 
       // Build initial scanResult for ALL strategies simultaneously
       const trend  = getTrend(symbol);
+      const { regime, adx, plusDI, minusDI } = getRegime(symbol);
       const sig1m  = calculateSignal(buf1m);
       const sig5m  = calculateMomentumSignal(buf5m);
       const sigMR  = calculateMeanRevSignal(buf15m);
@@ -622,6 +736,10 @@ async function seedCandleBuffer() {
         symbol,
         price:       sig1m.price || sig5m.price,
         trend,
+        regime,
+        adx,
+        plusDI,
+        minusDI,
         vwap:        parseFloat(calcVWAP(buf1m).toFixed(6)),
         oiChangePct: openInterestCache.get(symbol)?.oiChangePct ?? null,
         lsRatio:     longShortCache.get(symbol) ?? null,
@@ -631,7 +749,7 @@ async function seedCandleBuffer() {
       };
       const idx = scanResults.findIndex(r => r.symbol === symbol);
       if (idx >= 0) scanResults[idx] = entry; else scanResults.push(entry);
-      console.log(`[SEED] ${symbol} US:${sig1m.action} MA:${sig5m.action} MR:${sigMR.action} trend:${trend}`);
+      console.log(`[SEED] ${symbol} US:${sig1m.action} MA:${sig5m.action} MR:${sigMR.action} trend:${trend} regime:${regime}(ADX:${adx})`);
     } catch (e: any) {
       console.error(`[SEED] ${symbol}:`, e?.message);
     }
@@ -672,8 +790,14 @@ function initWebSocket() {
         if (buf15.length >= 20) {
           const signal = calculateMeanRevSignal(buf15);
           const trend  = getTrend(symbol);
+          const { regime, adx, plusDI, minusDI } = getRegime(symbol);
           const idx    = scanResults.findIndex(r => r.symbol === symbol);
           const entry  = scanResults[idx] || { symbol, price: signal.price, trend };
+          entry.trend   = trend;
+          entry.regime  = regime;
+          entry.adx     = adx;
+          entry.plusDI  = plusDI;
+          entry.minusDI = minusDI;
           entry.meanRev = { action: signal.action, rsi: signal.rsi, volumeRatio: signal.volumeRatio, atrPct: signal.atrPct, bbPos: signal.bbPos };
           if (idx >= 0) scanResults[idx] = entry; else scanResults.push(entry);
 
@@ -981,23 +1105,28 @@ app.get("/api/health", (req, res) => res.json({ status: "ok", timestamp: Date.no
 app.get("/api/cooldown-status", async (_req, res) => {
   try {
     const result = await pool.query(`
-      SELECT symbol, strategy, timestamp,
-        CASE strategy
-          WHEN 'MOMENTUM-ARB' THEN timestamp > NOW() - INTERVAL '15 minutes'
-          WHEN 'MEAN-REV'     THEN timestamp > NOW() - INTERVAL '30 minutes'
-          ELSE                     timestamp > NOW() - INTERVAL '5 minutes'
-        END AS in_cooldown
-      FROM trades
-      WHERE status = 'OPEN'
-        AND timestamp > NOW() - INTERVAL '30 minutes'
+      WITH rules AS (
+        SELECT symbol, strategy, timestamp, status,
+          CASE
+            WHEN status = 'OPEN' THEN true
+            WHEN strategy = 'MOMENTUM-ARB' AND timestamp > NOW() - INTERVAL '15 minutes' THEN true
+            WHEN strategy = 'MEAN-REV'     AND timestamp > NOW() - INTERVAL '30 minutes' THEN true
+            WHEN strategy NOT IN ('MOMENTUM-ARB','MEAN-REV') AND timestamp > NOW() - INTERVAL '5 minutes' THEN true
+            ELSE false
+          END AS in_cooldown
+        FROM trades
+      )
+      SELECT symbol, strategy, timestamp, status, in_cooldown
+      FROM rules
+      WHERE in_cooldown = true
       ORDER BY timestamp DESC
     `);
     // Keyed by "SYMBOL|STRATEGY" so each strategy has its own cooldown status
-    const map: Record<string, { inCooldown: boolean; strategy: string; since: string }> = {};
+    const map: Record<string, { inCooldown: boolean; strategy: string; since: string; status: string }> = {};
     for (const row of result.rows) {
       const key = `${row.symbol}|${row.strategy}`;
       if (!map[key]) {
-        map[key] = { inCooldown: row.in_cooldown, strategy: row.strategy, since: row.timestamp };
+        map[key] = { inCooldown: row.in_cooldown, strategy: row.strategy, since: row.timestamp, status: row.status };
       }
     }
     res.json(map);
@@ -1287,6 +1416,26 @@ app.get("/api/check-api", async (req, res) => {
   catch (e: any) { res.json({ connected: false, reason: e.message }); }
 });
 
+// ── Force-test a real order for a specific symbol/strategy ───────────────────
+app.post("/api/test-trade", async (req, res) => {
+  const { symbol, strategy = "ULTRA-SCALP", action = "BUY" } = req.body;
+  if (!symbol) return res.status(400).json({ error: "symbol required" });
+  const buf = strategy === "MOMENTUM-ARB" ? momentumBuffer.get(symbol)
+            : strategy === "MEAN-REV"     ? trendBuffer.get(symbol)
+            :                               candleBuffer.get(symbol);
+  if (!buf || buf.length < 10) return res.status(400).json({ error: "buffer not ready" });
+  const signal = strategy === "MOMENTUM-ARB" ? calculateMomentumSignal(buf)
+               : strategy === "MEAN-REV"     ? calculateMeanRevSignal(buf)
+               :                               calculateSignal(buf);
+  const forced = { ...signal, action: action as "BUY" | "SELL" };
+  try {
+    await checkAutoExecute(symbol, forced, strategy);
+    res.json({ ok: true, signal: forced.action, rsi: forced.rsi, vol: forced.volumeRatio });
+  } catch (e: any) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
 // ── Diagnose — real-time filter state per symbol ───────────────────────────────
 
 app.get("/api/diagnose", async (_req, res) => {
@@ -1297,6 +1446,9 @@ app.get("/api/diagnose", async (_req, res) => {
     function filterBlock(signal: any, strategyName: string, symbol: string): string {
       if (!isAutoPilot) return "autopilot OFF";
       if (signal.action === "HOLD") return "HOLD signal";
+      const { regime, adx } = getRegime(symbol);
+      if (strategyName === "MEAN-REV" && regime === "TRENDING") return `REGIME ${regime} (ADX ${adx}) — mean-rev disabled`;
+      if (strategyName === "MOMENTUM-ARB" && regime === "RANGING") return `REGIME ${regime} (ADX ${adx}) — momentum disabled`;
       const trend = getTrend(symbol);
       if (strategyName === "MOMENTUM-ARB") {
         if (signal.action === "BUY"  && trend === "DOWN")    return `trend DOWN (need UP)`;
@@ -1370,9 +1522,12 @@ app.get("/api/diagnose", async (_req, res) => {
         return base;
       }
 
+      const { regime, adx } = getRegime(symbol);
       return {
         symbol,
         trend: getTrend(symbol),
+        regime,
+        adx,
         buffers: { "1m": buf1m.length, "5m": buf5m.length, "15m": buf15m.length },
         openTrades: openTrades.length,
         cooldownBlocking: cooldownBlocking.length > 0,

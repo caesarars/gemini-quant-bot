@@ -39,6 +39,10 @@ interface ScanResult {
   symbol: string;
   price: number;
   trend?: 'UP' | 'DOWN' | 'NEUTRAL';
+  regime?: 'TRENDING' | 'RANGING' | 'NEUTRAL';
+  adx?: number;
+  plusDI?: number;
+  minusDI?: number;
   vwap?: number;
   oiChangePct?: number | null;
   lsRatio?: number | null;
@@ -81,9 +85,15 @@ function getBlockReason(
   fearGreed?: number | null,
   strategyId?: string,
   oiChangePct?: number | null,
-  lsRatio?: number | null
+  lsRatio?: number | null,
+  cdInfo?: { inCooldown: boolean; status?: string } | undefined,
+  regime?: 'TRENDING' | 'RANGING' | 'NEUTRAL' | undefined
 ): { label: string; color: string } {
   if (!isAutoPilot) return { label: 'Auto-pilot OFF', color: 'text-trading-muted' };
+  if (cdInfo?.status === 'OPEN') return { label: 'Position open', color: 'text-orange-400' };
+  if (cdInfo?.inCooldown) return { label: 'Cooldown active', color: 'text-orange-400' };
+  if (strategyId === 'MEAN-REV' && regime === 'TRENDING') return { label: 'Trending market — mean-rev off', color: 'text-orange-400' };
+  if (strategyId === 'MOMENTUM-ARB' && regime === 'RANGING') return { label: 'Ranging market — momentum off', color: 'text-orange-400' };
   if (action === 'HOLD') return { label: 'No signal', color: 'text-trading-muted' };
   if (!skipTrend) {
     if (trend === 'NEUTRAL') return { label: 'Trend neutral', color: 'text-orange-400' };
@@ -131,7 +141,7 @@ export default function App() {
   const [logs, setLogs] = useState<{ id: string; msg: string; time: string; type: string }[]>([]);
   const [isAutoPilot, setIsAutoPilot]             = useState(false);
   const [activeStrategies, setActiveStrategies]   = useState<string[]>(["ULTRA-SCALP", "MOMENTUM-ARB"]);
-  const [cooldownStatus, setCooldownStatus]       = useState<Record<string, { inCooldown: boolean; strategy: string }>>({});
+  const [cooldownStatus, setCooldownStatus]       = useState<Record<string, { inCooldown: boolean; strategy: string; status?: string }>>({});
   const [loadingAi, setLoadingAi] = useState<string | null>(null);
   const [marketContext, setMarketContext] = useState<{
     fearGreed: { value: number; classification: string } | null;
@@ -529,6 +539,16 @@ export default function App() {
                               {coin.trend === 'UP' ? '↑' : coin.trend === 'DOWN' ? '↓' : '—'}
                             </span>
                           )}
+                          {/* Regime (ADX) */}
+                          {coin.regime && (
+                            <span className={cn("text-[10px] font-bold px-1.5 py-0.5 rounded",
+                              coin.regime === 'TRENDING' ? "bg-purple-500/15 text-purple-400"
+                            : coin.regime === 'RANGING'  ? "bg-cyan-500/15 text-cyan-400"
+                            :                              "bg-trading-muted/10 text-trading-muted"
+                            )}>
+                              {coin.regime === 'TRENDING' ? 'TREND' : coin.regime === 'RANGING' ? 'RANGE' : 'NEUT'} {coin.adx?.toFixed(0)}
+                            </span>
+                          )}
                           {/* Trade fired badge */}
                           {hasTraded && (
                             <span className="text-[10px] px-2 py-0.5 bg-trading-up/15 text-trading-up border border-trading-up/30 rounded font-black uppercase tracking-wider animate-pulse">
@@ -572,7 +592,7 @@ export default function App() {
                     {/* ── Strategy rows ── */}
                     <div className="space-y-1.5 mb-3">
                       {coin.ultraScalp && (() => {
-                        const r = getBlockReason(coin.ultraScalp.action, coin.trend, coin.ultraScalp.volumeRatio, 1.0, isAutoPilot, true, marketContext.fundingRates[coin.symbol], marketContext.fearGreed?.value, 'ULTRA-SCALP', coin.oiChangePct, coin.lsRatio);
+                        const r = getBlockReason(coin.ultraScalp.action, coin.trend, coin.ultraScalp.volumeRatio, 1.0, isAutoPilot, true, marketContext.fundingRates[coin.symbol], marketContext.fearGreed?.value, 'ULTRA-SCALP', coin.oiChangePct, coin.lsRatio, cooldownStatus[`${coin.symbol}|ULTRA-SCALP`], coin.regime);
                         const active = coin.ultraScalp.action !== 'HOLD';
                         return (
                           <div className={cn("rounded overflow-hidden border",
@@ -604,7 +624,7 @@ export default function App() {
                       })()}
 
                       {coin.momentumArb && (() => {
-                        const r = getBlockReason(coin.momentumArb.action, coin.trend, coin.momentumArb.volumeRatio, 1.0, isAutoPilot, false, marketContext.fundingRates[coin.symbol], marketContext.fearGreed?.value, 'MOMENTUM-ARB', coin.oiChangePct, coin.lsRatio);
+                        const r = getBlockReason(coin.momentumArb.action, coin.trend, coin.momentumArb.volumeRatio, 1.0, isAutoPilot, false, marketContext.fundingRates[coin.symbol], marketContext.fearGreed?.value, 'MOMENTUM-ARB', coin.oiChangePct, coin.lsRatio, cooldownStatus[`${coin.symbol}|MOMENTUM-ARB`], coin.regime);
                         const active = coin.momentumArb.action !== 'HOLD';
                         return (
                           <div className={cn("rounded overflow-hidden border",
@@ -639,7 +659,7 @@ export default function App() {
                       })()}
 
                       {coin.meanRev && (() => {
-                        const r = getBlockReason(coin.meanRev.action, coin.trend, coin.meanRev.volumeRatio, 0.8, isAutoPilot, true, marketContext.fundingRates[coin.symbol], marketContext.fearGreed?.value, 'MEAN-REV', coin.oiChangePct, coin.lsRatio);
+                        const r = getBlockReason(coin.meanRev.action, coin.trend, coin.meanRev.volumeRatio, 0.8, isAutoPilot, true, marketContext.fundingRates[coin.symbol], marketContext.fearGreed?.value, 'MEAN-REV', coin.oiChangePct, coin.lsRatio, cooldownStatus[`${coin.symbol}|MEAN-REV`], coin.regime);
                         const active = coin.meanRev.action !== 'HOLD';
                         const bbColor = coin.meanRev.bbPos === 'LOWER' ? 'text-trading-up'
                                       : coin.meanRev.bbPos === 'UPPER' ? 'text-trading-down'
