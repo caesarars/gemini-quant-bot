@@ -151,6 +151,8 @@ export default function App() {
   const [isSettingsOpen, setIsSettingsOpen]       = useState(false);
   const [settingsLoading, setSettingsLoading]     = useState(false);
   const [telegramTestLoading, setTelegramTestLoading] = useState(false);
+  const [telegramBotToken, setTelegramBotToken]   = useState("");
+  const [telegramChatId, setTelegramChatId]       = useState("");
   const [botSettings, setBotSettings] = useState({
     leverage: 10,
     maxSlippage: 0.5,
@@ -225,6 +227,8 @@ export default function App() {
           mrSlMult:        s.mr_sl_mult ?? prev.mrSlMult,
           mrTpMult:        s.mr_tp_mult ?? prev.mrTpMult,
         }));
+        if (typeof s.telegram_bot_token === "string") setTelegramBotToken(s.telegram_bot_token);
+        if (typeof s.telegram_chat_id   === "string") setTelegramChatId(s.telegram_chat_id);
       })
       .catch(() => {});
   }, []);
@@ -1754,13 +1758,42 @@ export default function App() {
                   </div>
                 </div>
 
-                {/* ── Telegram Test ── */}
+                {/* ── Telegram Config ── */}
                 <div className="space-y-4">
                   <div className="flex items-center gap-3 text-[10px] uppercase text-trading-muted tracking-[2px]">
                     <Send className="w-3.5 h-3.5" />
                     Telegram Notifications
                     <div className="flex-1 h-[1px] bg-trading-border" />
                   </div>
+
+                  <div className="grid grid-cols-1 gap-4 max-w-2xl">
+                    {/* Bot Token */}
+                    <div className="space-y-1.5">
+                      <label className="text-[10px] uppercase text-trading-muted font-bold tracking-wider">Bot Token</label>
+                      <input
+                        type="text"
+                        value={telegramBotToken}
+                        onChange={e => setTelegramBotToken(e.target.value)}
+                        placeholder="123456789:ABCdefGHIjklMNOpqrSTUvwxyz"
+                        className="w-full bg-trading-card border border-trading-border rounded px-3 py-2 text-[11px] text-trading-text placeholder:text-trading-muted/40 focus:border-trading-accent focus:outline-none transition-colors"
+                      />
+                      <p className="text-[9px] text-trading-muted">Get from <span className="text-trading-accent">@BotFather</span>. Saved securely in database. Falls back to env var if empty.</p>
+                    </div>
+
+                    {/* Chat ID */}
+                    <div className="space-y-1.5">
+                      <label className="text-[10px] uppercase text-trading-muted font-bold tracking-wider">Chat ID</label>
+                      <input
+                        type="text"
+                        value={telegramChatId}
+                        onChange={e => setTelegramChatId(e.target.value)}
+                        placeholder="12345678 atau -1001234567890"
+                        className="w-full bg-trading-card border border-trading-border rounded px-3 py-2 text-[11px] text-trading-text placeholder:text-trading-muted/40 focus:border-trading-accent focus:outline-none transition-colors"
+                      />
+                      <p className="text-[9px] text-trading-muted">Your Telegram user ID or group ID. Get from <span className="text-trading-accent">@userinfobot</span>.</p>
+                    </div>
+                  </div>
+
                   <div className="flex flex-wrap gap-3">
                     <button
                       onClick={async () => {
@@ -1801,9 +1834,6 @@ export default function App() {
                       <span className="text-[11px] font-bold uppercase tracking-wider">{telegramTestLoading ? "Sending..." : "Test Signal Alert"}</span>
                     </button>
                   </div>
-                  <p className="text-[9px] text-trading-muted leading-relaxed max-w-xl">
-                    Sends a test message to the configured Telegram chat. Requires <code className="text-trading-accent">TELEGRAM_BOT_TOKEN</code> and <code className="text-trading-accent">TELEGRAM_CHAT_ID</code> environment variables.
-                  </p>
                 </div>
               </div>
 
@@ -1829,6 +1859,8 @@ export default function App() {
                           arbTpMult: botSettings.arbTpMult,
                           mrSlMult: botSettings.mrSlMult,
                           mrTpMult: botSettings.mrTpMult,
+                          telegramBotToken,
+                          telegramChatId,
                         }),
                       });
                       addLog("Bot settings saved", "success");

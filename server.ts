@@ -56,6 +56,8 @@ async function runMigrations() {
   await pool.query(`ALTER TABLE bot_settings ADD COLUMN IF NOT EXISTS mr_sl_mult NUMERIC(5,2) DEFAULT 1.0`);
   await pool.query(`ALTER TABLE bot_settings ADD COLUMN IF NOT EXISTS mr_tp_mult NUMERIC(5,2) DEFAULT 2.0`);
   await pool.query(`UPDATE bot_settings SET active_strategies = array_append(active_strategies, 'MEAN-REV') WHERE id = 'bot_config' AND NOT ('MEAN-REV' = ANY(COALESCE(active_strategies, '{}')))`);
+  await pool.query(`ALTER TABLE bot_settings ADD COLUMN IF NOT EXISTS telegram_bot_token VARCHAR(255) DEFAULT NULL`);
+  await pool.query(`ALTER TABLE bot_settings ADD COLUMN IF NOT EXISTS telegram_chat_id   VARCHAR(50)  DEFAULT NULL`);
 
 }
 
@@ -1066,9 +1068,25 @@ async function fetchFearGreed() {
   }
 }
 
+// Read Telegram config from DB (overrides env vars if set)
+async function getTelegramConfig(): Promise<{ token: string | null; chatId: string | null }> {
+  try {
+    const r = await pool.query("SELECT telegram_bot_token, telegram_chat_id FROM bot_settings WHERE id = 'bot_config'");
+    const row = r.rows[0];
+    return {
+      token:  row?.telegram_bot_token || process.env.TELEGRAM_BOT_TOKEN || null,
+      chatId: row?.telegram_chat_id   || process.env.TELEGRAM_CHAT_ID   || null,
+    };
+  } catch {
+    return {
+      token:  process.env.TELEGRAM_BOT_TOKEN || null,
+      chatId: process.env.TELEGRAM_CHAT_ID   || null,
+    };
+  }
+}
+
 async function sendTelegram(message: string): Promise<void> {
-  const token  = process.env.TELEGRAM_BOT_TOKEN;
-  const chatId = process.env.TELEGRAM_CHAT_ID;
+  const { token, chatId } = await getTelegramConfig();
   if (!token || !chatId) return;
   try {
     await fetch(`https://api.telegram.org/bot${token}/sendMessage`, {
@@ -1083,8 +1101,7 @@ async function sendTelegram(message: string): Promise<void> {
 
 // Send signal alert with full setup details before trade execution
 async function sendSignalAlert(symbol: string, signal: AnySignal, strategyName: string) {
-  const token  = process.env.TELEGRAM_BOT_TOKEN;
-  const chatId = process.env.TELEGRAM_CHAT_ID;
+  const { token, chatId } = await getTelegramConfig();
   if (!token || !chatId) return;
 
   const isLong = signal.action === "BUY";
@@ -1517,29 +1534,33 @@ app.get("/api/settings", async (req, res) => {
 
 app.post("/api/settings", async (req, res) => {
   const { isAutoPilot, riskLevel, maxSlippage, takeProfitPct, stopLossPct, leverage,
-          atrSlMult, atrTpMult, arbSlMult, arbTpMult, mrSlMult, mrTpMult, activeStrategiesVal } = req.body;
+          atrSlMult, atrTpMult, arbSlMult, arbTpMult, mrSlMult, mrTpMult, activeStrategiesVal,
+          telegramBotToken, telegramChatId } = req.body;
   const strategiesParam = Array.isArray(activeStrategiesVal) ? activeStrategiesVal : null;
   try {
     const r = await pool.query(
       `UPDATE bot_settings
-       SET is_auto_pilot    = COALESCE($1,  is_auto_pilot),
-           risk_level       = COALESCE($2,  risk_level),
-           max_slippage     = COALESCE($3,  max_slippage),
-           take_profit_pct  = COALESCE($4,  take_profit_pct),
-           stop_loss_pct    = COALESCE($5,  stop_loss_pct),
-           leverage         = COALESCE($6,  leverage),
-           atr_sl_mult      = COALESCE($7,  atr_sl_mult),
-           atr_tp_mult      = COALESCE($8,  atr_tp_mult),
-           arb_sl_mult      = COALESCE($9,  arb_sl_mult),
-           arb_tp_mult      = COALESCE($10, arb_tp_mult),
+       SET is_auto_pilot     = COALESCE($1,  is_auto_pilot),
+           risk_level        = COALESCE($2,  risk_level),
+           max_slippage      = COALESCE($3,  max_slippage),
+           take_profit_pct   = COALESCE($4,  take_profit_pct),
+           stop_loss_pct     = COALESCE($5,  stop_loss_pct),
+           leverage          = COALESCE($6,  leverage),
+           atr_sl_mult       = COALESCE($7,  atr_sl_mult),
+           atr_tp_mult       = COALESCE($8,  atr_tp_mult),
+           arb_sl_mult       = COALESCE($9,  arb_sl_mult),
+           arb_tp_mult       = COALESCE($10, arb_tp_mult),
            active_strategies = COALESCE($11, active_strategies),
-           mr_sl_mult       = COALESCE($12, mr_sl_mult),
-           mr_tp_mult       = COALESCE($13, mr_tp_mult)
+           mr_sl_mult        = COALESCE($12, mr_sl_mult),
+           mr_tp_mult        = COALESCE($13, mr_tp_mult),
+           telegram_bot_token = NULLIF(COALESCE($14, telegram_bot_token), ''),
+           telegram_chat_id   = NULLIF(COALESCE($15, telegram_chat_id), '')
        WHERE id = 'bot_config' RETURNING *`,
       [isAutoPilot ?? null, riskLevel ?? null, maxSlippage ?? null,
        takeProfitPct ?? null, stopLossPct ?? null, leverage ?? null,
        atrSlMult ?? null, atrTpMult ?? null, arbSlMult ?? null, arbTpMult ?? null,
-       strategiesParam, mrSlMult ?? null, mrTpMult ?? null]
+       strategiesParam, mrSlMult ?? null, mrTpMult ?? null,
+       telegramBotToken ?? null, telegramChatId ?? null]
     );
     // Sync in-memory Set so WebSocket handlers react immediately
     if (strategiesParam) {

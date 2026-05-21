@@ -24,14 +24,16 @@ CREATE TABLE IF NOT EXISTS pnl_snapshots (
 );
 
 CREATE TABLE IF NOT EXISTS bot_settings (
-  id               VARCHAR(50) PRIMARY KEY DEFAULT 'bot_config',
-  is_auto_pilot    BOOLEAN       DEFAULT false,
-  risk_level       NUMERIC(5, 2) DEFAULT 1,
-  max_slippage     NUMERIC(5, 2) DEFAULT 0.5,
-  leverage         INTEGER       DEFAULT 10,
-  take_profit_pct  NUMERIC(5, 2) DEFAULT 1.5,
-  stop_loss_pct    NUMERIC(5, 2) DEFAULT 0.8,
-  symbols          TEXT[]        DEFAULT '{BTC/USDT,ETH/USDT,SOL/USDT,XRP/USDT,BNB/USDT,AVAX/USDT,ARB/USDT,OP/USDT}'
+  id                  VARCHAR(50) PRIMARY KEY DEFAULT 'bot_config',
+  is_auto_pilot       BOOLEAN       DEFAULT false,
+  risk_level          NUMERIC(5, 2) DEFAULT 1,
+  max_slippage        NUMERIC(5, 2) DEFAULT 0.5,
+  leverage            INTEGER       DEFAULT 10,
+  take_profit_pct     NUMERIC(5, 2) DEFAULT 1.5,
+  stop_loss_pct       NUMERIC(5, 2) DEFAULT 0.8,
+  symbols             TEXT[]        DEFAULT '{BTC/USDT,ETH/USDT,SOL/USDT,XRP/USDT,BNB/USDT,AVAX/USDT,ARB/USDT,OP/USDT}',
+  telegram_bot_token  VARCHAR(255)  DEFAULT NULL,
+  telegram_chat_id    VARCHAR(50)   DEFAULT NULL
 );
 
 CREATE TABLE IF NOT EXISTS ohlcv (
