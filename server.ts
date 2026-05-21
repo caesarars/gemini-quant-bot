@@ -58,6 +58,12 @@ async function runMigrations() {
   await pool.query(`UPDATE bot_settings SET active_strategies = array_append(active_strategies, 'MEAN-REV') WHERE id = 'bot_config' AND NOT ('MEAN-REV' = ANY(COALESCE(active_strategies, '{}')))`);
   await pool.query(`ALTER TABLE bot_settings ADD COLUMN IF NOT EXISTS telegram_bot_token VARCHAR(255) DEFAULT NULL`);
   await pool.query(`ALTER TABLE bot_settings ADD COLUMN IF NOT EXISTS telegram_chat_id   VARCHAR(50)  DEFAULT NULL`);
+  await pool.query(`ALTER TABLE bot_settings ADD COLUMN IF NOT EXISTS max_concurrent_positions INTEGER DEFAULT 3`);
+  await pool.query(`ALTER TABLE bot_settings ADD COLUMN IF NOT EXISTS use_kelly_sizing BOOLEAN DEFAULT true`);
+  await pool.query(`ALTER TABLE bot_settings ADD COLUMN IF NOT EXISTS partial_tp_enabled BOOLEAN DEFAULT true`);
+  await pool.query(`ALTER TABLE trades ADD COLUMN IF NOT EXISTS partial_tp_filled BOOLEAN DEFAULT false`);
+  await pool.query(`ALTER TABLE trades ADD COLUMN IF NOT EXISTS tp1_price NUMERIC(20,8)`);
+  await pool.query(`ALTER TABLE trades ADD COLUMN IF NOT EXISTS tp2_price NUMERIC(20,8)`);
 
 }
 
@@ -165,6 +171,137 @@ function calcVolumeRatio(ohlcv: number[], period = 20): number {
   return avg > 0 ? ohlcv[ohlcv.length - 1] / avg : 1;
 }
 
+// ── Stochastic RSI ─────────────────────────────────────────────────────────────
+// Returns %K and %D (signal) in range 0-100
+function calcStochRSI(closes: number[], rsiPeriod = 14, stochPeriod = 14, kSmooth = 3, dSmooth = 3): { k: number; d: number } {
+  if (closes.length < rsiPeriod + stochPeriod + kSmooth + dSmooth) return { k: 50, d: 50 };
+
+  // Build RSI series
+  const rsiSeries: number[] = [];
+  for (let i = rsiPeriod; i <= closes.length; i++) {
+    rsiSeries.push(calcRSI(closes.slice(0, i), rsiPeriod));
+  }
+
+  if (rsiSeries.length < stochPeriod) return { k: 50, d: 50 };
+
+  // Raw %K series
+  const rawK: number[] = [];
+  for (let i = stochPeriod - 1; i < rsiSeries.length; i++) {
+    const window = rsiSeries.slice(i - stochPeriod + 1, i + 1);
+    const lo = Math.min(...window);
+    const hi = Math.max(...window);
+    rawK.push(hi === lo ? 50 : ((rsiSeries[i] - lo) / (hi - lo)) * 100);
+  }
+
+  // Smooth %K with SMA(kSmooth)
+  const smoothK: number[] = [];
+  for (let i = kSmooth - 1; i < rawK.length; i++) {
+    smoothK.push(rawK.slice(i - kSmooth + 1, i + 1).reduce((a, b) => a + b, 0) / kSmooth);
+  }
+
+  // %D = SMA(dSmooth) of smoothK
+  const smoothD: number[] = [];
+  for (let i = dSmooth - 1; i < smoothK.length; i++) {
+    smoothD.push(smoothK.slice(i - dSmooth + 1, i + 1).reduce((a, b) => a + b, 0) / dSmooth);
+  }
+
+  if (!smoothK.length || !smoothD.length) return { k: 50, d: 50 };
+  return {
+    k: parseFloat(smoothK[smoothK.length - 1].toFixed(2)),
+    d: parseFloat(smoothD[smoothD.length - 1].toFixed(2)),
+  };
+}
+
+// ── Supertrend ─────────────────────────────────────────────────────────────────
+// Returns direction: 1 = bullish (price above), -1 = bearish (price below)
+function calcSupertrend(ohlcv: number[][], period = 10, multiplier = 3.0): { direction: 1 | -1; value: number } {
+  if (ohlcv.length < period + 1) return { direction: 1, value: 0 };
+
+  const highs  = ohlcv.map(c => c[2]);
+  const lows   = ohlcv.map(c => c[3]);
+  const closes = ohlcv.map(c => c[4]);
+
+  // ATR using Wilder's smoothing
+  const trs: number[] = [];
+  for (let i = 1; i < ohlcv.length; i++) {
+    trs.push(Math.max(highs[i] - lows[i], Math.abs(highs[i] - closes[i - 1]), Math.abs(lows[i] - closes[i - 1])));
+  }
+  const k = 1 / period;
+  let atr = trs.slice(0, period).reduce((a, b) => a + b, 0) / period;
+  const atrArr: number[] = [NaN, ...Array(period - 1).fill(NaN), atr];
+  for (let i = period; i < trs.length; i++) {
+    atr = trs[i] * k + atr * (1 - k);
+    atrArr.push(atr);
+  }
+
+  // Upper/lower bands + direction
+  let direction: 1 | -1 = 1;
+  let prevUpper = 0, prevLower = 0;
+  let finalDir: 1 | -1 = 1;
+  let finalVal = 0;
+
+  for (let i = 1; i < ohlcv.length; i++) {
+    if (isNaN(atrArr[i])) continue;
+    const hl2 = (highs[i] + lows[i]) / 2;
+    let upper = hl2 + multiplier * atrArr[i];
+    let lower = hl2 - multiplier * atrArr[i];
+
+    // Adjust bands to prevent widening
+    if (i > 1) {
+      if (lower < prevLower || closes[i - 1] < prevLower) lower = lower;
+      else lower = prevLower;
+      if (upper > prevUpper || closes[i - 1] > prevUpper) upper = upper;
+      else upper = prevUpper;
+    }
+
+    if (closes[i] > prevUpper) direction = 1;
+    else if (closes[i] < prevLower) direction = -1;
+
+    prevUpper = upper;
+    prevLower = lower;
+    finalDir = direction;
+    finalVal = direction === 1 ? lower : upper;
+  }
+
+  return { direction: finalDir, value: parseFloat(finalVal.toFixed(6)) };
+}
+
+// ── Williams %R ────────────────────────────────────────────────────────────────
+function calcWilliamsR(ohlcv: number[][], period = 14): number {
+  if (ohlcv.length < period) return -50;
+  const slice  = ohlcv.slice(-period);
+  const hi     = Math.max(...slice.map(c => c[2]));
+  const lo     = Math.min(...slice.map(c => c[3]));
+  const close  = ohlcv[ohlcv.length - 1][4];
+  return hi === lo ? -50 : ((hi - close) / (hi - lo)) * -100;
+}
+
+// ── Historical Win Rate for Kelly Criterion ────────────────────────────────────
+// Reads last N closed trades for a strategy to estimate win rate + avg win/loss
+async function getKellyFraction(strategyName: string, symbol: string): Promise<number> {
+  try {
+    const r = await pool.query(
+      `SELECT pnl::float FROM trades
+       WHERE strategy = $1 AND symbol = $2 AND status = 'CLOSED' AND pnl IS NOT NULL
+       ORDER BY timestamp DESC LIMIT 30`,
+      [strategyName, symbol]
+    );
+    if (r.rows.length < 5) return 0.01; // not enough history — use conservative 1%
+    const wins   = r.rows.filter((t: any) => t.pnl > 0);
+    const losses = r.rows.filter((t: any) => t.pnl <= 0);
+    const winRate = wins.length / r.rows.length;
+    const avgWin  = wins.length  > 0 ? wins.reduce((s: number, t: any) => s + t.pnl, 0) / wins.length : 0;
+    const avgLoss = losses.length > 0 ? Math.abs(losses.reduce((s: number, t: any) => s + t.pnl, 0) / losses.length) : 1;
+    if (avgLoss === 0) return 0.01;
+    const b = avgWin / avgLoss; // win/loss ratio
+    const kelly = (winRate * b - (1 - winRate)) / b;
+    // Use fractional Kelly (25%) capped at 3% of balance
+    return Math.min(Math.max(kelly * 0.25, 0.005), 0.03);
+  } catch {
+    return 0.01;
+  }
+}
+
 function calcVWAP(ohlcv: number[][]): number {
   if (!ohlcv.length) return 0;
   let pv = 0, vol = 0;
@@ -219,7 +356,7 @@ function calcADX(ohlcv: number[][], period = 14): { adx: number; plusDI: number;
 }
 
 function calculateSignal(ohlcv: number[][]) {
-  if (!ohlcv || ohlcv.length < 26) return { action: "HOLD" as const, rsi: 50, price: 0, macd: null, bb: null, ema9: null, ema21: null, volumeRatio: 1, atr: 0, atrPct: 0, score: 0, buyScore: 0, sellScore: 0 };
+  if (!ohlcv || ohlcv.length < 26) return { action: "HOLD" as const, rsi: 50, price: 0, macd: null, bb: null, ema9: null, ema21: null, volumeRatio: 1, atr: 0, atrPct: 0, score: 0, buyScore: 0, sellScore: 0, stochK: 50, stochD: 50, supertrend: 1 as 1 | -1, williamsR: -50 };
   const closes  = ohlcv.map(c => c[4]);
   const volumes = ohlcv.map(c => c[5]);
   const price   = closes[closes.length - 1];
@@ -232,7 +369,12 @@ function calculateSignal(ohlcv: number[][]) {
   const atr     = parseFloat(calcATR(ohlcv).toFixed(6));
   const atrPct  = price > 0 ? parseFloat((atr / price * 100).toFixed(4)) : 0;
 
-  // ── Weighted scoring (max 5.0) ──
+  // New indicators
+  const stoch   = calcStochRSI(closes);
+  const { direction: supertrendDir } = calcSupertrend(ohlcv, 10, 3.0);
+  const wR      = parseFloat(calcWilliamsR(ohlcv).toFixed(2));
+
+  // ── Weighted scoring (max 7.0) ──
   let buyScore = 0, sellScore = 0;
 
   // EMA9/21 alignment — strongest directional signal for scalps (weight 2)
@@ -251,6 +393,20 @@ function calculateSignal(ohlcv: number[][]) {
   if (price < bb.lower) buyScore += 1;
   if (price > bb.upper) sellScore += 1;
 
+  // Supertrend direction confirmation (weight 1) — strong trend filter
+  if (supertrendDir === 1)  buyScore  += 1;
+  if (supertrendDir === -1) sellScore += 1;
+
+  // Stochastic RSI — oversold/overbought + crossover (weight 0.75)
+  if (stoch.k < 20 && stoch.k > stoch.d) buyScore  += 0.75; // oversold + K crossing above D
+  if (stoch.k > 80 && stoch.k < stoch.d) sellScore += 0.75; // overbought + K crossing below D
+  else if (stoch.k < 25) buyScore  += 0.4;
+  else if (stoch.k > 75) sellScore += 0.4;
+
+  // Williams %R confirmation (weight 0.5)
+  if (wR < -80) buyScore  += 0.5; // deeply oversold
+  if (wR > -20) sellScore += 0.5; // deeply overbought
+
   // Volume confirmation — only adds to the leading side (weight 0.5)
   if (volumeRatio >= 1.0) {
     if (buyScore > sellScore) buyScore += 0.5;
@@ -258,18 +414,20 @@ function calculateSignal(ohlcv: number[][]) {
   }
 
   const maxScore = Math.max(buyScore, sellScore);
-  const MIN_SCORE = 3.0;
+  // Raise threshold slightly since max score is now 7.0 — require 3.5 for entry
+  const MIN_SCORE = 3.5;
 
   // RSI veto: don't short when already oversold, don't long when already overbought
-  const action = buyScore >= MIN_SCORE && buyScore > sellScore && rsi < 60  ? "BUY"  as const
-               : sellScore >= MIN_SCORE && sellScore > buyScore && rsi > 40 ? "SELL" as const
+  // Also require Supertrend alignment for cleaner entries
+  const action = buyScore >= MIN_SCORE && buyScore > sellScore && rsi < 65 && supertrendDir === 1  ? "BUY"  as const
+               : sellScore >= MIN_SCORE && sellScore > buyScore && rsi > 35 && supertrendDir === -1 ? "SELL" as const
                : "HOLD" as const;
-  return { action, rsi, price, macd, bb, ema9, ema21, volumeRatio, atr, atrPct, score: maxScore, buyScore, sellScore };
+  return { action, rsi, price, macd, bb, ema9, ema21, volumeRatio, atr, atrPct, score: maxScore, buyScore, sellScore, stochK: stoch.k, stochD: stoch.d, supertrend: supertrendDir, williamsR: wR };
 }
 
 // Returns signal for MOMENTUM ARB: EMA9/21 fresh crossover confirmed by RSI (5m candles)
 function calculateMomentumSignal(ohlcv: number[][]) {
-  const empty = { action: "HOLD" as const, rsi: 50, price: 0, volumeRatio: 1, atr: 0, atrPct: 0, cross: null as string | null, score: 0 };
+  const empty = { action: "HOLD" as const, rsi: 50, price: 0, volumeRatio: 1, atr: 0, atrPct: 0, cross: null as string | null, score: 0, supertrend: 1 as 1 | -1, stochK: 50, stochD: 50 };
   if (!ohlcv || ohlcv.length < 22) return empty;
   const closes  = ohlcv.map(c => c[4]);
   const volumes = ohlcv.map(c => c[5]);
@@ -280,18 +438,20 @@ function calculateMomentumSignal(ohlcv: number[][]) {
   const volumeRatio = parseFloat(calcVolumeRatio(volumes).toFixed(2));
   const atr     = parseFloat(calcATR(ohlcv).toFixed(6));
   const atrPct  = price > 0 ? parseFloat((atr / price * 100).toFixed(4)) : 0;
+  const { direction: supertrendDir } = calcSupertrend(ohlcv, 10, 3.0);
+  const stoch   = calcStochRSI(closes);
 
   const last  = ema9arr.length - 1;
   const curr9 = ema9arr[last], curr21 = ema21arr[last];
   const prev9 = ema9arr[last - 1], prev21 = ema21arr[last - 1];
-  if ([curr9, curr21, prev9, prev21].some(isNaN)) return { ...empty, price, rsi, volumeRatio, atr, atrPct };
+  if ([curr9, curr21, prev9, prev21].some(isNaN)) return { ...empty, price, rsi, volumeRatio, atr, atrPct, supertrend: supertrendDir, stochK: stoch.k, stochD: stoch.d };
 
   // Fresh crossovers only — trend continuation without a cross is HOLD
   const bullCross = prev9 <= prev21 && curr9 > curr21;
   const bearCross = prev9 >= prev21 && curr9 < curr21;
   const cross     = bullCross ? "GOLDEN" : bearCross ? "DEATH" : null;
 
-  // ── Weighted scoring (max 4.5) ──
+  // ── Weighted scoring (max 6.0) ──
   let score = 0;
   if (bullCross || bearCross) score += 3;           // fresh crossover (base)
   if (bullCross && rsi > 55) score += 1;            // strong RSI momentum
@@ -300,18 +460,27 @@ function calculateMomentumSignal(ohlcv: number[][]) {
   if (bearCross && rsi >= 45 && rsi < 55) score += 0.5;
   if (volumeRatio >= 1.2) score += 0.5;             // volume spike confirmation
 
-  const MIN_SCORE = 3.0;
-  let action: "BUY" | "SELL" | "HOLD" = "HOLD";
-  if (bullCross && score >= MIN_SCORE) action = "BUY";
-  if (bearCross && score >= MIN_SCORE) action = "SELL";
+  // Supertrend alignment bonus (weight 1.0)
+  if (bullCross && supertrendDir === 1)  score += 1.0;
+  if (bearCross && supertrendDir === -1) score += 1.0;
 
-  return { action, rsi, price, volumeRatio, atr, atrPct, cross, score };
+  // Stochastic RSI confirmation (weight 0.5)
+  if (bullCross && stoch.k < 60 && stoch.k > stoch.d) score += 0.5;
+  if (bearCross && stoch.k > 40 && stoch.k < stoch.d) score += 0.5;
+
+  const MIN_SCORE = 3.5;
+  let action: "BUY" | "SELL" | "HOLD" = "HOLD";
+  // Require Supertrend alignment for execution
+  if (bullCross && score >= MIN_SCORE && supertrendDir === 1)  action = "BUY";
+  if (bearCross && score >= MIN_SCORE && supertrendDir === -1) action = "SELL";
+
+  return { action, rsi, price, volumeRatio, atr, atrPct, cross, score, supertrend: supertrendDir, stochK: stoch.k, stochD: stoch.d };
 }
 
 // Returns signal for MEAN-REVERSION: BB band touch + RSI on 15m candles.
 // Intentionally ignores trend direction — designed for range/neutral markets.
 function calculateMeanRevSignal(ohlcv: number[][]) {
-  const empty = { action: "HOLD" as const, rsi: 50, price: 0, volumeRatio: 1, atr: 0, atrPct: 0, bbPos: null as string | null, score: 0 };
+  const empty = { action: "HOLD" as const, rsi: 50, price: 0, volumeRatio: 1, atr: 0, atrPct: 0, bbPos: null as string | null, score: 0, stochK: 50, stochD: 50, williamsR: -50 };
   if (!ohlcv || ohlcv.length < 20) return empty;
   const closes  = ohlcv.map(c => c[4]);
   const volumes = ohlcv.map(c => c[5]);
@@ -321,12 +490,14 @@ function calculateMeanRevSignal(ohlcv: number[][]) {
   const atr     = parseFloat(calcATR(ohlcv).toFixed(6));
   const atrPct  = price > 0 ? parseFloat((atr / price * 100).toFixed(4)) : 0;
   const volumeRatio = parseFloat(calcVolumeRatio(volumes).toFixed(2));
+  const stoch   = calcStochRSI(closes);
+  const wR      = parseFloat(calcWilliamsR(ohlcv).toFixed(2));
 
   const bbPos = price <= bb.lower ? "LOWER" : price >= bb.upper ? "UPPER" : "MID";
   const bbRange = bb.upper - bb.lower;
   const distFromMid = bbRange > 0 ? Math.abs(price - bb.middle) / (bbRange / 2) : 0; // 0 = mid, 1 = band
 
-  // ── Weighted scoring (max 5.0) ──
+  // ── Weighted scoring (max 7.0) ──
   let score = 0;
 
   // BB band touch / proximity (weight up to 2)
@@ -350,12 +521,22 @@ function calculateMeanRevSignal(ohlcv: number[][]) {
   // Distance from midpoint bonus (weight up to 1)
   score += Math.min(distFromMid, 1);
 
-  const MIN_SCORE = 3.0;
+  // Stochastic RSI confirmation (weight up to 1.0)
+  if (price <= bb.lower * 1.003 && stoch.k < 25) score += 1.0;
+  else if (price <= bb.lower * 1.003 && stoch.k < 40) score += 0.5;
+  if (price >= bb.upper * 0.997 && stoch.k > 75) score += 1.0;
+  else if (price >= bb.upper * 0.997 && stoch.k > 60) score += 0.5;
+
+  // Williams %R confirmation (weight up to 0.5)
+  if (price <= bb.lower * 1.003 && wR < -80) score += 0.5;
+  if (price >= bb.upper * 0.997 && wR > -20) score += 0.5;
+
+  const MIN_SCORE = 3.5;
   let action: "BUY" | "SELL" | "HOLD" = "HOLD";
   if (price <= bb.lower * 1.003 && score >= MIN_SCORE) action = "BUY";
   if (price >= bb.upper * 0.997 && score >= MIN_SCORE) action = "SELL";
 
-  return { action, rsi, price, volumeRatio, atr, atrPct, bbPos, score };
+  return { action, rsi, price, volumeRatio, atr, atrPct, bbPos, score, stochK: stoch.k, stochD: stoch.d, williamsR: wR };
 }
 
 // ── OHLCV Persistence ──────────────────────────────────────────────────────────
@@ -719,9 +900,12 @@ async function checkAutoExecute(symbol: string, signal: AnySignal, strategyName:
   checks.push({ name: "Cooldown", status: "pass", detail: `None (${cooldown} window clear)` });
 
   // ATR multipliers differ per strategy
-  const cfgRow   = await pool.query("SELECT leverage, risk_level, atr_sl_mult::float, atr_tp_mult::float, arb_sl_mult::float, arb_tp_mult::float, mr_sl_mult::float, mr_tp_mult::float FROM bot_settings WHERE id = 'bot_config'");
+  const cfgRow   = await pool.query("SELECT leverage, risk_level, atr_sl_mult::float, atr_tp_mult::float, arb_sl_mult::float, arb_tp_mult::float, mr_sl_mult::float, mr_tp_mult::float, max_concurrent_positions, use_kelly_sizing, partial_tp_enabled FROM bot_settings WHERE id = 'bot_config'");
   const leverage = cfgRow.rows[0]?.leverage || 10;
   const riskPct  = (cfgRow.rows[0]?.risk_level ?? 1) / 100;
+  const maxConcurrent = cfgRow.rows[0]?.max_concurrent_positions ?? 3;
+  const useKelly      = cfgRow.rows[0]?.use_kelly_sizing ?? true;
+  const partialTpEnabled = cfgRow.rows[0]?.partial_tp_enabled ?? true;
   const slMult   = strategyName === "MOMENTUM-ARB" ? (cfgRow.rows[0]?.arb_sl_mult ?? 1.0)
                  : strategyName === "MEAN-REV"      ? (cfgRow.rows[0]?.mr_sl_mult  ?? 1.0)
                  :                                    (cfgRow.rows[0]?.atr_sl_mult ?? 1.5);
@@ -733,9 +917,29 @@ async function checkAutoExecute(symbol: string, signal: AnySignal, strategyName:
   const isLong    = signal.action === "BUY";
   const hasKeys   = !!(process.env.BINANCE_API_KEY && process.env.BINANCE_SECRET_KEY);
 
-  // ── ATR-based position sizing ──
+  // ── Max concurrent positions cap ──
+  const totalOpen = await pool.query(`SELECT COUNT(*) AS cnt FROM trades WHERE status = 'OPEN'`);
+  const openCount = parseInt(totalOpen.rows[0]?.cnt ?? "0");
+  if (openCount >= maxConcurrent) {
+    checks.push({ name: "Max Positions", status: "block", detail: `${openCount}/${maxConcurrent} positions open — cap reached` });
+    pushValidation({ id: vid, timestamp: Date.now(), symbol, strategy: strategyName, action: signal.action, finalStatus: "blocked", checks });
+    console.log(`[AUTO] ${symbol} blocked — max concurrent positions (${openCount}/${maxConcurrent})`);
+    return;
+  }
+  checks.push({ name: "Max Positions", status: "pass", detail: `${openCount}/${maxConcurrent} positions open` });
+
+  // ── Position sizing: Kelly Criterion or ATR-based ──
   const balance     = await getAccountBalance();
-  const riskAmount  = balance * riskPct;
+  let effectiveRiskPct = riskPct;
+  if (useKelly) {
+    const kellyFrac = await getKellyFraction(strategyName, symbol);
+    // Blend Kelly with configured risk: take the lower of the two for safety
+    effectiveRiskPct = Math.min(kellyFrac, riskPct * 2);
+    checks.push({ name: "Kelly Sizing", status: "info", detail: `Kelly ${(kellyFrac*100).toFixed(2)}% → effective risk ${(effectiveRiskPct*100).toFixed(2)}%` });
+    console.log(`[KELLY] ${symbol} ${strategyName} kelly:${(kellyFrac*100).toFixed(2)}% effective:${(effectiveRiskPct*100).toFixed(2)}%`);
+  }
+
+  const riskAmount  = balance * effectiveRiskPct;
   const stopDistance = (signal.atr ?? 0) * slMult;
   let amount = 0;
   if (stopDistance > 0) {
@@ -744,14 +948,14 @@ async function checkAutoExecute(symbol: string, signal: AnySignal, strategyName:
   const notional = amount * signal.price;
   if (notional < 10 || amount <= 0) {
     amount = parseFloat((binance as any).amountToPrecision(symbol, 25 / signal.price));
-    checks.push({ name: "Position Size", status: "info", detail: `Fallback fixed sizing (notional $${notional.toFixed(2)} < $10)` });
+    checks.push({ name: "Position Size", status: "info", detail: `Fallback fixed sizing (notional ${notional.toFixed(2)} < $10)` });
     console.log(`[AUTO-SIZE] ${symbol} fallback to fixed sizing (notional ${notional.toFixed(2)} < $10)`);
   } else {
     amount = parseFloat((binance as any).amountToPrecision(symbol, amount));
-    checks.push({ name: "Position Size", status: "pass", detail: `${amount.toFixed(4)} @ $${signal.price.toLocaleString()} (notional $${(amount * signal.price).toFixed(2)})` });
+    checks.push({ name: "Position Size", status: "pass", detail: `${amount.toFixed(4)} @ ${signal.price.toLocaleString()} (notional ${(amount * signal.price).toFixed(2)})` });
   }
 
-  console.log(`[AUTO] ${signal.action} ${symbol} x${leverage} ATR:${signal.atrPct?.toFixed(3)}% risk:${(riskPct*100).toFixed(1)}% size:${amount.toFixed(4)} notional:$${(amount*signal.price).toFixed(2)}`);
+  console.log(`[AUTO] ${signal.action} ${symbol} x${leverage} ATR:${signal.atrPct?.toFixed(3)}% risk:${(effectiveRiskPct*100).toFixed(1)}% size:${amount.toFixed(4)} notional:${(amount*signal.price).toFixed(2)}`);
 
   let fillPrice = signal.price;
   const TAKER_RATE = 0.0004;
@@ -759,6 +963,8 @@ async function checkAutoExecute(symbol: string, signal: AnySignal, strategyName:
 
   const orderWarnings: string[] = [];
   let tpPrice      = 0;
+  let tp1Price     = 0;
+  let tp2Price     = 0;
   let callbackRate = 0;
   let tpBonus      = 1.0;
 
@@ -773,7 +979,7 @@ async function checkAutoExecute(symbol: string, signal: AnySignal, strategyName:
       } else {
         feeUsdt = parseFloat((fillPrice * amount * TAKER_RATE).toFixed(6));
       }
-      checks.push({ name: "Binance Order", status: "pass", detail: `Market ${side} filled @ $${fillPrice.toLocaleString()} fee $${feeUsdt}` });
+      checks.push({ name: "Binance Order", status: "pass", detail: `Market ${side} filled @ ${fillPrice.toLocaleString()} fee ${feeUsdt}` });
       console.log(`[AUTO-FUTURES] ✓ ${signal.action} ${symbol} x${leverage} fill:${fillPrice} fee:${feeUsdt} USDT`);
     } catch (e: any) {
       checks.push({ name: "Binance Order", status: "block", detail: `Market order failed: ${(e?.message ?? "unknown").slice(0, 100)}` });
@@ -804,22 +1010,59 @@ async function checkAutoExecute(symbol: string, signal: AnySignal, strategyName:
     callbackRate   = parseFloat(Math.min(Math.max(dynSlPct * 100, 0.5), 5.0).toFixed(1));
     tpPrice        = safeTpPrice(isLong, fillPrice, amount, dynTpPct, feeUsdt, symbol);
 
+    // ── Partial TP levels (TP1 = 50% at 60% of full TP, TP2 = 50% at full TP) ──
+    const tp1Pct = dynTpPct * 0.6;
+    const tp2Pct = dynTpPct;
+    tp1Price = parseFloat((binance as any).priceToPrecision(symbol,
+      isLong ? fillPrice * (1 + tp1Pct) : fillPrice * (1 - tp1Pct)
+    ));
+    tp2Price = tpPrice;
+
     if (tpBonus !== 1.0 || ctxSlMult !== 1.0) {
       console.log(`[CTX] ${symbol} TP×${tpBonus.toFixed(2)} SL×${ctxSlMult.toFixed(2)} | FR:${((fundingRateCache.get(symbol) ?? 0)*100).toFixed(4)}% F&G:${fearGreedCache?.value ?? 'N/A'}`);
     }
-    console.log(`[AUTO] ATR-SL:${(dynSlPct*100).toFixed(3)}% (cb:${callbackRate}%)  ATR-TP:${(dynTpPct*100).toFixed(3)}% @ ${tpPrice}`);
+    console.log(`[AUTO] ATR-SL:${(dynSlPct*100).toFixed(3)}% (cb:${callbackRate}%)  ATR-TP:${(dynTpPct*100).toFixed(3)}% TP1:${tp1Price} TP2:${tp2Price}`);
 
-    // ── Native TP order ──
-    try {
-      await binance.createOrder(symbol, "TAKE_PROFIT_MARKET", closeSide, amount, undefined, {
-        stopPrice: tpPrice, reduceOnly: true, workingType: "MARK_PRICE", priceProtect: true,
-      });
-      checks.push({ name: "Take Profit", status: "pass", detail: `@ $${tpPrice.toLocaleString()}` });
-      console.log(`[AUTO] TP order placed @ ${tpPrice}`);
-    } catch (e: any) {
-      console.error(`[AUTO] TP order failed [${symbol}]:`, e?.message);
-      orderWarnings.push(`TP failed: ${(e?.message ?? "").slice(0, 150)}`);
-      checks.push({ name: "Take Profit", status: "block", detail: `Failed: ${(e?.message ?? "").slice(0, 80)}` });
+    if (partialTpEnabled && amount > 0) {
+      // ── Partial TP1: close 50% at TP1 ──
+      const halfAmount = parseFloat((binance as any).amountToPrecision(symbol, amount / 2));
+      try {
+        await binance.createOrder(symbol, "TAKE_PROFIT_MARKET", closeSide, halfAmount, undefined, {
+          stopPrice: tp1Price, reduceOnly: true, workingType: "MARK_PRICE", priceProtect: true,
+        });
+        checks.push({ name: "TP1 (50%)", status: "pass", detail: `@ ${tp1Price.toLocaleString()} (${halfAmount} ${symbol.split("/")[0]})` });
+        console.log(`[AUTO] TP1 (50%) placed @ ${tp1Price}`);
+      } catch (e: any) {
+        console.error(`[AUTO] TP1 order failed [${symbol}]:`, e?.message);
+        orderWarnings.push(`TP1 failed: ${(e?.message ?? "").slice(0, 150)}`);
+        checks.push({ name: "TP1 (50%)", status: "block", detail: `Failed: ${(e?.message ?? "").slice(0, 80)}` });
+      }
+
+      // ── TP2: close remaining 50% at full TP ──
+      try {
+        await binance.createOrder(symbol, "TAKE_PROFIT_MARKET", closeSide, halfAmount, undefined, {
+          stopPrice: tp2Price, reduceOnly: true, workingType: "MARK_PRICE", priceProtect: true,
+        });
+        checks.push({ name: "TP2 (50%)", status: "pass", detail: `@ ${tp2Price.toLocaleString()} (${halfAmount} ${symbol.split("/")[0]})` });
+        console.log(`[AUTO] TP2 (50%) placed @ ${tp2Price}`);
+      } catch (e: any) {
+        console.error(`[AUTO] TP2 order failed [${symbol}]:`, e?.message);
+        orderWarnings.push(`TP2 failed: ${(e?.message ?? "").slice(0, 150)}`);
+        checks.push({ name: "TP2 (50%)", status: "block", detail: `Failed: ${(e?.message ?? "").slice(0, 80)}` });
+      }
+    } else {
+      // ── Single TP (partial TP disabled) ──
+      try {
+        await binance.createOrder(symbol, "TAKE_PROFIT_MARKET", closeSide, amount, undefined, {
+          stopPrice: tpPrice, reduceOnly: true, workingType: "MARK_PRICE", priceProtect: true,
+        });
+        checks.push({ name: "Take Profit", status: "pass", detail: `@ ${tpPrice.toLocaleString()}` });
+        console.log(`[AUTO] TP order placed @ ${tpPrice}`);
+      } catch (e: any) {
+        console.error(`[AUTO] TP order failed [${symbol}]:`, e?.message);
+        orderWarnings.push(`TP failed: ${(e?.message ?? "").slice(0, 150)}`);
+        checks.push({ name: "Take Profit", status: "block", detail: `Failed: ${(e?.message ?? "").slice(0, 80)}` });
+      }
     }
 
     // ── Native Trailing SL ──
@@ -837,11 +1080,12 @@ async function checkAutoExecute(symbol: string, signal: AnySignal, strategyName:
   }
 
   await pool.query(
-    `INSERT INTO trades (symbol, type, entry_price, amount, strategy, status, leverage, fee_usdt)
-     VALUES ($1, $2, $3, $4, $5, 'OPEN', $6, $7)`,
-    [symbol, signal.action, fillPrice, amount, strategyName, leverage, feeUsdt]
+    `INSERT INTO trades (symbol, type, entry_price, amount, strategy, status, leverage, fee_usdt, tp1_price, tp2_price)
+     VALUES ($1, $2, $3, $4, $5, 'OPEN', $6, $7, $8, $9)`,
+    [symbol, signal.action, fillPrice, amount, strategyName, leverage, feeUsdt,
+     tp1Price > 0 ? tp1Price : null, tp2Price > 0 ? tp2Price : null]
   );
-  checks.push({ name: "Database", status: "pass", detail: `Recorded OPEN trade @ $${fillPrice.toLocaleString()}` });
+  checks.push({ name: "Database", status: "pass", detail: `Recorded OPEN trade @ ${fillPrice.toLocaleString()}` });
   console.log(`[AUTO] DB recorded: ${signal.action} ${symbol} @ ${fillPrice} fee:${feeUsdt} USDT [${strategyName}]`);
 
   broadcastSSE("trade", { symbol, action: signal.action, strategy: strategyName, price: fillPrice, amount, leverage, timestamp: Date.now() });
@@ -856,17 +1100,22 @@ async function checkAutoExecute(symbol: string, signal: AnySignal, strategyName:
     const score = signal.score ?? 0;
     const notional = fillPrice * amount;
 
+    const tp1Display = tp1Price > 0 ? tp1Price.toLocaleString() : "N/A";
+    const tp2Display = tp2Price > 0 ? tp2Price.toLocaleString() : "N/A";
+    const tpLine = partialTpEnabled && tp1Price > 0
+      ? `TP1:   <code>${tp1Display}</code> (50%)\nTP2:   <code>${tp2Display}</code> (50%)`
+      : `TP:    <code>${tpPriceDisplay}</code>`;
     await sendTelegram(
       `${icon} <b>AUTO TRADE ${status}</b>\n` +
       `<code>${symbol}</code>  <b>${isLong ? "LONG 🟢" : "SHORT 🔴"}</b>  <code>${strategyName}</code>\n` +
       `Score: <code>${score.toFixed(1)}/5.0</code>  RSI: <code>${signal.rsi}</code>\n\n` +
       `📊 <b>SETUP</b>\n` +
-      `Entry: <code>$${fillPrice.toLocaleString()}</code>\n` +
-      `TP:    <code>$${tpPriceDisplay}</code>\n` +
-      `SL:    <code>$${slPriceDisplay}</code> (trailing ${callbackRate}%)\n` +
-      `Size:  <code>${amount.toFixed(4)} ${symbol.split("/")[0]}</code>  ($${notional.toLocaleString()})\n` +
+      `Entry: <code>${fillPrice.toLocaleString()}</code>\n` +
+      `${tpLine}\n` +
+      `SL:    <code>${slPriceDisplay}</code> (trailing ${callbackRate}%)\n` +
+      `Size:  <code>${amount.toFixed(4)} ${symbol.split("/")[0]}</code>  (${notional.toLocaleString()})\n` +
       `Lev:   <code>${leverage}×</code>  Fee: <code>${feeUsdt} USDT</code>\n` +
-      `Risk:  <code>${(balance * riskPct).toFixed(2)} USDT</code> (${(riskPct * 100).toFixed(1)}% of balance)` +
+      `Risk:  <code>${(balance * effectiveRiskPct).toFixed(2)} USDT</code> (${(effectiveRiskPct * 100).toFixed(1)}% of balance)` +
       (orderWarnings.length ? `\n\n⚠️ <b>Warnings:</b>\n<code>${orderWarnings.join("\n")}</code>` : "")
     );
   }
@@ -914,9 +1163,9 @@ async function seedCandleBuffer() {
         vwap:        parseFloat(calcVWAP(buf1m).toFixed(6)),
         oiChangePct: openInterestCache.get(symbol)?.oiChangePct ?? null,
         lsRatio:     longShortCache.get(symbol) ?? null,
-        ultraScalp:  { action: sig1m.action, rsi: sig1m.rsi, volumeRatio: sig1m.volumeRatio, atrPct: sig1m.atrPct, score: sig1m.score, buyScore: sig1m.buyScore, sellScore: sig1m.sellScore },
-        momentumArb: { action: sig5m.action, rsi: sig5m.rsi, volumeRatio: sig5m.volumeRatio, atrPct: sig5m.atrPct, cross: sig5m.cross, score: sig5m.score },
-        meanRev:     { action: sigMR.action, rsi: sigMR.rsi, volumeRatio: sigMR.volumeRatio, atrPct: sigMR.atrPct, bbPos: sigMR.bbPos, score: sigMR.score },
+        ultraScalp:  { action: sig1m.action, rsi: sig1m.rsi, volumeRatio: sig1m.volumeRatio, atrPct: sig1m.atrPct, score: sig1m.score, buyScore: sig1m.buyScore, sellScore: sig1m.sellScore, stochK: sig1m.stochK, stochD: sig1m.stochD, supertrend: sig1m.supertrend, williamsR: sig1m.williamsR },
+        momentumArb: { action: sig5m.action, rsi: sig5m.rsi, volumeRatio: sig5m.volumeRatio, atrPct: sig5m.atrPct, cross: sig5m.cross, score: sig5m.score, supertrend: sig5m.supertrend, stochK: sig5m.stochK, stochD: sig5m.stochD },
+        meanRev:     { action: sigMR.action, rsi: sigMR.rsi, volumeRatio: sigMR.volumeRatio, atrPct: sigMR.atrPct, bbPos: sigMR.bbPos, score: sigMR.score, stochK: sigMR.stochK, stochD: sigMR.stochD, williamsR: sigMR.williamsR },
       };
       const idx = scanResults.findIndex(r => r.symbol === symbol);
       if (idx >= 0) scanResults[idx] = entry; else scanResults.push(entry);
@@ -969,7 +1218,7 @@ function initWebSocket() {
           entry.adx     = adx;
           entry.plusDI  = plusDI;
           entry.minusDI = minusDI;
-          entry.meanRev = { action: signal.action, rsi: signal.rsi, volumeRatio: signal.volumeRatio, atrPct: signal.atrPct, bbPos: signal.bbPos, score: signal.score };
+          entry.meanRev = { action: signal.action, rsi: signal.rsi, volumeRatio: signal.volumeRatio, atrPct: signal.atrPct, bbPos: signal.bbPos, score: signal.score, stochK: signal.stochK, stochD: signal.stochD, williamsR: signal.williamsR };
           if (idx >= 0) scanResults[idx] = entry; else scanResults.push(entry);
 
           const prevMR  = lastMeanRevAction.get(symbol)  || "HOLD";
@@ -1006,7 +1255,7 @@ function initWebSocket() {
           const entry  = scanResults[idx] || { symbol, price: signal.price, trend };
           entry.trend       = trend;
           entry.price       = signal.price;
-          entry.momentumArb = { action: signal.action, rsi: signal.rsi, volumeRatio: signal.volumeRatio, atrPct: signal.atrPct, cross: signal.cross, score: signal.score };
+          entry.momentumArb = { action: signal.action, rsi: signal.rsi, volumeRatio: signal.volumeRatio, atrPct: signal.atrPct, cross: signal.cross, score: signal.score, supertrend: signal.supertrend, stochK: signal.stochK, stochD: signal.stochD };
           if (idx >= 0) scanResults[idx] = entry; else scanResults.push(entry);
 
           const prevMA  = lastMomentumAction.get(symbol)  || "HOLD";
@@ -1047,7 +1296,7 @@ function initWebSocket() {
         // Use closed-candle volume ratio for the scan result so the frontend displays the same
         // value that checkAutoExecute actually checks (not the partial in-progress candle's volume).
         const closedVolumeRatio = parseFloat(calcVolumeRatio(buffer.map(c => c[5])).toFixed(2));
-        entry.ultraScalp  = { action: signal.action, rsi: signal.rsi, volumeRatio: closedVolumeRatio, atrPct: signal.atrPct, score: signal.score, buyScore: signal.buyScore, sellScore: signal.sellScore };
+        entry.ultraScalp  = { action: signal.action, rsi: signal.rsi, volumeRatio: closedVolumeRatio, atrPct: signal.atrPct, score: signal.score, buyScore: signal.buyScore, sellScore: signal.sellScore, stochK: signal.stochK, stochD: signal.stochD, supertrend: signal.supertrend, williamsR: signal.williamsR };
         entry.lastTickMs  = Date.now();
         if (idx >= 0) scanResults[idx] = entry; else scanResults.push(entry);
 
@@ -1626,32 +1875,36 @@ app.get("/api/settings", async (req, res) => {
 app.post("/api/settings", async (req, res) => {
   const { isAutoPilot, riskLevel, maxSlippage, takeProfitPct, stopLossPct, leverage,
           atrSlMult, atrTpMult, arbSlMult, arbTpMult, mrSlMult, mrTpMult, activeStrategiesVal,
-          telegramBotToken, telegramChatId } = req.body;
+          telegramBotToken, telegramChatId, maxConcurrentPositions, useKellySizing, partialTpEnabled } = req.body;
   const strategiesParam = Array.isArray(activeStrategiesVal) ? activeStrategiesVal : null;
   try {
     const r = await pool.query(
       `UPDATE bot_settings
-       SET is_auto_pilot     = COALESCE($1,  is_auto_pilot),
-           risk_level        = COALESCE($2,  risk_level),
-           max_slippage      = COALESCE($3,  max_slippage),
-           take_profit_pct   = COALESCE($4,  take_profit_pct),
-           stop_loss_pct     = COALESCE($5,  stop_loss_pct),
-           leverage          = COALESCE($6,  leverage),
-           atr_sl_mult       = COALESCE($7,  atr_sl_mult),
-           atr_tp_mult       = COALESCE($8,  atr_tp_mult),
-           arb_sl_mult       = COALESCE($9,  arb_sl_mult),
-           arb_tp_mult       = COALESCE($10, arb_tp_mult),
-           active_strategies = COALESCE($11, active_strategies),
-           mr_sl_mult        = COALESCE($12, mr_sl_mult),
-           mr_tp_mult        = COALESCE($13, mr_tp_mult),
-           telegram_bot_token = NULLIF(COALESCE($14, telegram_bot_token), ''),
-           telegram_chat_id   = NULLIF(COALESCE($15, telegram_chat_id), '')
+       SET is_auto_pilot              = COALESCE($1,  is_auto_pilot),
+           risk_level                 = COALESCE($2,  risk_level),
+           max_slippage               = COALESCE($3,  max_slippage),
+           take_profit_pct            = COALESCE($4,  take_profit_pct),
+           stop_loss_pct              = COALESCE($5,  stop_loss_pct),
+           leverage                   = COALESCE($6,  leverage),
+           atr_sl_mult                = COALESCE($7,  atr_sl_mult),
+           atr_tp_mult                = COALESCE($8,  atr_tp_mult),
+           arb_sl_mult                = COALESCE($9,  arb_sl_mult),
+           arb_tp_mult                = COALESCE($10, arb_tp_mult),
+           active_strategies          = COALESCE($11, active_strategies),
+           mr_sl_mult                 = COALESCE($12, mr_sl_mult),
+           mr_tp_mult                 = COALESCE($13, mr_tp_mult),
+           telegram_bot_token         = NULLIF(COALESCE($14, telegram_bot_token), ''),
+           telegram_chat_id           = NULLIF(COALESCE($15, telegram_chat_id), ''),
+           max_concurrent_positions   = COALESCE($16, max_concurrent_positions),
+           use_kelly_sizing           = COALESCE($17, use_kelly_sizing),
+           partial_tp_enabled         = COALESCE($18, partial_tp_enabled)
        WHERE id = 'bot_config' RETURNING *`,
       [isAutoPilot ?? null, riskLevel ?? null, maxSlippage ?? null,
        takeProfitPct ?? null, stopLossPct ?? null, leverage ?? null,
        atrSlMult ?? null, atrTpMult ?? null, arbSlMult ?? null, arbTpMult ?? null,
        strategiesParam, mrSlMult ?? null, mrTpMult ?? null,
-       telegramBotToken ?? null, telegramChatId ?? null]
+       telegramBotToken ?? null, telegramChatId ?? null,
+       maxConcurrentPositions ?? null, useKellySizing ?? null, partialTpEnabled ?? null]
     );
     // Sync in-memory Set so WebSocket handlers react immediately
     if (strategiesParam) {
@@ -2190,6 +2443,28 @@ app.get("/api/backtest", async (req, res) => {
       if (dd > maxDD) maxDD = dd;
     }
 
+    // ── Sharpe Ratio (annualised, assuming 0% risk-free rate) ──
+    const pnlArr = trades.map(t => t.pnlPct);
+    const meanPnl = pnlArr.length > 0 ? pnlArr.reduce((a, b) => a + b, 0) / pnlArr.length : 0;
+    const stdPnl  = pnlArr.length > 1
+      ? Math.sqrt(pnlArr.reduce((s, v) => s + Math.pow(v - meanPnl, 2), 0) / (pnlArr.length - 1))
+      : 0;
+    // Annualise: assume ~252 trading days, scale by sqrt(252)
+    const sharpeRatio = stdPnl > 0 ? parseFloat(((meanPnl / stdPnl) * Math.sqrt(252)).toFixed(3)) : 0;
+
+    // ── Profit Factor = gross wins / |gross losses| ──
+    const grossWins   = wins.reduce((s, t) => s + t.pnlPct, 0);
+    const grossLosses = Math.abs(losses.reduce((s, t) => s + t.pnlPct, 0));
+    const profitFactor = grossLosses > 0 ? parseFloat((grossWins / grossLosses).toFixed(3)) : grossWins > 0 ? 999 : 0;
+
+    // ── Expectancy per trade ──
+    const expectancy = parseFloat((winRate / 100 * avgWin + (1 - winRate / 100) * avgLoss).toFixed(3));
+
+    // ── Avg hold time ──
+    const avgHoldMin = trades.length > 0
+      ? parseFloat((trades.reduce((s, t) => s + t.holdMinutes, 0) / trades.length).toFixed(1))
+      : 0;
+
     res.json({
       symbol, days, strategy: strategyName,
       stats: {
@@ -2198,6 +2473,10 @@ app.get("/api/backtest", async (req, res) => {
         avgWinPct: avgWin, avgLossPct: avgLoss,
         maxDrawdownPct: parseFloat(maxDD.toFixed(3)),
         finalEquity: parseFloat(currentEquity.toFixed(4)),
+        sharpeRatio,
+        profitFactor,
+        expectancy,
+        avgHoldMinutes: avgHoldMin,
         candles: candles.length,
       },
       equity: equity, // time-series for charting

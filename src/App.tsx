@@ -39,6 +39,10 @@ interface StrategySignal {
   score?: number;
   buyScore?: number;
   sellScore?: number;
+  stochK?: number;
+  stochD?: number;
+  supertrend?: 1 | -1;
+  williamsR?: number;
 }
 
 interface ScanResult {
@@ -166,6 +170,9 @@ export default function App() {
     mrSlMult: 1.0,
     mrTpMult: 2.0,
   });
+  const [maxConcurrentPositions, setMaxConcurrentPositions] = useState<number>(3);
+  const [useKellySizing, setUseKellySizing]               = useState<boolean>(true);
+  const [partialTpEnabled, setPartialTpEnabled]           = useState<boolean>(true);
   const [cooldownStatus, setCooldownStatus]       = useState<Record<string, { inCooldown: boolean; strategy: string; status?: string }>>({});
   const [validationLogs, setValidationLogs] = useState<any[]>([]);
   const [loadingAi, setLoadingAi] = useState<string | null>(null);
@@ -231,6 +238,9 @@ export default function App() {
         }));
         if (typeof s.telegram_bot_token === "string") setTelegramBotToken(s.telegram_bot_token);
         if (typeof s.telegram_chat_id   === "string") setTelegramChatId(s.telegram_chat_id);
+        if (typeof s.max_concurrent_positions === "number") setMaxConcurrentPositions(s.max_concurrent_positions);
+        if (typeof s.use_kelly_sizing === "boolean") setUseKellySizing(s.use_kelly_sizing);
+        if (typeof s.partial_tp_enabled === "boolean") setPartialTpEnabled(s.partial_tp_enabled);
       })
       .catch(() => {});
   }, []);
@@ -876,6 +886,18 @@ export default function App() {
                                 )}>{(coin.ultraScalp.score ?? 0).toFixed(1)}</span>
                               )}
                               <span className="text-[11px] text-trading-muted">RSI {coin.ultraScalp.rsi.toFixed(0)}</span>
+                              {coin.ultraScalp.stochK !== undefined && (
+                                <span className={cn("text-[10px] font-bold px-1 py-0.5 rounded",
+                                  coin.ultraScalp.stochK < 20 ? "bg-trading-up/10 text-trading-up"
+                                : coin.ultraScalp.stochK > 80 ? "bg-trading-down/10 text-trading-down"
+                                :                                "bg-trading-muted/10 text-trading-muted"
+                                )}>K{coin.ultraScalp.stochK.toFixed(0)}</span>
+                              )}
+                              {coin.ultraScalp.supertrend !== undefined && (
+                                <span className={cn("text-[10px] font-black",
+                                  coin.ultraScalp.supertrend === 1 ? "text-trading-up" : "text-trading-down"
+                                )}>{coin.ultraScalp.supertrend === 1 ? "ST↑" : "ST↓"}</span>
+                              )}
                               {coin.ultraScalp.volumeRatio !== undefined && (
                                 <span className={cn("ml-auto text-[11px] font-bold",
                                   coin.ultraScalp.volumeRatio >= 1.5 ? "text-trading-up"
@@ -920,6 +942,11 @@ export default function App() {
                                   coin.momentumArb.cross === 'GOLDEN' ? "text-trading-up" : "text-trading-down"
                                 )}>{coin.momentumArb.cross === 'GOLDEN' ? '↑GX' : '↓DX'}</span>
                               )}
+                              {coin.momentumArb.supertrend !== undefined && (
+                                <span className={cn("text-[10px] font-black",
+                                  coin.momentumArb.supertrend === 1 ? "text-trading-up" : "text-trading-down"
+                                )}>{coin.momentumArb.supertrend === 1 ? "ST↑" : "ST↓"}</span>
+                              )}
                               {coin.momentumArb.volumeRatio !== undefined && (
                                 <span className={cn("ml-auto text-[11px] font-bold",
                                   coin.momentumArb.volumeRatio >= 1.2 ? "text-trading-up" : "text-trading-muted"
@@ -962,6 +989,20 @@ export default function App() {
                               <span className="text-[11px] text-trading-muted">RSI {coin.meanRev.rsi.toFixed(0)}</span>
                               {coin.meanRev.bbPos && (
                                 <span className={cn("text-[11px] font-bold", bbColor)}>BB:{coin.meanRev.bbPos}</span>
+                              )}
+                              {coin.meanRev.stochK !== undefined && (
+                                <span className={cn("text-[10px] font-bold px-1 py-0.5 rounded",
+                                  coin.meanRev.stochK < 25 ? "bg-trading-up/10 text-trading-up"
+                                : coin.meanRev.stochK > 75 ? "bg-trading-down/10 text-trading-down"
+                                :                             "bg-trading-muted/10 text-trading-muted"
+                                )}>K{coin.meanRev.stochK.toFixed(0)}</span>
+                              )}
+                              {coin.meanRev.williamsR !== undefined && (
+                                <span className={cn("text-[10px] font-mono",
+                                  coin.meanRev.williamsR < -80 ? "text-trading-up"
+                                : coin.meanRev.williamsR > -20 ? "text-trading-down"
+                                :                                 "text-trading-muted"
+                                )}>W%{coin.meanRev.williamsR.toFixed(0)}</span>
                               )}
                               {coin.meanRev.volumeRatio !== undefined && (
                                 <span className={cn("ml-auto text-[11px] font-bold",
@@ -1581,18 +1622,22 @@ export default function App() {
                     </div>
 
                     {/* Stats Grid */}
-                    <div className="grid grid-cols-2 sm:grid-cols-5 gap-3">
+                    <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
                       {[
-                        { label: "Win Rate",     value: `${btResult.stats.winRate}%`,           color: btResult.stats.winRate >= 50 ? "text-trading-up" : "text-trading-down" },
-                        { label: "Total PnL",    value: `${btResult.stats.totalPnlPct > 0 ? "+" : ""}${btResult.stats.totalPnlPct}%`, color: btResult.stats.totalPnlPct >= 0 ? "text-trading-up" : "text-trading-down" },
-                        { label: "Final Equity", value: `${btResult.stats.finalEquity}`,        color: btResult.stats.finalEquity >= 100 ? "text-trading-up" : "text-trading-down" },
-                        { label: "Max Drawdown", value: `-${btResult.stats.maxDrawdownPct}%`,   color: "text-trading-down" },
-                        { label: "Total Trades", value: btResult.stats.total,                   color: "text-trading-text" },
-                        { label: "Wins",         value: btResult.stats.wins,                    color: "text-trading-up" },
-                        { label: "Losses",       value: btResult.stats.losses,                  color: "text-trading-down" },
-                        { label: "Avg Win",      value: `+${btResult.stats.avgWinPct}%`,        color: "text-trading-up" },
-                        { label: "Avg Loss",     value: `${btResult.stats.avgLossPct}%`,        color: "text-trading-down" },
-                        { label: "Profit Factor", value: btResult.stats.avgLossPct !== 0 ? ((btResult.stats.avgWinPct * btResult.stats.wins) / Math.abs(btResult.stats.avgLossPct * btResult.stats.losses)).toFixed(2) : "N/A", color: "text-trading-text" },
+                        { label: "Win Rate",      value: `${btResult.stats.winRate}%`,           color: btResult.stats.winRate >= 50 ? "text-trading-up" : "text-trading-down" },
+                        { label: "Total PnL",     value: `${btResult.stats.totalPnlPct > 0 ? "+" : ""}${btResult.stats.totalPnlPct}%`, color: btResult.stats.totalPnlPct >= 0 ? "text-trading-up" : "text-trading-down" },
+                        { label: "Final Equity",  value: `${btResult.stats.finalEquity}`,        color: btResult.stats.finalEquity >= 100 ? "text-trading-up" : "text-trading-down" },
+                        { label: "Max Drawdown",  value: `-${btResult.stats.maxDrawdownPct}%`,   color: "text-trading-down" },
+                        { label: "Sharpe Ratio",  value: btResult.stats.sharpeRatio ?? "N/A",    color: (btResult.stats.sharpeRatio ?? 0) >= 1 ? "text-trading-up" : (btResult.stats.sharpeRatio ?? 0) >= 0 ? "text-orange-400" : "text-trading-down" },
+                        { label: "Profit Factor", value: btResult.stats.profitFactor ?? "N/A",   color: (btResult.stats.profitFactor ?? 0) >= 1.5 ? "text-trading-up" : (btResult.stats.profitFactor ?? 0) >= 1 ? "text-orange-400" : "text-trading-down" },
+                        { label: "Expectancy",    value: `${(btResult.stats.expectancy ?? 0) >= 0 ? "+" : ""}${btResult.stats.expectancy ?? 0}%`, color: (btResult.stats.expectancy ?? 0) >= 0 ? "text-trading-up" : "text-trading-down" },
+                        { label: "Avg Hold",      value: `${btResult.stats.avgHoldMinutes ?? 0}m`, color: "text-trading-muted" },
+                        { label: "Total Trades",  value: btResult.stats.total,                   color: "text-trading-text" },
+                        { label: "Wins",          value: btResult.stats.wins,                    color: "text-trading-up" },
+                        { label: "Losses",        value: btResult.stats.losses,                  color: "text-trading-down" },
+                        { label: "Avg Win",       value: `+${btResult.stats.avgWinPct}%`,        color: "text-trading-up" },
+                        { label: "Avg Loss",      value: `${btResult.stats.avgLossPct}%`,        color: "text-trading-down" },
+                        { label: "Candles",       value: btResult.stats.candles,                 color: "text-trading-muted" },
                       ].map(s => (
                         <div key={s.label} className="bg-trading-card border border-trading-border rounded p-3">
                           <div className="text-[9px] text-trading-muted uppercase tracking-wider mb-1">{s.label}</div>
@@ -1758,6 +1803,56 @@ export default function App() {
                         className="w-full h-1.5 bg-trading-border rounded-full appearance-none cursor-pointer accent-trading-accent"
                       />
                       <p className="text-[9px] text-trading-muted leading-relaxed">Maximum acceptable price slippage on market orders.</p>
+                    </div>
+
+                    {/* Max Concurrent Positions */}
+                    <div className="p-4 bg-trading-card border border-trading-border rounded space-y-3">
+                      <div className="flex items-center justify-between">
+                        <label className="text-[10px] uppercase text-trading-muted font-bold tracking-wider">Max Concurrent Positions</label>
+                        <span className="text-[13px] font-black text-trading-accent">{maxConcurrentPositions}</span>
+                      </div>
+                      <input
+                        type="range"
+                        min="1"
+                        max="10"
+                        step="1"
+                        value={maxConcurrentPositions}
+                        onChange={e => setMaxConcurrentPositions(parseInt(e.target.value))}
+                        className="w-full h-1.5 bg-trading-border rounded-full appearance-none cursor-pointer accent-trading-accent"
+                      />
+                      <p className="text-[9px] text-trading-muted leading-relaxed">Maximum number of open positions across all strategies at once.</p>
+                    </div>
+
+                    {/* Kelly Sizing Toggle */}
+                    <div className="p-4 bg-trading-card border border-trading-border rounded space-y-3">
+                      <div className="flex items-center justify-between">
+                        <label className="text-[10px] uppercase text-trading-muted font-bold tracking-wider">Kelly Criterion Sizing</label>
+                        <div
+                          onClick={() => setUseKellySizing(v => !v)}
+                          className={cn("w-8 h-4 rounded-full transition-all relative cursor-pointer", useKellySizing ? "bg-trading-up" : "bg-trading-border")}
+                        >
+                          <div className={cn("absolute top-0.5 left-0.5 w-3 h-3 bg-white rounded-full transition-transform", useKellySizing && "translate-x-4")} />
+                        </div>
+                      </div>
+                      <p className="text-[9px] text-trading-muted leading-relaxed">
+                        Uses historical win rate + avg win/loss to compute optimal position size (fractional Kelly, capped at 3%). Falls back to ATR sizing if insufficient history.
+                      </p>
+                    </div>
+
+                    {/* Partial TP Toggle */}
+                    <div className="p-4 bg-trading-card border border-trading-border rounded space-y-3">
+                      <div className="flex items-center justify-between">
+                        <label className="text-[10px] uppercase text-trading-muted font-bold tracking-wider">Partial Take-Profit</label>
+                        <div
+                          onClick={() => setPartialTpEnabled(v => !v)}
+                          className={cn("w-8 h-4 rounded-full transition-all relative cursor-pointer", partialTpEnabled ? "bg-trading-up" : "bg-trading-border")}
+                        >
+                          <div className={cn("absolute top-0.5 left-0.5 w-3 h-3 bg-white rounded-full transition-transform", partialTpEnabled && "translate-x-4")} />
+                        </div>
+                      </div>
+                      <p className="text-[9px] text-trading-muted leading-relaxed">
+                        Scale out: close 50% at TP1 (60% of full TP) and remaining 50% at TP2 (full TP). Locks in profit while letting winners run.
+                      </p>
                     </div>
                   </div>
                 </div>
@@ -1956,6 +2051,9 @@ export default function App() {
                           mrTpMult: botSettings.mrTpMult,
                           telegramBotToken,
                           telegramChatId,
+                          maxConcurrentPositions,
+                          useKellySizing,
+                          partialTpEnabled,
                         }),
                       });
                       addLog("Bot settings saved", "success");
