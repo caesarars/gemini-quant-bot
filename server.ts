@@ -65,7 +65,12 @@ const binance = new ccxt.binanceusdm({
   apiKey: process.env.BINANCE_API_KEY,
   secret: process.env.BINANCE_SECRET_KEY,
   options: { defaultType: "future" },
+  enableRateLimit: true,
 });
+
+// Track consecutive balance fetch failures for auto-mock fallback
+let balanceFetchFailures = 0;
+const MAX_BALANCE_FAILURES = 3;
 
 // ── AI (DeepSeek) ──────────────────────────────────────────────────────────────
 
@@ -212,7 +217,7 @@ function calcADX(ohlcv: number[][], period = 14): { adx: number; plusDI: number;
 }
 
 function calculateSignal(ohlcv: number[][]) {
-  if (!ohlcv || ohlcv.length < 26) return { action: "HOLD" as const, rsi: 50, price: 0, macd: null, bb: null, ema9: null, ema21: null, volumeRatio: 1, atr: 0, atrPct: 0 };
+  if (!ohlcv || ohlcv.length < 26) return { action: "HOLD" as const, rsi: 50, price: 0, macd: null, bb: null, ema9: null, ema21: null, volumeRatio: 1, atr: 0, atrPct: 0, score: 0, buyScore: 0, sellScore: 0 };
   const closes  = ohlcv.map(c => c[4]);
   const volumes = ohlcv.map(c => c[5]);
   const price   = closes[closes.length - 1];
@@ -223,28 +228,46 @@ function calculateSignal(ohlcv: number[][]) {
   const ema21   = parseFloat((calcEMA(closes, 21).at(-1) || 0).toFixed(4));
   const volumeRatio = parseFloat(calcVolumeRatio(volumes).toFixed(2));
   const atr     = parseFloat(calcATR(ohlcv).toFixed(6));
-  const atrPct  = price > 0 ? parseFloat((atr / price * 100).toFixed(4)) : 0; // % of price
+  const atrPct  = price > 0 ? parseFloat((atr / price * 100).toFixed(4)) : 0;
 
+  // ── Weighted scoring (max 5.0) ──
   let buyScore = 0, sellScore = 0;
-  if (rsi < 35)                                          buyScore++;
-  if (rsi > 65)                                          sellScore++;
-  if (macd.macd > macd.signal && macd.histogram > 0)    buyScore++;
-  if (macd.macd < macd.signal && macd.histogram < 0)    sellScore++;
-  if (price < bb.lower)                                  buyScore++;
-  if (price > bb.upper)                                  sellScore++;
-  if (ema9 > ema21)                                      buyScore++;
-  if (ema9 < ema21)                                      sellScore++;
+
+  // EMA9/21 alignment — strongest directional signal for scalps (weight 2)
+  if (ema9 > ema21) buyScore += 2;
+  if (ema9 < ema21) sellScore += 2;
+
+  // MACD momentum confirmation (weight 1.5)
+  if (macd.macd > macd.signal && macd.histogram > 0) buyScore += 1.5;
+  if (macd.macd < macd.signal && macd.histogram < 0) sellScore += 1.5;
+
+  // RSI extreme reversal zone (weight 1)
+  if (rsi < 35) buyScore += 1;
+  if (rsi > 65) sellScore += 1;
+
+  // Bollinger Bands touch / break (weight 1)
+  if (price < bb.lower) buyScore += 1;
+  if (price > bb.upper) sellScore += 1;
+
+  // Volume confirmation — only adds to the leading side (weight 0.5)
+  if (volumeRatio >= 1.0) {
+    if (buyScore > sellScore) buyScore += 0.5;
+    else if (sellScore > buyScore) sellScore += 0.5;
+  }
+
+  const maxScore = Math.max(buyScore, sellScore);
+  const MIN_SCORE = 3.0;
 
   // RSI veto: don't short when already oversold, don't long when already overbought
-  const action = buyScore >= 2 && rsi < 60  ? "BUY"  as const
-               : sellScore >= 2 && rsi > 40 ? "SELL" as const
+  const action = buyScore >= MIN_SCORE && buyScore > sellScore && rsi < 60  ? "BUY"  as const
+               : sellScore >= MIN_SCORE && sellScore > buyScore && rsi > 40 ? "SELL" as const
                : "HOLD" as const;
-  return { action, rsi, price, macd, bb, ema9, ema21, volumeRatio, atr, atrPct };
+  return { action, rsi, price, macd, bb, ema9, ema21, volumeRatio, atr, atrPct, score: maxScore, buyScore, sellScore };
 }
 
 // Returns signal for MOMENTUM ARB: EMA9/21 fresh crossover confirmed by RSI (5m candles)
 function calculateMomentumSignal(ohlcv: number[][]) {
-  const empty = { action: "HOLD" as const, rsi: 50, price: 0, volumeRatio: 1, atr: 0, atrPct: 0, cross: null as string | null };
+  const empty = { action: "HOLD" as const, rsi: 50, price: 0, volumeRatio: 1, atr: 0, atrPct: 0, cross: null as string | null, score: 0 };
   if (!ohlcv || ohlcv.length < 22) return empty;
   const closes  = ohlcv.map(c => c[4]);
   const volumes = ohlcv.map(c => c[5]);
@@ -266,17 +289,27 @@ function calculateMomentumSignal(ohlcv: number[][]) {
   const bearCross = prev9 >= prev21 && curr9 < curr21;
   const cross     = bullCross ? "GOLDEN" : bearCross ? "DEATH" : null;
 
-  let action: "BUY" | "SELL" | "HOLD" = "HOLD";
-  if (bullCross && rsi > 45) action = "BUY";
-  if (bearCross && rsi < 55) action = "SELL";
+  // ── Weighted scoring (max 4.5) ──
+  let score = 0;
+  if (bullCross || bearCross) score += 3;           // fresh crossover (base)
+  if (bullCross && rsi > 55) score += 1;            // strong RSI momentum
+  if (bearCross && rsi < 45) score += 1;
+  if (bullCross && rsi > 45 && rsi <= 55) score += 0.5; // moderate RSI
+  if (bearCross && rsi >= 45 && rsi < 55) score += 0.5;
+  if (volumeRatio >= 1.2) score += 0.5;             // volume spike confirmation
 
-  return { action, rsi, price, volumeRatio, atr, atrPct, cross };
+  const MIN_SCORE = 3.0;
+  let action: "BUY" | "SELL" | "HOLD" = "HOLD";
+  if (bullCross && score >= MIN_SCORE) action = "BUY";
+  if (bearCross && score >= MIN_SCORE) action = "SELL";
+
+  return { action, rsi, price, volumeRatio, atr, atrPct, cross, score };
 }
 
 // Returns signal for MEAN-REVERSION: BB band touch + RSI on 15m candles.
 // Intentionally ignores trend direction — designed for range/neutral markets.
 function calculateMeanRevSignal(ohlcv: number[][]) {
-  const empty = { action: "HOLD" as const, rsi: 50, price: 0, volumeRatio: 1, atr: 0, atrPct: 0, bbPos: null as string | null };
+  const empty = { action: "HOLD" as const, rsi: 50, price: 0, volumeRatio: 1, atr: 0, atrPct: 0, bbPos: null as string | null, score: 0 };
   if (!ohlcv || ohlcv.length < 20) return empty;
   const closes  = ohlcv.map(c => c[4]);
   const volumes = ohlcv.map(c => c[5]);
@@ -288,12 +321,39 @@ function calculateMeanRevSignal(ohlcv: number[][]) {
   const volumeRatio = parseFloat(calcVolumeRatio(volumes).toFixed(2));
 
   const bbPos = price <= bb.lower ? "LOWER" : price >= bb.upper ? "UPPER" : "MID";
+  const bbRange = bb.upper - bb.lower;
+  const distFromMid = bbRange > 0 ? Math.abs(price - bb.middle) / (bbRange / 2) : 0; // 0 = mid, 1 = band
 
+  // ── Weighted scoring (max 5.0) ──
+  let score = 0;
+
+  // BB band touch / proximity (weight up to 2)
+  if (price <= bb.lower * 1.003) score += 2;
+  else if (bbPos === "LOWER") score += 1.5;
+  else if (price < bb.middle && distFromMid > 0.5) score += 1;
+
+  if (price >= bb.upper * 0.997) score += 2;
+  else if (bbPos === "UPPER") score += 1.5;
+  else if (price > bb.middle && distFromMid > 0.5) score += 1;
+
+  // RSI extreme (weight up to 1.5)
+  if (rsi < 30) score += 1.5;
+  else if (rsi < 38) score += 1.0;
+  else if (rsi < 45) score += 0.5;
+
+  if (rsi > 70) score += 1.5;
+  else if (rsi > 62) score += 1.0;
+  else if (rsi > 55) score += 0.5;
+
+  // Distance from midpoint bonus (weight up to 1)
+  score += Math.min(distFromMid, 1);
+
+  const MIN_SCORE = 3.0;
   let action: "BUY" | "SELL" | "HOLD" = "HOLD";
-  if (price <= bb.lower * 1.003 && rsi < 38) action = "BUY";  // oversold at lower band
-  if (price >= bb.upper * 0.997 && rsi > 62) action = "SELL"; // overbought at upper band
+  if (price <= bb.lower * 1.003 && score >= MIN_SCORE) action = "BUY";
+  if (price >= bb.upper * 0.997 && score >= MIN_SCORE) action = "SELL";
 
-  return { action, rsi, price, volumeRatio, atr, atrPct, bbPos };
+  return { action, rsi, price, volumeRatio, atr, atrPct, bbPos, score };
 }
 
 // ── OHLCV Persistence ──────────────────────────────────────────────────────────
@@ -439,15 +499,20 @@ async function getAccountBalance(): Promise<number> {
     const bal = await binance.fetchBalance() as any;
     cachedBalance = parseFloat(bal.total?.USDT || bal.USDT?.total || 10000);
     cachedBalanceAt = Date.now();
+    balanceFetchFailures = 0; // reset on success
   } catch (e: any) {
-    console.error("[BALANCE] fetch error:", e?.message);
+    balanceFetchFailures++;
+    console.error(`[BALANCE] fetch error (${balanceFetchFailures}/${MAX_BALANCE_FAILURES}):`, e?.message);
+    if (balanceFetchFailures >= MAX_BALANCE_FAILURES) {
+      console.warn(`[BALANCE] Auto-switching to MOCK mode — balance fetch failed ${MAX_BALANCE_FAILURES}x. Check your Binance API key permissions (Futures must be enabled).`);
+    }
   }
   return cachedBalance;
 }
 
 // ── Auto-Execute ───────────────────────────────────────────────────────────────
 
-type AnySignal = { action: "BUY" | "SELL" | "HOLD"; price: number; rsi: number; volumeRatio: number; atr: number; atrPct: number };
+type AnySignal = { action: "BUY" | "SELL" | "HOLD"; price: number; rsi: number; volumeRatio: number; atr: number; atrPct: number; score?: number; buyScore?: number; sellScore?: number; cross?: string | null; bbPos?: string | null };
 
 async function checkAutoExecute(symbol: string, signal: AnySignal, strategyName: string) {
   const settingsRow = await pool.query("SELECT is_auto_pilot FROM bot_settings WHERE id = 'bot_config'");
@@ -687,15 +752,29 @@ async function checkAutoExecute(symbol: string, signal: AnySignal, strategyName:
   );
   console.log(`[AUTO] DB recorded: ${signal.action} ${symbol} @ ${fillPrice} fee:${feeUsdt} USDT [${strategyName}]`);
 
+  // Push real-time trade event to SSE clients
+  broadcastSSE("trade", { symbol, action: signal.action, strategy: strategyName, price: fillPrice, amount, leverage, timestamp: Date.now() });
+
   if (hasKeys) {
     const icon   = orderWarnings.length ? "⚠️" : "✅";
     const status = orderWarnings.length ? "EXECUTED (warnings)" : "EXECUTED";
+    const slPrice = isLong ? fillPrice * (1 - (signal.atr ?? 0) / fillPrice * slMult) : fillPrice * (1 + (signal.atr ?? 0) / fillPrice * slMult);
+    const tpPriceDisplay = tpPrice > 0 ? tpPrice.toLocaleString() : "N/A";
+    const slPriceDisplay = slPrice > 0 ? slPrice.toLocaleString() : "N/A";
+    const score = signal.score ?? 0;
+    const notional = fillPrice * amount;
+
     await sendTelegram(
       `${icon} <b>AUTO TRADE ${status}</b>\n` +
       `<code>${symbol}</code>  <b>${isLong ? "LONG 🟢" : "SHORT 🔴"}</b>  <code>${strategyName}</code>\n` +
-      `Fill: <code>$${fillPrice.toLocaleString()}</code>  Lev: <code>${leverage}×</code>  Fee: <code>${feeUsdt} USDT</code>\n` +
-      `TP: <code>$${tpPrice > 0 ? tpPrice.toLocaleString() : "N/A"}</code>  SL: <code>${callbackRate}% callback</code>\n` +
-      `RSI: <code>${signal.rsi}</code>  ATR: <code>${signal.atrPct?.toFixed(3)}%</code>  TP×: <code>${tpBonus.toFixed(2)}</code>` +
+      `Score: <code>${score.toFixed(1)}/5.0</code>  RSI: <code>${signal.rsi}</code>\n\n` +
+      `📊 <b>SETUP</b>\n` +
+      `Entry: <code>$${fillPrice.toLocaleString()}</code>\n` +
+      `TP:    <code>$${tpPriceDisplay}</code>\n` +
+      `SL:    <code>$${slPriceDisplay}</code> (trailing ${callbackRate}%)\n` +
+      `Size:  <code>${amount.toFixed(4)} ${symbol.split("/")[0]}</code>  ($${notional.toLocaleString()})\n` +
+      `Lev:   <code>${leverage}×</code>  Fee: <code>${feeUsdt} USDT</code>\n` +
+      `Risk:  <code>${(balance * riskPct).toFixed(2)} USDT</code> (${(riskPct * 100).toFixed(1)}% of balance)` +
       (orderWarnings.length ? `\n\n⚠️ <b>Warnings:</b>\n<code>${orderWarnings.join("\n")}</code>` : "")
     );
   }
@@ -743,9 +822,9 @@ async function seedCandleBuffer() {
         vwap:        parseFloat(calcVWAP(buf1m).toFixed(6)),
         oiChangePct: openInterestCache.get(symbol)?.oiChangePct ?? null,
         lsRatio:     longShortCache.get(symbol) ?? null,
-        ultraScalp:  { action: sig1m.action, rsi: sig1m.rsi, volumeRatio: sig1m.volumeRatio, atrPct: sig1m.atrPct },
-        momentumArb: { action: sig5m.action, rsi: sig5m.rsi, volumeRatio: sig5m.volumeRatio, atrPct: sig5m.atrPct, cross: sig5m.cross },
-        meanRev:     { action: sigMR.action, rsi: sigMR.rsi, volumeRatio: sigMR.volumeRatio, atrPct: sigMR.atrPct, bbPos: sigMR.bbPos },
+        ultraScalp:  { action: sig1m.action, rsi: sig1m.rsi, volumeRatio: sig1m.volumeRatio, atrPct: sig1m.atrPct, score: sig1m.score, buyScore: sig1m.buyScore, sellScore: sig1m.sellScore },
+        momentumArb: { action: sig5m.action, rsi: sig5m.rsi, volumeRatio: sig5m.volumeRatio, atrPct: sig5m.atrPct, cross: sig5m.cross, score: sig5m.score },
+        meanRev:     { action: sigMR.action, rsi: sigMR.rsi, volumeRatio: sigMR.volumeRatio, atrPct: sigMR.atrPct, bbPos: sigMR.bbPos, score: sigMR.score },
       };
       const idx = scanResults.findIndex(r => r.symbol === symbol);
       if (idx >= 0) scanResults[idx] = entry; else scanResults.push(entry);
@@ -798,7 +877,7 @@ function initWebSocket() {
           entry.adx     = adx;
           entry.plusDI  = plusDI;
           entry.minusDI = minusDI;
-          entry.meanRev = { action: signal.action, rsi: signal.rsi, volumeRatio: signal.volumeRatio, atrPct: signal.atrPct, bbPos: signal.bbPos };
+          entry.meanRev = { action: signal.action, rsi: signal.rsi, volumeRatio: signal.volumeRatio, atrPct: signal.atrPct, bbPos: signal.bbPos, score: signal.score };
           if (idx >= 0) scanResults[idx] = entry; else scanResults.push(entry);
 
           const prevMR  = lastMeanRevAction.get(symbol)  || "HOLD";
@@ -807,6 +886,7 @@ function initWebSocket() {
           const isRetryMR = signal.action !== "HOLD" && (Date.now() - lastMR) > 2 * 60 * 1000;
           if (activeStrategies.has("MEAN-REV") && (isNewMR || isRetryMR)) {
             lastMeanRevAttempt.set(symbol, Date.now());
+            if (isNewMR) sendSignalAlert(symbol, signal, "MEAN-REV");
             await checkAutoExecute(symbol, signal, "MEAN-REV");
           }
           lastMeanRevAction.set(symbol, signal.action);
@@ -834,7 +914,7 @@ function initWebSocket() {
           const entry  = scanResults[idx] || { symbol, price: signal.price, trend };
           entry.trend       = trend;
           entry.price       = signal.price;
-          entry.momentumArb = { action: signal.action, rsi: signal.rsi, volumeRatio: signal.volumeRatio, atrPct: signal.atrPct, cross: signal.cross };
+          entry.momentumArb = { action: signal.action, rsi: signal.rsi, volumeRatio: signal.volumeRatio, atrPct: signal.atrPct, cross: signal.cross, score: signal.score };
           if (idx >= 0) scanResults[idx] = entry; else scanResults.push(entry);
 
           const prevMA  = lastMomentumAction.get(symbol)  || "HOLD";
@@ -843,6 +923,7 @@ function initWebSocket() {
           const isRetryMA = signal.action !== "HOLD" && (Date.now() - lastMA) > 60 * 1000;
           if (activeStrategies.has("MOMENTUM-ARB") && (isNewMA || isRetryMA)) {
             lastMomentumAttempt.set(symbol, Date.now());
+            if (isNewMA) sendSignalAlert(symbol, signal, "MOMENTUM-ARB");
             await checkAutoExecute(symbol, signal, "MOMENTUM-ARB");
           }
           lastMomentumAction.set(symbol, signal.action);
@@ -874,7 +955,7 @@ function initWebSocket() {
         // Use closed-candle volume ratio for the scan result so the frontend displays the same
         // value that checkAutoExecute actually checks (not the partial in-progress candle's volume).
         const closedVolumeRatio = parseFloat(calcVolumeRatio(buffer.map(c => c[5])).toFixed(2));
-        entry.ultraScalp  = { action: signal.action, rsi: signal.rsi, volumeRatio: closedVolumeRatio, atrPct: signal.atrPct };
+        entry.ultraScalp  = { action: signal.action, rsi: signal.rsi, volumeRatio: closedVolumeRatio, atrPct: signal.atrPct, score: signal.score, buyScore: signal.buyScore, sellScore: signal.sellScore };
         entry.lastTickMs  = Date.now();
         if (idx >= 0) scanResults[idx] = entry; else scanResults.push(entry);
 
@@ -886,6 +967,7 @@ function initWebSocket() {
         const isRetry     = signal.action !== "HOLD" && (Date.now() - lastAttempt) > 60 * 1000;
         if (activeStrategies.has("ULTRA-SCALP") && (isNewSignal || isRetry)) {
           lastUltraScalpAttempt.set(symbol, Date.now());
+          if (isNewSignal) sendSignalAlert(symbol, signal, "ULTRA-SCALP");
           await checkAutoExecute(symbol, signal, "ULTRA-SCALP");
         }
         lastUltraScalpAction.set(symbol, signal.action);
@@ -999,6 +1081,61 @@ async function sendTelegram(message: string): Promise<void> {
   }
 }
 
+// Send signal alert with full setup details before trade execution
+async function sendSignalAlert(symbol: string, signal: AnySignal, strategyName: string) {
+  const token  = process.env.TELEGRAM_BOT_TOKEN;
+  const chatId = process.env.TELEGRAM_CHAT_ID;
+  if (!token || !chatId) return;
+
+  const isLong = signal.action === "BUY";
+  const price  = signal.price;
+  const atr    = signal.atr ?? 0;
+
+  // Default SL/TP multipliers per strategy (for alert approximation)
+  const slMult = strategyName === "MOMENTUM-ARB" ? 1.0 : strategyName === "MEAN-REV" ? 1.0 : 1.5;
+  const tpMult = strategyName === "MOMENTUM-ARB" ? 3.0 : strategyName === "MEAN-REV" ? 2.0 : 4.0;
+
+  const slPrice = isLong ? price - atr * slMult : price + atr * slMult;
+  const tpPrice = isLong ? price + atr * tpMult : price - atr * tpMult;
+  const slPct   = Math.abs((slPrice - price) / price * 100);
+  const tpPct   = Math.abs((tpPrice - price) / price * 100);
+
+  // Score strength label
+  const score = signal.score ?? 0;
+  const strength = score >= 4 ? "🔥 STRONG" : score >= 3 ? "⚡ WEAK" : "❌ BELOW THRESHOLD";
+
+  // Rationale lines based on strategy
+  const lines: string[] = [];
+  if (strategyName === "ULTRA-SCALP") {
+    if ((signal.buyScore ?? 0) >= 2 || (signal.sellScore ?? 0) >= 2) lines.push(`• EMA9/21 aligned (+2.0)`);
+    if ((signal.buyScore ?? 0) >= 1.5 || (signal.sellScore ?? 0) >= 1.5) lines.push(`• MACD momentum (+1.5)`);
+    if (signal.rsi < 35 || signal.rsi > 65) lines.push(`• RSI extreme (+1.0)`);
+  } else if (strategyName === "MOMENTUM-ARB") {
+    lines.push(`• Fresh EMA crossover (+3.0)`);
+    if (signal.rsi > 55 && isLong) lines.push(`• RSI momentum > 55 (+1.0)`);
+    if (signal.rsi < 45 && !isLong) lines.push(`• RSI momentum < 45 (+1.0)`);
+    if ((signal.volumeRatio ?? 1) >= 1.2) lines.push(`• Volume spike (+0.5)`);
+  } else {
+    lines.push(`• Bollinger Band touch (+2.0)`);
+    if (signal.rsi < 38 && isLong) lines.push(`• RSI oversold (+1.5)`);
+    if (signal.rsi > 62 && !isLong) lines.push(`• RSI overbought (+1.5)`);
+  }
+
+  const message =
+    `🚨 <b>SIGNAL ALERT — ${strength}</b>\n` +
+    `<code>${symbol}</code>  <b>${isLong ? "LONG 🟢" : "SHORT 🔴"}</b>  <code>${strategyName}</code>\n` +
+    `Score: <code>${score.toFixed(1)}/5.0</code>  RSI: <code>${signal.rsi}</code>  Vol: <code>${(signal.volumeRatio ?? 1).toFixed(1)}×</code>\n\n` +
+    `📊 <b>SETUP</b>\n` +
+    `Entry: <code>$${price.toLocaleString()}</code>\n` +
+    `TP:    <code>$${tpPrice.toLocaleString()}</code>  (+${tpPct.toFixed(2)}%)\n` +
+    `SL:    <code>$${slPrice.toLocaleString()}</code>  (-${slPct.toFixed(2)}%)\n` +
+    `ATR:   <code>${signal.atrPct?.toFixed(3)}%</code>\n\n` +
+    `📈 <b>RATIONALE</b>\n` +
+    lines.map(l => `${l}`).join("\n");
+
+  await sendTelegram(message);
+}
+
 async function fetchFuturesData() {
   await Promise.all(SYMBOLS.map(async symbol => {
     const binSym = symbol.replace("/", ""); // BTC/USDT → BTCUSDT
@@ -1073,6 +1210,7 @@ async function syncPositionsFromBinance() {
 
     lastSyncAt = new Date().toISOString();
     console.log(`[SYNC] Done — ${dbTrades.rows.length} checked, ${new Date().toLocaleTimeString()}`);
+    broadcastSSE("sync", { timestamp: lastSyncAt });
   } catch (err: any) {
     console.error("[SYNC] Error:", err?.message);
   }
@@ -1100,6 +1238,97 @@ const takePnLSnapshot = async () => {
 // ── API Routes ─────────────────────────────────────────────────────────────────
 
 app.get("/api/health", (req, res) => res.json({ status: "ok", timestamp: Date.now() }));
+
+// ── SSE (Server-Sent Events) ───────────────────────────────────────────────────
+
+const sseClients: any[] = [];
+
+function broadcastSSE(event: string, data: any) {
+  const payload = `event: ${event}\ndata: ${JSON.stringify(data)}\n\n`;
+  for (let i = sseClients.length - 1; i >= 0; i--) {
+    try {
+      sseClients[i].write(payload);
+    } catch {
+      sseClients.splice(i, 1); // remove dead connections
+    }
+  }
+}
+
+// Build cooldown map from DB (cached for SSE)
+let cachedCooldownMap: Record<string, { inCooldown: boolean; strategy: string; status: string }> = {};
+let cachedCooldownAt = 0;
+async function getCooldownMap(): Promise<Record<string, { inCooldown: boolean; strategy: string; status: string }>> {
+  if (Date.now() - cachedCooldownAt < 5000) return cachedCooldownMap;
+  try {
+    const result = await pool.query(`
+      WITH rules AS (
+        SELECT symbol, strategy, timestamp, status,
+          CASE
+            WHEN status = 'OPEN' THEN true
+            WHEN strategy = 'MOMENTUM-ARB' AND timestamp > NOW() - INTERVAL '15 minutes' THEN true
+            WHEN strategy = 'MEAN-REV'     AND timestamp > NOW() - INTERVAL '30 minutes' THEN true
+            WHEN strategy NOT IN ('MOMENTUM-ARB','MEAN-REV') AND timestamp > NOW() - INTERVAL '5 minutes' THEN true
+            ELSE false
+          END AS in_cooldown
+        FROM trades
+      )
+      SELECT symbol, strategy, timestamp, status, in_cooldown
+      FROM rules
+      WHERE in_cooldown = true
+      ORDER BY timestamp DESC
+    `);
+    const map: Record<string, { inCooldown: boolean; strategy: string; status: string }> = {};
+    for (const row of result.rows) {
+      const key = `${row.symbol}|${row.strategy}`;
+      if (!map[key]) map[key] = { inCooldown: row.in_cooldown, strategy: row.strategy, status: row.status };
+    }
+    cachedCooldownMap = map;
+    cachedCooldownAt = Date.now();
+  } catch (err) {
+    console.error("[SSE] cooldown cache error:", err);
+  }
+  return cachedCooldownMap;
+}
+
+// Gather lightweight dashboard data for SSE snapshots
+async function gatherSSEData() {
+  const cooldownStatus = await getCooldownMap();
+  return {
+    scanResults,
+    marketContext: {
+      fearGreed: fearGreedCache,
+      fundingRates: Object.fromEntries(fundingRateCache),
+      openInterest: Object.fromEntries(openInterestCache),
+      longShortRatios: Object.fromEntries(longShortCache),
+    },
+    cooldownStatus,
+    activeStrategies: [...activeStrategies],
+    timestamp: Date.now(),
+  };
+}
+
+app.get("/api/events", async (req, res) => {
+  res.setHeader("Content-Type", "text/event-stream");
+  res.setHeader("Cache-Control", "no-cache");
+  res.setHeader("Connection", "keep-alive");
+  res.setHeader("X-Accel-Buffering", "no");
+  res.flushHeaders();
+
+  // Send initial snapshot immediately
+  const initial = await gatherSSEData();
+  res.write(`event: snapshot\ndata: ${JSON.stringify(initial)}\n\n`);
+
+  sseClients.push(res);
+  console.log(`[SSE] Client connected — total: ${sseClients.length}`);
+
+  req.on("close", () => {
+    const idx = sseClients.indexOf(res);
+    if (idx >= 0) sseClients.splice(idx, 1);
+    console.log(`[SSE] Client disconnected — total: ${sseClients.length}`);
+  });
+});
+
+// ── REST API ───────────────────────────────────────────────────────────────────
 
 // Returns per-symbol cooldown status so the frontend can show if a trade was just fired
 app.get("/api/cooldown-status", async (_req, res) => {
@@ -1400,20 +1629,26 @@ app.post("/api/ai-confirm", async (req, res) => {
 app.get("/api/balance", async (req, res) => {
   try {
     if (!process.env.BINANCE_API_KEY || !process.env.BINANCE_SECRET_KEY) {
-      return res.json({ total: { USDT: 10000 }, status: "mock" });
+      return res.json({ total: { USDT: 10000 }, status: "mock", reason: "No API keys" });
     }
-    const balance = await binance.fetchBalance({ type: "future" });
-    res.json({ total: { USDT: parseFloat(String((balance as any).total?.USDT ?? 0)) }, status: "live", type: "futures" });
+    const balance = await binance.fetchBalance() as any;
+    res.json({ total: { USDT: parseFloat(String(balance.total?.USDT ?? 0)) }, status: "live", type: "futures" });
   } catch (err: any) {
-    res.status(200).json({ status: "error", error: err.message, total: {} });
+    console.error("[API /balance] error:", err?.message);
+    res.status(200).json({ status: "error", error: err?.message, total: { USDT: 10000 }, fallback: "mock" });
   }
 });
 
 app.get("/api/check-api", async (req, res) => {
   if (!process.env.BINANCE_API_KEY || !process.env.BINANCE_SECRET_KEY)
     return res.json({ connected: false, reason: "Keys not found" });
-  try { await binance.fetchBalance(); res.json({ connected: true }); }
-  catch (e: any) { res.json({ connected: false, reason: e.message }); }
+  try {
+    await binance.fetchBalance();
+    res.json({ connected: true, mode: "live" });
+  } catch (e: any) {
+    console.error("[API /check-api] error:", e?.message);
+    res.json({ connected: false, reason: e?.message, hint: "Check: (1) API key is correct, (2) Futures permission is enabled, (3) IP whitelist matches your server IP" });
+  }
 });
 
 // ── Force-test a real order for a specific symbol/strategy ───────────────────
@@ -1482,6 +1717,8 @@ app.get("/api/diagnose", async (_req, res) => {
         if (signal.action === "BUY"  && ls > 2.5) return `L/S ${ls.toFixed(2)} > 2.5 (over-long)`;
         if (signal.action === "SELL" && ls < 0.4) return `L/S ${ls.toFixed(2)} < 0.4 (over-short)`;
       }
+      // Score threshold check
+      if ((signal.score ?? 0) < 3.0) return `score ${(signal.score ?? 0).toFixed(1)} < 3.0 (weak signal)`;
       return "PASS ✓ (cooldown not checked here — see /api/cooldown-status)";
     }
 
@@ -1552,6 +1789,25 @@ app.get("/api/diagnose", async (_req, res) => {
 
 // ── Backtest Engine ────────────────────────────────────────────────────────────
 
+function resampleTo5m(candles1m: number[][]): number[][] {
+  const buckets = new Map<number, number[][]>();
+  for (const c of candles1m) {
+    const key = Math.floor(c[0] / (5 * 60 * 1000)) * 5 * 60 * 1000;
+    if (!buckets.has(key)) buckets.set(key, []);
+    buckets.get(key)!.push(c);
+  }
+  return Array.from(buckets.entries())
+    .sort((a, b) => a[0] - b[0])
+    .map(([ts, group]) => [
+      ts,
+      group[0][1],                               // open  = first 1m open
+      Math.max(...group.map(c => c[2])),          // high  = max
+      Math.min(...group.map(c => c[3])),          // low   = min
+      group[group.length - 1][4],                 // close = last 1m close
+      group.reduce((s, c) => s + c[5], 0),        // vol   = sum
+    ]);
+}
+
 function resampleTo15m(candles1m: number[][]): number[][] {
   const buckets = new Map<number, number[][]>();
   for (const c of candles1m) {
@@ -1574,6 +1830,7 @@ function resampleTo15m(candles1m: number[][]): number[][] {
 app.get("/api/backtest", async (req, res) => {
   const symbol = (req.query.symbol as string) || "BTC/USDT";
   const days   = Math.min(parseInt((req.query.days as string) || "7"), 30);
+  const strategyName = (req.query.strategy as string) || "ULTRA-SCALP";
 
   try {
     const since = Date.now() - days * 24 * 60 * 60 * 1000;
@@ -1590,17 +1847,61 @@ app.get("/api/backtest", async (req, res) => {
       return res.json({ error: "Not enough 1m data in DB yet. Let the bot run for a while first.", candles: candles1m.length });
     }
 
-    const cfg    = await pool.query(`SELECT atr_sl_mult::float, atr_tp_mult::float FROM bot_settings WHERE id = 'bot_config'`);
-    const slMult = cfg.rows[0]?.atr_sl_mult ?? 1.5;
-    const tpMult = cfg.rows[0]?.atr_tp_mult ?? 2.5;
+    // ── Prepare data & config per strategy ──
+    let candles: number[][];
+    let windowSize: number;
+    let signalFn: (ohlcv: number[][]) => any;
+    let volThreshold: number;
+    let skipTrend: boolean;
+    let cooldownMs: number;
+    let slMult: number;
+    let tpMult: number;
 
-    // Build 15m trend lookup: ts15m → EMA200 value
+    if (strategyName === "MOMENTUM-ARB") {
+      candles = resampleTo5m(candles1m);
+      windowSize = 22;
+      signalFn = calculateMomentumSignal;
+      volThreshold = 1.0;
+      skipTrend = false;
+      cooldownMs = 15 * 60 * 1000;
+    } else if (strategyName === "MEAN-REV") {
+      candles = resampleTo15m(candles1m);
+      windowSize = 20;
+      signalFn = calculateMeanRevSignal;
+      volThreshold = 0.8;
+      skipTrend = true;
+      cooldownMs = 30 * 60 * 1000;
+    } else {
+      candles = candles1m;
+      windowSize = 26;
+      signalFn = calculateSignal;
+      volThreshold = 1.0;
+      skipTrend = true;
+      cooldownMs = 5 * 60 * 1000;
+    }
+
+    const cfg = await pool.query(`
+      SELECT atr_sl_mult::float, atr_tp_mult::float,
+             arb_sl_mult::float, arb_tp_mult::float,
+             mr_sl_mult::float,  mr_tp_mult::float
+      FROM bot_settings WHERE id = 'bot_config'
+    `);
+    if (strategyName === "MOMENTUM-ARB") {
+      slMult = cfg.rows[0]?.arb_sl_mult ?? 1.0;
+      tpMult = cfg.rows[0]?.arb_tp_mult ?? 3.0;
+    } else if (strategyName === "MEAN-REV") {
+      slMult = cfg.rows[0]?.mr_sl_mult ?? 1.0;
+      tpMult = cfg.rows[0]?.mr_tp_mult ?? 2.0;
+    } else {
+      slMult = cfg.rows[0]?.atr_sl_mult ?? 1.5;
+      tpMult = cfg.rows[0]?.atr_tp_mult ?? 4.0;
+    }
+
+    // ── Build 15m trend & ADX lookup ──
     const candles15m = resampleTo15m(candles1m);
     const closes15m  = candles15m.map(c => c[4]);
     const ema200arr  = calcEMA(closes15m, 200);
-    const trendAt15m: Array<{ ts: number; ema: number; price: number }> = candles15m.map((c, i) => ({
-      ts: c[0], ema: ema200arr[i], price: c[4],
-    }));
+    const trendAt15m = candles15m.map((c, i) => ({ ts: c[0], ema: ema200arr[i], price: c[4] }));
 
     function getTrendAtTime(ts: number): "UP" | "DOWN" | "NEUTRAL" {
       let idx = -1;
@@ -1610,9 +1911,22 @@ app.get("/api/backtest", async (req, res) => {
       if (idx < 0) return "NEUTRAL";
       const { ema, price } = trendAt15m[idx];
       if (isNaN(ema) || ema === 0) return "NEUTRAL";
-      if (price > ema * 1.001) return "UP";
-      if (price < ema * 0.999) return "DOWN";
+      if (price > ema) return "UP";
+      if (price < ema) return "DOWN";
       return "NEUTRAL";
+    }
+
+    function getRegimeAtTime(ts: number): { regime: "TRENDING" | "RANGING" | "NEUTRAL"; adx: number } {
+      let idx = -1;
+      for (let i = candles15m.length - 1; i >= 0; i--) {
+        if (candles15m[i][0] <= ts) { idx = i; break; }
+      }
+      if (idx < 29) return { regime: "NEUTRAL", adx: 0 };
+      const buf = candles15m.slice(0, idx + 1);
+      const { adx } = calcADX(buf, 14);
+      if (adx > 25) return { regime: "TRENDING", adx };
+      if (adx < 20) return { regime: "RANGING", adx };
+      return { regime: "NEUTRAL", adx };
     }
 
     interface BtTrade {
@@ -1630,17 +1944,19 @@ app.get("/api/backtest", async (req, res) => {
 
     const trades: BtTrade[] = [];
     let position: BtPosition | null = null;
-    const WINDOW = 50;
+    let lastEntryTs = 0;
+    const equity: { ts: number; value: number }[] = [];
+    let currentEquity = 100; // start at 100 for percentage baseline
 
-    for (let i = WINDOW; i < candles1m.length; i++) {
-      const window = candles1m.slice(i - WINDOW, i + 1);
-      const signal = calculateSignal(window);
-      const currentPrice = candles1m[i][4];
+    for (let i = windowSize; i < candles.length; i++) {
+      const window = candles.slice(i - windowSize, i + 1);
+      const signal = signalFn(window);
+      const currentPrice = candles[i][4];
+      const currentTs = candles[i][0];
 
       // ── Manage open position ──
       if (position) {
         const isLong = position.type === "BUY";
-
         if (isLong) position.trailingHigh = Math.max(position.trailingHigh, currentPrice);
         else         position.trailingLow  = Math.min(position.trailingLow, currentPrice);
 
@@ -1657,30 +1973,71 @@ app.get("/api/backtest", async (req, res) => {
           trades.push({
             type: position.type, entry: position.entry, exit: currentPrice,
             pnlPct: parseFloat(realPnl.toFixed(3)), reason,
-            entryTs: position.entryTs, exitTs: candles1m[i][0],
-            holdMinutes: Math.round((candles1m[i][0] - position.entryTs) / 60000),
+            entryTs: position.entryTs, exitTs: currentTs,
+            holdMinutes: Math.round((currentTs - position.entryTs) / 60000),
           });
+          currentEquity = currentEquity * (1 + realPnl / 100);
+          equity.push({ ts: currentTs, value: parseFloat(currentEquity.toFixed(4)) });
           position = null;
         }
       }
 
       // ── Open new position ──
       if (!position && signal.action !== "HOLD") {
-        const trend   = getTrendAtTime(candles1m[i][0]);
-        const volOk   = (signal.volumeRatio ?? 1) >= 1.5;
-        const trendOk = (signal.action === "BUY" && trend === "UP") ||
-                        (signal.action === "SELL" && trend === "DOWN");
-        if (volOk && trendOk) {
-          const atrF    = (signal.atr ?? 0) / currentPrice;
-          const dynSlPct = Math.min(Math.max(atrF * slMult, 0.001), 0.05);
-          const dynTpPct = Math.min(Math.max(atrF * tpMult, 0.01), 0.10);
-          position = {
-            type: signal.action, entry: currentPrice,
-            trailingHigh: currentPrice, trailingLow: currentPrice,
-            entryTs: candles1m[i][0], dynSlPct, dynTpPct,
-          };
+        // Cooldown
+        if (currentTs - lastEntryTs < cooldownMs) continue;
+
+        const trend = getTrendAtTime(currentTs);
+        const { regime } = getRegimeAtTime(currentTs);
+
+        // Regime filter
+        if (strategyName === "MEAN-REV" && regime === "TRENDING") continue;
+        if (strategyName === "MOMENTUM-ARB" && regime === "RANGING") continue;
+
+        // Trend filter
+        if (!skipTrend) {
+          if (signal.action === "BUY" && trend === "DOWN") continue;
+          if (signal.action === "SELL" && trend === "UP") continue;
+          if (trend === "NEUTRAL") continue;
         }
+
+        // Volume filter
+        const volRatio = signal.volumeRatio ?? 1;
+        if (volRatio < volThreshold) continue;
+
+        const atrF = (signal.atr ?? 0) / currentPrice;
+        const dynSlPct = Math.min(Math.max(atrF * slMult, 0.001), 0.05);
+        const dynTpPct = Math.min(Math.max(atrF * tpMult, 0.01), 0.15);
+
+        position = {
+          type: signal.action, entry: currentPrice,
+          trailingHigh: currentPrice, trailingLow: currentPrice,
+          entryTs: currentTs, dynSlPct, dynTpPct,
+        };
+        lastEntryTs = currentTs;
       }
+
+      // Record equity while flat
+      if (!position) {
+        equity.push({ ts: currentTs, value: parseFloat(currentEquity.toFixed(4)) });
+      }
+    }
+
+    // Close any open position at last price
+    if (position) {
+      const lastPrice = candles[candles.length - 1][4];
+      const lastTs = candles[candles.length - 1][0];
+      const isLong = position.type === "BUY";
+      const realPnl = isLong ? (lastPrice - position.entry) / position.entry * 100
+                             : (position.entry - lastPrice) / position.entry * 100;
+      trades.push({
+        type: position.type, entry: position.entry, exit: lastPrice,
+        pnlPct: parseFloat(realPnl.toFixed(3)), reason: "OPEN_AT_END",
+        entryTs: position.entryTs, exitTs: lastTs,
+        holdMinutes: Math.round((lastTs - position.entryTs) / 60000),
+      });
+      currentEquity = currentEquity * (1 + realPnl / 100);
+      equity.push({ ts: lastTs, value: parseFloat(currentEquity.toFixed(4)) });
     }
 
     const wins     = trades.filter(t => t.pnlPct > 0);
@@ -1690,7 +2047,6 @@ app.get("/api/backtest", async (req, res) => {
     const avgWin   = wins.length  > 0 ? parseFloat((wins.reduce((s,t) => s + t.pnlPct, 0) / wins.length).toFixed(3)) : 0;
     const avgLoss  = losses.length > 0 ? parseFloat((losses.reduce((s,t) => s + t.pnlPct, 0) / losses.length).toFixed(3)) : 0;
 
-    // Max drawdown: max cumulative PnL drop from a peak
     let peak = 0, cumPnl = 0, maxDD = 0;
     for (const t of trades) {
       cumPnl += t.pnlPct;
@@ -1700,15 +2056,17 @@ app.get("/api/backtest", async (req, res) => {
     }
 
     res.json({
-      symbol, days,
+      symbol, days, strategy: strategyName,
       stats: {
         total: trades.length, wins: wins.length, losses: losses.length,
         winRate, totalPnlPct: totalPnl,
         avgWinPct: avgWin, avgLossPct: avgLoss,
         maxDrawdownPct: parseFloat(maxDD.toFixed(3)),
-        candles: candles1m.length,
+        finalEquity: parseFloat(currentEquity.toFixed(4)),
+        candles: candles.length,
       },
-      trades: trades.slice(-100),  // last 100 trades max
+      equity: equity, // time-series for charting
+      trades: trades.slice(-100),
     });
   } catch (err: any) {
     console.error("[BACKTEST] Error:", err?.message);
@@ -1743,6 +2101,13 @@ async function startServer() {
   // Seed candle buffer via REST, then hand off to WebSocket
   await seedCandleBuffer();
   initWebSocket();
+
+  // SSE snapshot interval — push dashboard data to all connected clients every 2s
+  setInterval(async () => {
+    if (sseClients.length === 0) return;
+    const data = await gatherSSEData();
+    broadcastSSE("snapshot", data);
+  }, 2000);
 
   // Fallback reseed every 5 min (catches any gaps if WS misses a candle)
   setInterval(seedCandleBuffer, 5 * 60 * 1000);

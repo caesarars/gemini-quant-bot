@@ -33,6 +33,9 @@ interface StrategySignal {
   atrPct?: number;
   cross?: string | null;
   bbPos?: string | null;
+  score?: number;
+  buyScore?: number;
+  sellScore?: number;
 }
 
 interface ScanResult {
@@ -153,6 +156,7 @@ export default function App() {
   const [isBacktestOpen, setIsBacktestOpen]   = useState(false);
   const [btSymbol, setBtSymbol]               = useState("BTC/USDT");
   const [btDays, setBtDays]                   = useState(7);
+  const [btStrategy, setBtStrategy]           = useState("ULTRA-SCALP");
   const [btLoading, setBtLoading]             = useState(false);
   const [btResult, setBtResult]               = useState<any>(null);
   // Increments every second so scan-age badges re-render without full data refresh
@@ -163,7 +167,7 @@ export default function App() {
     setBtLoading(true);
     setBtResult(null);
     try {
-      const r = await fetch(`/api/backtest?symbol=${encodeURIComponent(btSymbol)}&days=${btDays}`);
+      const r = await fetch(`/api/backtest?symbol=${encodeURIComponent(btSymbol)}&days=${btDays}&strategy=${encodeURIComponent(btStrategy)}`);
       const d = await r.json();
       setBtResult(d);
     } catch { setBtResult({ error: "Request failed" }); }
@@ -241,49 +245,139 @@ export default function App() {
     }
   };
 
+  // ── Initial data fetch (REST) + SSE for real-time updates ──
   useEffect(() => {
-    const fetchData = async () => {
+    // 1. Fetch static/less-frequent data once on mount
+    const fetchStaticData = async () => {
       try {
-        const scanRes = await fetch("/api/scan");
-        const scanData = await scanRes.json();
-        setScanResults(scanData.results);
+        const [checkRes, balRes, pnlRes, historyRes, posRes] = await Promise.all([
+          fetch("/api/check-api"),
+          fetch("/api/balance"),
+          fetch("/api/pnl-history"),
+          fetch("/api/trade-history"),
+          fetch("/api/open-positions"),
+        ]);
 
-        const balRes = await fetch("/api/balance");
+        if (checkRes.ok) {
+          const checkData = await checkRes.json();
+          setApiStatus(checkData.connected ? (checkData.mode || 'live') : 'mock');
+          if (!checkData.connected && checkData.reason && checkData.reason !== 'Keys not found') {
+            addLog(`API ERROR: ${checkData.reason}`, 'error');
+          }
+        }
         if (balRes.ok) {
           const balData = await balRes.json();
           setBalance(balData.total);
-          setApiStatus(balData.status);
-          if (balData.status === 'error') {
-             addLog(`API ERROR: ${balData.error}`, 'error');
-          }
+          if (balData.fallback === 'mock') setApiStatus('mock');
         }
-
-        const pnlRes = await fetch("/api/pnl-history");
-        const pnlHistory = await pnlRes.json();
-        setPnlData(pnlHistory);
-
-        const historyRes = await fetch("/api/trade-history");
-        const historyData = await historyRes.json();
-        setTradeHistory(historyData);
-
-        const cdRes = await fetch("/api/cooldown-status");
-        if (cdRes.ok) setCooldownStatus(await cdRes.json());
-
-        const ctxRes = await fetch("/api/market-context");
-        if (ctxRes.ok) setMarketContext(await ctxRes.json());
-
-        const posRes = await fetch("/api/open-positions");
-        const posData = await posRes.json();
-        setOpenPositions(posData.positions ?? []);
-        if (posData.last_sync) setLastSync(posData.last_sync);
+        if (pnlRes.ok) setPnlData(await pnlRes.json());
+        if (historyRes.ok) setTradeHistory(await historyRes.json());
+        if (posRes.ok) {
+          const posData = await posRes.json();
+          setOpenPositions(posData.positions ?? []);
+          if (posData.last_sync) setLastSync(posData.last_sync);
+        }
       } catch (err) {
-        console.error("Failed to fetch data", err);
+        console.error("[INIT] Failed to fetch static data", err);
       }
     };
 
-    fetchData();
-    const interval = setInterval(fetchData, 10000);
-    return () => clearInterval(interval);
+    fetchStaticData();
+
+    // 2. SSE for real-time scanner + market context + cooldown
+    let es: EventSource | null = null;
+    let reconnectAttempts = 0;
+    const maxReconnects = 5;
+
+    const connectSSE = () => {
+      es = new EventSource("/api/events");
+
+      es.onopen = () => {
+        reconnectAttempts = 0;
+        console.log("[SSE] Connected");
+      };
+
+      es.onmessage = (ev) => {
+        try {
+          const msg = JSON.parse(ev.data);
+          if (msg.scanResults) setScanResults(msg.scanResults);
+          if (msg.marketContext) setMarketContext(msg.marketContext);
+          if (msg.cooldownStatus) setCooldownStatus(msg.cooldownStatus);
+        } catch (err) {
+          console.error("[SSE] Parse error:", err);
+        }
+      };
+
+      // Named events
+      es.addEventListener("snapshot", (ev: any) => {
+        try {
+          const data = JSON.parse(ev.data);
+          if (data.scanResults) setScanResults(data.scanResults);
+          if (data.marketContext) setMarketContext(data.marketContext);
+          if (data.cooldownStatus) setCooldownStatus(data.cooldownStatus);
+        } catch (err) {
+          console.error("[SSE] snapshot error:", err);
+        }
+      });
+
+      es.addEventListener("trade", (ev: any) => {
+        try {
+          const data = JSON.parse(ev.data);
+          addLog(`Trade: ${data.action} ${data.symbol} @ $${data.price.toLocaleString()} [${data.strategy}]`, 'success');
+          // Re-fetch positions & trade history after a trade
+          fetch("/api/open-positions").then(r => r.json()).then(d => {
+            setOpenPositions(d.positions ?? []);
+            if (d.last_sync) setLastSync(d.last_sync);
+          }).catch(() => {});
+          fetch("/api/trade-history").then(r => r.json()).then(setTradeHistory).catch(() => {});
+          fetch("/api/balance").then(r => r.json()).then(d => setBalance(d.total)).catch(() => {});
+        } catch (err) {
+          console.error("[SSE] trade event error:", err);
+        }
+      });
+
+      es.addEventListener("sync", (ev: any) => {
+        try {
+          const data = JSON.parse(ev.data);
+          addLog(`Positions synced at ${new Date(data.timestamp).toLocaleTimeString()}`, 'info');
+          fetch("/api/open-positions").then(r => r.json()).then(d => {
+            setOpenPositions(d.positions ?? []);
+            if (d.last_sync) setLastSync(d.last_sync);
+          }).catch(() => {});
+        } catch (err) {
+          console.error("[SSE] sync event error:", err);
+        }
+      });
+
+      es.onerror = () => {
+        console.error(`[SSE] Connection error (attempt ${reconnectAttempts + 1}/${maxReconnects})`);
+        es?.close();
+        if (reconnectAttempts < maxReconnects) {
+          reconnectAttempts++;
+          setTimeout(connectSSE, 3000);
+        } else {
+          addLog("SSE failed — falling back to polling mode", 'error');
+          // Fallback: start polling every 10s
+          const fallbackInterval = setInterval(fetchStaticData, 10000);
+          // Store interval on window for cleanup (hacky but works)
+          (window as any).__fallbackInterval = fallbackInterval;
+        }
+      };
+    };
+
+    connectSSE();
+
+    // 3. Light backup fetch every 30s for balance & PnL (in case SSE misses something)
+    const backupInterval = setInterval(() => {
+      fetch("/api/balance").then(r => r.json()).then(d => setBalance(d.total)).catch(() => {});
+      fetch("/api/pnl-history").then(r => r.json()).then(setPnlData).catch(() => {});
+    }, 30000);
+
+    return () => {
+      es?.close();
+      clearInterval(backupInterval);
+      if ((window as any).__fallbackInterval) clearInterval((window as any).__fallbackInterval);
+    };
   }, []);
 
   const getAiConfirmation = async (symbol: string, data: any) => {
@@ -607,6 +701,13 @@ export default function App() {
                               : coin.ultraScalp.action === 'SELL' ? "bg-trading-down/15 text-trading-down"
                               :                                      "bg-trading-muted/10 text-trading-muted"
                               )}>{coin.ultraScalp.action}</span>
+                              {coin.ultraScalp.score !== undefined && (
+                                <span className={cn("text-[10px] font-bold px-1.5 py-0.5 rounded",
+                                  (coin.ultraScalp.score ?? 0) >= 4 ? "bg-trading-up/20 text-trading-up"
+                                  : (coin.ultraScalp.score ?? 0) >= 3 ? "bg-orange-400/20 text-orange-400"
+                                  :                                     "bg-trading-muted/10 text-trading-muted"
+                                )}>{(coin.ultraScalp.score ?? 0).toFixed(1)}</span>
+                              )}
                               <span className="text-[11px] text-trading-muted">RSI {coin.ultraScalp.rsi.toFixed(0)}</span>
                               {coin.ultraScalp.volumeRatio !== undefined && (
                                 <span className={cn("ml-auto text-[11px] font-bold",
@@ -639,6 +740,13 @@ export default function App() {
                               : coin.momentumArb.action === 'SELL' ? "bg-trading-down/15 text-trading-down"
                               :                                       "bg-trading-muted/10 text-trading-muted"
                               )}>{coin.momentumArb.action}</span>
+                              {coin.momentumArb.score !== undefined && (
+                                <span className={cn("text-[10px] font-bold px-1.5 py-0.5 rounded",
+                                  (coin.momentumArb.score ?? 0) >= 4 ? "bg-trading-up/20 text-trading-up"
+                                  : (coin.momentumArb.score ?? 0) >= 3 ? "bg-orange-400/20 text-orange-400"
+                                  :                                      "bg-trading-muted/10 text-trading-muted"
+                                )}>{(coin.momentumArb.score ?? 0).toFixed(1)}</span>
+                              )}
                               <span className="text-[11px] text-trading-muted">RSI {coin.momentumArb.rsi.toFixed(0)}</span>
                               {coin.momentumArb.cross && (
                                 <span className={cn("text-[11px] font-black",
@@ -677,6 +785,13 @@ export default function App() {
                               : coin.meanRev.action === 'SELL' ? "bg-trading-down/15 text-trading-down"
                               :                                   "bg-trading-muted/10 text-trading-muted"
                               )}>{coin.meanRev.action}</span>
+                              {coin.meanRev.score !== undefined && (
+                                <span className={cn("text-[10px] font-bold px-1.5 py-0.5 rounded",
+                                  (coin.meanRev.score ?? 0) >= 4 ? "bg-trading-up/20 text-trading-up"
+                                  : (coin.meanRev.score ?? 0) >= 3 ? "bg-orange-400/20 text-orange-400"
+                                  :                                    "bg-trading-muted/10 text-trading-muted"
+                                )}>{(coin.meanRev.score ?? 0).toFixed(1)}</span>
+                              )}
                               <span className="text-[11px] text-trading-muted">RSI {coin.meanRev.rsi.toFixed(0)}</span>
                               {coin.meanRev.bbPos && (
                                 <span className={cn("text-[11px] font-bold", bbColor)}>BB:{coin.meanRev.bbPos}</span>
@@ -1256,6 +1371,15 @@ export default function App() {
                     <option key={d} value={d}>Last {d} day{d > 1 ? "s" : ""}</option>
                   ))}
                 </select>
+                <select
+                  value={btStrategy}
+                  onChange={e => setBtStrategy(e.target.value)}
+                  className="bg-trading-bg border border-trading-border rounded px-2 py-1.5 text-[11px] font-bold text-trading-text"
+                >
+                  <option value="ULTRA-SCALP">ULTRA-SCALP (1m)</option>
+                  <option value="MOMENTUM-ARB">MOMENTUM-ARB (5m)</option>
+                  <option value="MEAN-REV">MEAN-REV (15m)</option>
+                </select>
                 <button
                   onClick={runBacktest}
                   disabled={btLoading}
@@ -1263,7 +1387,7 @@ export default function App() {
                 >
                   {btLoading ? "Running..." : "Run Backtest"}
                 </button>
-                <span className="text-[10px] text-trading-muted">Uses real OHLCV from DB · Signal + Trend + Volume filters</span>
+                <span className="text-[10px] text-trading-muted">Uses real OHLCV from DB · Signal + Trend + Volume + Regime filters</span>
               </div>
 
               {/* Body */}
@@ -1282,17 +1406,25 @@ export default function App() {
                 )}
                 {btResult?.stats && (
                   <div className="space-y-6">
+                    {/* Strategy badge */}
+                    <div className="flex items-center gap-2">
+                      <span className="text-[10px] font-bold px-2 py-1 bg-trading-accent/15 text-trading-accent rounded uppercase tracking-wider">{btResult.strategy}</span>
+                      <span className="text-[10px] text-trading-muted">{btResult.stats.candles} candles · {btResult.days}d</span>
+                    </div>
+
                     {/* Stats Grid */}
-                    <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
+                    <div className="grid grid-cols-2 sm:grid-cols-5 gap-3">
                       {[
                         { label: "Win Rate",     value: `${btResult.stats.winRate}%`,           color: btResult.stats.winRate >= 50 ? "text-trading-up" : "text-trading-down" },
                         { label: "Total PnL",    value: `${btResult.stats.totalPnlPct > 0 ? "+" : ""}${btResult.stats.totalPnlPct}%`, color: btResult.stats.totalPnlPct >= 0 ? "text-trading-up" : "text-trading-down" },
-                        { label: "Total Trades", value: btResult.stats.total,                   color: "text-trading-text" },
+                        { label: "Final Equity", value: `${btResult.stats.finalEquity}`,        color: btResult.stats.finalEquity >= 100 ? "text-trading-up" : "text-trading-down" },
                         { label: "Max Drawdown", value: `-${btResult.stats.maxDrawdownPct}%`,   color: "text-trading-down" },
+                        { label: "Total Trades", value: btResult.stats.total,                   color: "text-trading-text" },
                         { label: "Wins",         value: btResult.stats.wins,                    color: "text-trading-up" },
                         { label: "Losses",       value: btResult.stats.losses,                  color: "text-trading-down" },
                         { label: "Avg Win",      value: `+${btResult.stats.avgWinPct}%`,        color: "text-trading-up" },
                         { label: "Avg Loss",     value: `${btResult.stats.avgLossPct}%`,        color: "text-trading-down" },
+                        { label: "Profit Factor", value: btResult.stats.avgLossPct !== 0 ? ((btResult.stats.avgWinPct * btResult.stats.wins) / Math.abs(btResult.stats.avgLossPct * btResult.stats.losses)).toFixed(2) : "N/A", color: "text-trading-text" },
                       ].map(s => (
                         <div key={s.label} className="bg-trading-card border border-trading-border rounded p-3">
                           <div className="text-[9px] text-trading-muted uppercase tracking-wider mb-1">{s.label}</div>
@@ -1300,6 +1432,26 @@ export default function App() {
                         </div>
                       ))}
                     </div>
+
+                    {/* Equity Curve */}
+                    {btResult.equity && btResult.equity.length > 0 && (
+                      <div className="bg-trading-card border border-trading-border rounded p-4">
+                        <div className="text-[10px] uppercase text-trading-muted tracking-wider mb-3">Equity Curve (Base 100)</div>
+                        <ResponsiveContainer width="100%" height={220}>
+                          <LineChart data={btResult.equity}>
+                            <CartesianGrid strokeDasharray="3 3" stroke="rgba(255,255,255,0.05)" />
+                            <XAxis dataKey="ts" tickFormatter={(ts) => new Date(ts).toLocaleDateString()} stroke="#64748b" fontSize={9} />
+                            <YAxis domain={['auto', 'auto']} stroke="#64748b" fontSize={9} />
+                            <Tooltip
+                              contentStyle={{ backgroundColor: '#0f172a', border: '1px solid #334155', fontSize: 11 }}
+                              labelFormatter={(ts) => new Date(ts).toLocaleString()}
+                              formatter={(value: any) => [`${value}`, 'Equity']}
+                            />
+                            <Line type="monotone" dataKey="value" stroke="#00e5a0" strokeWidth={1.5} dot={false} />
+                          </LineChart>
+                        </ResponsiveContainer>
+                      </div>
+                    )}
 
                     {/* Trade Log */}
                     {btResult.trades?.length > 0 && (
