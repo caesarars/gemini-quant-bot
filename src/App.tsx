@@ -166,6 +166,7 @@ export default function App() {
     mrTpMult: 2.0,
   });
   const [cooldownStatus, setCooldownStatus]       = useState<Record<string, { inCooldown: boolean; strategy: string; status?: string }>>({});
+  const [validationLogs, setValidationLogs] = useState<any[]>([]);
   const [loadingAi, setLoadingAi] = useState<string | null>(null);
   const [marketContext, setMarketContext] = useState<{
     fearGreed: { value: number; classification: string } | null;
@@ -351,6 +352,7 @@ export default function App() {
           if (data.scanResults) setScanResults(data.scanResults);
           if (data.marketContext) setMarketContext(data.marketContext);
           if (data.cooldownStatus) setCooldownStatus(data.cooldownStatus);
+          if (data.validationLogs) setValidationLogs(data.validationLogs);
         } catch (err) {
           console.error("[SSE] snapshot error:", err);
         }
@@ -369,6 +371,15 @@ export default function App() {
           fetch("/api/balance").then(r => r.json()).then(d => setBalance(d.total)).catch(() => {});
         } catch (err) {
           console.error("[SSE] trade event error:", err);
+        }
+      });
+
+      es.addEventListener("validation", (ev: any) => {
+        try {
+          const data = JSON.parse(ev.data);
+          setValidationLogs(prev => [data, ...prev].slice(0, 40));
+        } catch (err) {
+          console.error("[SSE] validation event error:", err);
         }
       });
 
@@ -574,8 +585,91 @@ export default function App() {
         {/* Bottom Grid: Strategies | Scanner | Activity */}
         <div className="flex-1 grid grid-cols-1 lg:grid-cols-[220px_1fr_280px] gap-[1px] bg-trading-border overflow-hidden">
 
-          {/* Left Column: Execution Strategies */}
+          {/* Left Column: Validation Log + Strategies */}
           <aside className="bg-trading-bg p-4 flex flex-col overflow-y-auto">
+            {/* ── Validation Log Widget ── */}
+            <div className="flex items-center justify-between mb-2">
+              <div className="flex items-center gap-2 text-[10px] uppercase text-trading-muted tracking-[2px]">
+                <ShieldCheck className="w-3 h-3" />
+                <span>Validation Log</span>
+                {validationLogs.length > 0 && (
+                  <span className="px-1.5 py-0.5 bg-trading-card rounded text-[8px] font-black text-trading-muted">
+                    {validationLogs.length}
+                  </span>
+                )}
+              </div>
+              <button
+                onClick={() => setValidationLogs([])}
+                className="text-[9px] text-trading-muted hover:text-trading-down transition-colors uppercase font-bold tracking-widest"
+              >
+                Clear
+              </button>
+            </div>
+
+            <div className="flex-1 min-h-[180px] max-h-[260px] overflow-y-auto mb-4 space-y-2 pr-0.5">
+              {validationLogs.length === 0 ? (
+                <div className="flex flex-col items-center justify-center h-full opacity-20 py-6">
+                  <ShieldCheck className="w-5 h-5 mb-1.5" />
+                  <div className="text-[9px] uppercase tracking-widest text-center leading-relaxed">
+                    No validations yet<br/>Bot is scanning
+                  </div>
+                </div>
+              ) : (
+                validationLogs.map((v) => {
+                  const blocked = v.finalStatus === "blocked";
+                  const skipped = v.finalStatus === "skipped";
+                  const time = new Date(v.timestamp).toLocaleTimeString();
+                  const firstBlock = v.checks.find((c: any) => c.status === "block");
+                  return (
+                    <div key={v.id} className={cn(
+                      "p-2 rounded border text-[10px] leading-tight",
+                      blocked ? "bg-trading-down/5 border-trading-down/20" :
+                      skipped ? "bg-trading-muted/5 border-trading-border/40" :
+                                "bg-trading-up/5 border-trading-up/20"
+                    )}>
+                      <div className="flex items-center justify-between mb-1">
+                        <div className="flex items-center gap-1.5">
+                          <span className={cn("w-1.5 h-1.5 rounded-full",
+                            blocked ? "bg-trading-down" : skipped ? "bg-trading-muted" : "bg-trading-up"
+                          )} />
+                          <span className="font-bold text-white">{v.symbol.replace('/USDT','')}</span>
+                          <span className={cn("font-black uppercase",
+                            v.action === 'BUY' ? "text-trading-up" : "text-trading-down"
+                          )}>{v.action}</span>
+                          <span className="text-trading-muted">{v.strategy?.replace('MOMENTUM-ARB','MOM').replace('ULTRA-SCALP','SCALP').replace('MEAN-REV','MR')}</span>
+                        </div>
+                        <span className="text-[8px] text-trading-muted font-mono">{time}</span>
+                      </div>
+                      <div className="text-trading-muted mb-1">
+                        {blocked && firstBlock ? (
+                          <span className="text-trading-down">↳ Blocked at <span className="font-bold">{firstBlock.name}</span>: {firstBlock.detail}</span>
+                        ) : skipped ? (
+                          <span className="text-trading-muted">↳ Skipped — {v.checks[v.checks.length - 1]?.detail || "Auto-pilot OFF or HOLD"}</span>
+                        ) : (
+                          <span className="text-trading-up">↳ Executed — {v.checks.filter((c: any) => c.status === "pass").length}/{v.checks.length} checks passed</span>
+                        )}
+                      </div>
+                      {/* Mini check list */}
+                      <div className="flex flex-wrap gap-1">
+                        {v.checks.slice(0, 6).map((c: any, i: number) => (
+                          <span key={i} className={cn("px-1 py-0.5 rounded text-[8px] font-bold uppercase",
+                            c.status === "pass" ? "bg-trading-up/10 text-trading-up" :
+                            c.status === "block" ? "bg-trading-down/10 text-trading-down" :
+                            "bg-trading-accent/10 text-trading-accent"
+                          )} title={c.detail}>
+                            {c.name}
+                          </span>
+                        ))}
+                        {v.checks.length > 6 && (
+                          <span className="px-1 py-0.5 rounded text-[8px] text-trading-muted">+{v.checks.length - 6}</span>
+                        )}
+                      </div>
+                    </div>
+                  );
+                })
+              )}
+            </div>
+
             <div className="flex items-center gap-3 text-[10px] uppercase text-trading-muted tracking-[2px] mb-3 after:content-[''] after:flex-1 after:h-[1px] after:bg-trading-border after:ml-3">
               Strategies
             </div>

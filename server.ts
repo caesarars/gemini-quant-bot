@@ -397,6 +397,27 @@ let scanResults: any[] = [];
 // Set of currently enabled strategies — all three active by default
 let activeStrategies = new Set<string>(["ULTRA-SCALP", "MOMENTUM-ARB", "MEAN-REV"]);
 
+// ── Validation Log ─────────────────────────────────────────────────────────────
+// Real-time audit trail of every checkAutoExecute run so the frontend can show
+// exactly which filter blocked (or passed) a signal.
+type ValidationCheck = { name: string; status: "pass" | "block" | "info"; detail: string };
+type ValidationEntry = {
+  id: string;
+  timestamp: number;
+  symbol: string;
+  strategy: string;
+  action: string;
+  finalStatus: "executed" | "blocked" | "skipped";
+  checks: ValidationCheck[];
+};
+const validationLogs: ValidationEntry[] = [];
+
+function pushValidation(entry: ValidationEntry) {
+  validationLogs.unshift(entry);
+  if (validationLogs.length > 40) validationLogs.pop();
+  broadcastSSE("validation", entry);
+}
+
 // ── Trend Filter (EMA 200 on 15m) ─────────────────────────────────────────────
 
 function getTrend(symbol: string): "UP" | "DOWN" | "NEUTRAL" {
@@ -517,6 +538,9 @@ async function getAccountBalance(): Promise<number> {
 type AnySignal = { action: "BUY" | "SELL" | "HOLD"; price: number; rsi: number; volumeRatio: number; atr: number; atrPct: number; score?: number; buyScore?: number; sellScore?: number; cross?: string | null; bbPos?: string | null };
 
 async function checkAutoExecute(symbol: string, signal: AnySignal, strategyName: string) {
+  const vid = Math.random().toString(36).slice(2, 8);
+  const checks: ValidationCheck[] = [];
+
   const settingsRow = await pool.query("SELECT is_auto_pilot FROM bot_settings WHERE id = 'bot_config'");
   const isAutoPilot = settingsRow.rows[0]?.is_auto_pilot || false;
 
@@ -524,112 +548,175 @@ async function checkAutoExecute(symbol: string, signal: AnySignal, strategyName:
   const { regime, adx } = getRegime(symbol);
   console.log(`[${strategyName}] ${symbol} → ${signal.action} RSI:${signal.rsi} trend:${trend} regime:${regime}(ADX:${adx}) autoPilot:${isAutoPilot}`);
 
-  if (!isAutoPilot || signal.action === "HOLD") return;
+  checks.push({ name: "Signal", status: "info", detail: `${signal.action}  RSI:${signal.rsi}  Score:${(signal.score ?? 0).toFixed(1)}` });
+  checks.push({ name: "Auto-Pilot", status: isAutoPilot ? "pass" : "block", detail: isAutoPilot ? "ON" : "OFF — execution disabled" });
+  checks.push({ name: "Regime", status: "info", detail: `${regime} (ADX ${adx.toFixed(1)})` });
+
+  if (!isAutoPilot || signal.action === "HOLD") {
+    pushValidation({ id: vid, timestamp: Date.now(), symbol, strategy: strategyName, action: signal.action, finalStatus: "skipped", checks });
+    return;
+  }
 
   // Regime-based strategy gating (ADX on 15m)
   if (strategyName === "MEAN-REV" && regime === "TRENDING") {
+    checks.push({ name: "Regime Gate", status: "block", detail: `MEAN-REV blocked — ADX ${adx.toFixed(1)} (strong trend)` });
+    pushValidation({ id: vid, timestamp: Date.now(), symbol, strategy: strategyName, action: signal.action, finalStatus: "blocked", checks });
     console.log(`[REGIME] ${symbol} MEAN-REV blocked — ADX ${adx} (strong trend)`);
     return;
   }
   if (strategyName === "MOMENTUM-ARB" && regime === "RANGING") {
+    checks.push({ name: "Regime Gate", status: "block", detail: `MOMENTUM-ARB blocked — ADX ${adx.toFixed(1)} (ranging market)` });
+    pushValidation({ id: vid, timestamp: Date.now(), symbol, strategy: strategyName, action: signal.action, finalStatus: "blocked", checks });
     console.log(`[REGIME] ${symbol} MOMENTUM-ARB blocked — ADX ${adx} (ranging market)`);
     return;
   }
+  checks.push({ name: "Regime Gate", status: "pass", detail: `${strategyName} allowed in ${regime} regime` });
 
-  // Trend filter — only MOMENTUM-ARB uses this (crossover strategy benefits from trend alignment)
-  // ULTRA-SCALP and MEAN-REV skip trend filter: 1m scalps are too short for 15m trend to matter
+  // Trend filter — only MOMENTUM-ARB uses this
   if (strategyName === "MOMENTUM-ARB") {
-    if (signal.action === "BUY"  && trend === "DOWN") { console.log(`[TREND] ${symbol} BUY blocked — DOWN`);    return; }
-    if (signal.action === "SELL" && trend === "UP")   { console.log(`[TREND] ${symbol} SELL blocked — UP`);     return; }
-    if (trend === "NEUTRAL")                           { console.log(`[TREND] ${symbol} blocked — NEUTRAL`);     return; }
+    if (signal.action === "BUY"  && trend === "DOWN") {
+      checks.push({ name: "Trend", status: "block", detail: `BUY blocked — trend is DOWN` });
+      pushValidation({ id: vid, timestamp: Date.now(), symbol, strategy: strategyName, action: signal.action, finalStatus: "blocked", checks });
+      console.log(`[TREND] ${symbol} BUY blocked — DOWN`); return;
+    }
+    if (signal.action === "SELL" && trend === "UP") {
+      checks.push({ name: "Trend", status: "block", detail: `SELL blocked — trend is UP` });
+      pushValidation({ id: vid, timestamp: Date.now(), symbol, strategy: strategyName, action: signal.action, finalStatus: "blocked", checks });
+      console.log(`[TREND] ${symbol} SELL blocked — UP`); return;
+    }
+    if (trend === "NEUTRAL") {
+      checks.push({ name: "Trend", status: "block", detail: `Blocked — trend is NEUTRAL` });
+      pushValidation({ id: vid, timestamp: Date.now(), symbol, strategy: strategyName, action: signal.action, finalStatus: "blocked", checks });
+      console.log(`[TREND] ${symbol} blocked — NEUTRAL`); return;
+    }
+    checks.push({ name: "Trend", status: "pass", detail: `${signal.action} aligned with ${trend} trend` });
+  } else {
+    checks.push({ name: "Trend", status: "pass", detail: `Skipped — ${strategyName} ignores trend` });
   }
 
-  // Volume thresholds: MEAN-REV 0.8× (range markets have naturally subdued volume), others 1.0×.
-  // ULTRA-SCALP recomputes ratio from closed-candle buffer for a fair comparison
-  // (live partial candle volume is always a fraction of a completed candle).
+  // Volume thresholds
   const volThreshold = strategyName === "MEAN-REV" ? 0.8 : 1.0;
   const volRatio = strategyName === "ULTRA-SCALP"
     ? parseFloat(calcVolumeRatio((candleBuffer.get(symbol) || []).map(c => c[5])).toFixed(2))
     : signal.volumeRatio ?? 1;
   if (volRatio < volThreshold) {
+    checks.push({ name: "Volume", status: "block", detail: `${volRatio.toFixed(2)}× < ${volThreshold}× threshold` });
+    pushValidation({ id: vid, timestamp: Date.now(), symbol, strategy: strategyName, action: signal.action, finalStatus: "blocked", checks });
     console.log(`[VOL] ${symbol} blocked — ${volRatio}× < ${volThreshold}× threshold`);
     return;
   }
+  checks.push({ name: "Volume", status: "pass", detail: `${volRatio.toFixed(2)}× ≥ ${volThreshold}× threshold` });
 
-  // Funding rate filter — high positive = market overleveraged long; high negative = overleveraged short
+  // Funding rate filter
   const fundingRate = fundingRateCache.get(symbol);
   if (fundingRate !== undefined) {
     if (signal.action === "BUY" && fundingRate > 0.0005) {
-      console.log(`[FUNDING] ${symbol} BUY blocked — ${(fundingRate * 100).toFixed(4)}% > 0.05% (longs paying too much)`);
-      return;
+      checks.push({ name: "Funding", status: "block", detail: `${(fundingRate * 100).toFixed(4)}% > 0.05% (longs paying too much)` });
+      pushValidation({ id: vid, timestamp: Date.now(), symbol, strategy: strategyName, action: signal.action, finalStatus: "blocked", checks });
+      console.log(`[FUNDING] ${symbol} BUY blocked — ${(fundingRate * 100).toFixed(4)}% > 0.05%`); return;
     }
     if (signal.action === "SELL" && fundingRate < -0.0003) {
-      console.log(`[FUNDING] ${symbol} SELL blocked — ${(fundingRate * 100).toFixed(4)}% < -0.03% (shorts paying too much)`);
-      return;
+      checks.push({ name: "Funding", status: "block", detail: `${(fundingRate * 100).toFixed(4)}% < -0.03% (shorts paying too much)` });
+      pushValidation({ id: vid, timestamp: Date.now(), symbol, strategy: strategyName, action: signal.action, finalStatus: "blocked", checks });
+      console.log(`[FUNDING] ${symbol} SELL blocked — ${(fundingRate * 100).toFixed(4)}% < -0.03%`); return;
     }
+    checks.push({ name: "Funding", status: "pass", detail: `${(fundingRate * 100).toFixed(4)}% within limits` });
+  } else {
+    checks.push({ name: "Funding", status: "pass", detail: `No data — skipped` });
   }
 
   // Fear & Greed filter
   if (fearGreedCache) {
     const fg = fearGreedCache.value;
-    // MEAN-REV has no trend filter so is most exposed to regime risk — apply stricter F&G gates
     if (strategyName === "MEAN-REV") {
-      if (signal.action === "BUY" && fg > 75)  { console.log(`[F&G] ${symbol} MEAN-REV BUY blocked — Extreme Greed (${fg})`);  return; }
-      if (signal.action === "SELL" && fg < 25)  { console.log(`[F&G] ${symbol} MEAN-REV SELL blocked — Extreme Fear (${fg})`);  return; }
+      if (signal.action === "BUY" && fg > 75) {
+        checks.push({ name: "Fear & Greed", status: "block", detail: `MEAN-REV BUY blocked — Extreme Greed (${fg})` });
+        pushValidation({ id: vid, timestamp: Date.now(), symbol, strategy: strategyName, action: signal.action, finalStatus: "blocked", checks });
+        console.log(`[F&G] ${symbol} MEAN-REV BUY blocked — Extreme Greed (${fg})`); return;
+      }
+      if (signal.action === "SELL" && fg < 25) {
+        checks.push({ name: "Fear & Greed", status: "block", detail: `MEAN-REV SELL blocked — Extreme Fear (${fg})` });
+        pushValidation({ id: vid, timestamp: Date.now(), symbol, strategy: strategyName, action: signal.action, finalStatus: "blocked", checks });
+        console.log(`[F&G] ${symbol} MEAN-REV SELL blocked — Extreme Fear (${fg})`); return;
+      }
     }
-    // All strategies: block at absolute extremes
-    if (signal.action === "BUY"  && fg > 85) { console.log(`[F&G] ${symbol} ${strategyName} BUY blocked — F&G ${fg} (extreme greed)`);  return; }
-    if (signal.action === "SELL" && fg < 15) { console.log(`[F&G] ${symbol} ${strategyName} SELL blocked — F&G ${fg} (extreme fear)`); return; }
+    if (signal.action === "BUY"  && fg > 85) {
+      checks.push({ name: "Fear & Greed", status: "block", detail: `BUY blocked — F&G ${fg} (extreme greed)` });
+      pushValidation({ id: vid, timestamp: Date.now(), symbol, strategy: strategyName, action: signal.action, finalStatus: "blocked", checks });
+      console.log(`[F&G] ${symbol} ${strategyName} BUY blocked — F&G ${fg}`); return;
+    }
+    if (signal.action === "SELL" && fg < 15) {
+      checks.push({ name: "Fear & Greed", status: "block", detail: `SELL blocked — F&G ${fg} (extreme fear)` });
+      pushValidation({ id: vid, timestamp: Date.now(), symbol, strategy: strategyName, action: signal.action, finalStatus: "blocked", checks });
+      console.log(`[F&G] ${symbol} ${strategyName} SELL blocked — F&G ${fg}`); return;
+    }
+    checks.push({ name: "Fear & Greed", status: "pass", detail: `F&G ${fg} — within limits` });
+  } else {
+    checks.push({ name: "Fear & Greed", status: "pass", detail: `No data — skipped` });
   }
 
   // Open Interest filter
   const oiData = openInterestCache.get(symbol);
   if (oiData) {
-    // MOMENTUM-ARB BUY on falling OI = short covering (no real demand), not a conviction rally
     if (strategyName === "MOMENTUM-ARB" && signal.action === "BUY" && oiData.oiChangePct < -2.0) {
-      console.log(`[OI] ${symbol} MOMENTUM-ARB BUY blocked — OI ${oiData.oiChangePct.toFixed(2)}% (short covering, not real demand)`);
-      return;
+      checks.push({ name: "Open Interest", status: "block", detail: `OI ${oiData.oiChangePct.toFixed(2)}% (short covering, not real demand)` });
+      pushValidation({ id: vid, timestamp: Date.now(), symbol, strategy: strategyName, action: signal.action, finalStatus: "blocked", checks });
+      console.log(`[OI] ${symbol} MOMENTUM-ARB BUY blocked — OI ${oiData.oiChangePct.toFixed(2)}%`); return;
     }
-    // MEAN-REV SELL on falling OI = long liquidation nearing exhaustion → reversal risk
     if (strategyName === "MEAN-REV" && signal.action === "SELL" && oiData.oiChangePct < -2.0) {
-      console.log(`[OI] ${symbol} MEAN-REV SELL blocked — OI ${oiData.oiChangePct.toFixed(2)}% (liquidation exhaustion near)`);
-      return;
+      checks.push({ name: "Open Interest", status: "block", detail: `OI ${oiData.oiChangePct.toFixed(2)}% (liquidation exhaustion near)` });
+      pushValidation({ id: vid, timestamp: Date.now(), symbol, strategy: strategyName, action: signal.action, finalStatus: "blocked", checks });
+      console.log(`[OI] ${symbol} MEAN-REV SELL blocked — OI ${oiData.oiChangePct.toFixed(2)}%`); return;
     }
+    checks.push({ name: "Open Interest", status: "pass", detail: `OI ${oiData.oiChangePct.toFixed(2)}% — valid` });
+  } else {
+    checks.push({ name: "Open Interest", status: "pass", detail: `No data — skipped` });
   }
 
-  // Long/Short Ratio filter — extreme one-sided positioning
+  // Long/Short Ratio filter
   const lsRatio = longShortCache.get(symbol);
   if (lsRatio !== undefined) {
     if (signal.action === "BUY"  && lsRatio > 2.5) {
-      console.log(`[LS] ${symbol} BUY blocked — L/S ${lsRatio.toFixed(2)} (market over-long, reversal risk)`);
-      return;
+      checks.push({ name: "Long/Short", status: "block", detail: `L/S ${lsRatio.toFixed(2)} (market over-long, reversal risk)` });
+      pushValidation({ id: vid, timestamp: Date.now(), symbol, strategy: strategyName, action: signal.action, finalStatus: "blocked", checks });
+      console.log(`[LS] ${symbol} BUY blocked — L/S ${lsRatio.toFixed(2)}`); return;
     }
     if (signal.action === "SELL" && lsRatio < 0.4) {
-      console.log(`[LS] ${symbol} SELL blocked — L/S ${lsRatio.toFixed(2)} (market over-short, reversal risk)`);
-      return;
+      checks.push({ name: "Long/Short", status: "block", detail: `L/S ${lsRatio.toFixed(2)} (market over-short, reversal risk)` });
+      pushValidation({ id: vid, timestamp: Date.now(), symbol, strategy: strategyName, action: signal.action, finalStatus: "blocked", checks });
+      console.log(`[LS] ${symbol} SELL blocked — L/S ${lsRatio.toFixed(2)}`); return;
     }
+    checks.push({ name: "Long/Short", status: "pass", detail: `L/S ${lsRatio.toFixed(2)} — balanced` });
+  } else {
+    checks.push({ name: "Long/Short", status: "pass", detail: `No data — skipped` });
   }
 
-  // 1. Prevent duplicate open positions for the same symbol+strategy
+  // 1. Prevent duplicate open positions
   const openPos = await pool.query(
     `SELECT id FROM trades WHERE symbol = $1 AND strategy = $2 AND status = 'OPEN' LIMIT 1`,
     [symbol, strategyName]
   );
   if (openPos.rows.length > 0) {
+    checks.push({ name: "Open Position", status: "block", detail: `Already has an open ${strategyName} position` });
+    pushValidation({ id: vid, timestamp: Date.now(), symbol, strategy: strategyName, action: signal.action, finalStatus: "blocked", checks });
     console.log(`[AUTO] ${symbol} ${strategyName} skipped — already has an open position`);
     return;
   }
+  checks.push({ name: "Open Position", status: "pass", detail: `No open ${strategyName} position` });
 
-  // 2. Cooldown per strategy — each strategy tracks its own independently so they can all fire on the same symbol.
+  // 2. Cooldown per strategy
   const cooldown = strategyName === "MOMENTUM-ARB" ? "15 minutes" : strategyName === "MEAN-REV" ? "30 minutes" : "5 minutes";
   const recent   = await pool.query(
     `SELECT id FROM trades WHERE symbol = $1 AND strategy = $2
      AND timestamp > NOW() - INTERVAL '${cooldown}' LIMIT 1`, [symbol, strategyName]
   );
   if (recent.rows.length > 0) {
+    checks.push({ name: "Cooldown", status: "block", detail: `Active (${cooldown})` });
+    pushValidation({ id: vid, timestamp: Date.now(), symbol, strategy: strategyName, action: signal.action, finalStatus: "blocked", checks });
     console.log(`[AUTO] ${symbol} ${strategyName} skipped — cooldown active (${cooldown})`);
     return;
   }
+  checks.push({ name: "Cooldown", status: "pass", detail: `None (${cooldown} window clear)` });
 
   // ATR multipliers differ per strategy
   const cfgRow   = await pool.query("SELECT leverage, risk_level, atr_sl_mult::float, atr_tp_mult::float, arb_sl_mult::float, arb_tp_mult::float, mr_sl_mult::float, mr_tp_mult::float FROM bot_settings WHERE id = 'bot_config'");
@@ -647,10 +734,6 @@ async function checkAutoExecute(symbol: string, signal: AnySignal, strategyName:
   const hasKeys   = !!(process.env.BINANCE_API_KEY && process.env.BINANCE_SECRET_KEY);
 
   // ── ATR-based position sizing ──
-  // riskAmount = balance * riskPct
-  // stopDistance = ATR * slMult  (in price units)
-  // amount = riskAmount / stopDistance  (base asset qty)
-  // notional = amount * price  (USDT)
   const balance     = await getAccountBalance();
   const riskAmount  = balance * riskPct;
   const stopDistance = (signal.atr ?? 0) * slMult;
@@ -658,23 +741,22 @@ async function checkAutoExecute(symbol: string, signal: AnySignal, strategyName:
   if (stopDistance > 0) {
     amount = riskAmount / stopDistance;
   }
-  // Fallback to fixed $25 sizing if calculation fails or below minimum notional
   const notional = amount * signal.price;
   if (notional < 10 || amount <= 0) {
     amount = parseFloat((binance as any).amountToPrecision(symbol, 25 / signal.price));
+    checks.push({ name: "Position Size", status: "info", detail: `Fallback fixed sizing (notional $${notional.toFixed(2)} < $10)` });
     console.log(`[AUTO-SIZE] ${symbol} fallback to fixed sizing (notional ${notional.toFixed(2)} < $10)`);
   } else {
     amount = parseFloat((binance as any).amountToPrecision(symbol, amount));
+    checks.push({ name: "Position Size", status: "pass", detail: `${amount.toFixed(4)} @ $${signal.price.toLocaleString()} (notional $${(amount * signal.price).toFixed(2)})` });
   }
 
   console.log(`[AUTO] ${signal.action} ${symbol} x${leverage} ATR:${signal.atrPct?.toFixed(3)}% risk:${(riskPct*100).toFixed(1)}% size:${amount.toFixed(4)} notional:$${(amount*signal.price).toFixed(2)}`);
 
   let fillPrice = signal.price;
-  // Binance USDM futures taker rate: 0.04% — used as fallback when fee not in API response
   const TAKER_RATE = 0.0004;
   let feeUsdt = parseFloat((fillPrice * amount * TAKER_RATE).toFixed(6));
 
-  // Variables hoisted so Telegram notification at the end can reference them
   const orderWarnings: string[] = [];
   let tpPrice      = 0;
   let callbackRate = 0;
@@ -691,8 +773,11 @@ async function checkAutoExecute(symbol: string, signal: AnySignal, strategyName:
       } else {
         feeUsdt = parseFloat((fillPrice * amount * TAKER_RATE).toFixed(6));
       }
+      checks.push({ name: "Binance Order", status: "pass", detail: `Market ${side} filled @ $${fillPrice.toLocaleString()} fee $${feeUsdt}` });
       console.log(`[AUTO-FUTURES] ✓ ${signal.action} ${symbol} x${leverage} fill:${fillPrice} fee:${feeUsdt} USDT`);
     } catch (e: any) {
+      checks.push({ name: "Binance Order", status: "block", detail: `Market order failed: ${(e?.message ?? "unknown").slice(0, 100)}` });
+      pushValidation({ id: vid, timestamp: Date.now(), symbol, strategy: strategyName, action: signal.action, finalStatus: "blocked", checks });
       console.error(`[AUTO-FUTURES] ✗ Market order failed [${symbol}]:`, e?.message);
       await sendTelegram(
         `❌ <b>AUTO TRADE FAILED</b>\n` +
@@ -729,10 +814,12 @@ async function checkAutoExecute(symbol: string, signal: AnySignal, strategyName:
       await binance.createOrder(symbol, "TAKE_PROFIT_MARKET", closeSide, amount, undefined, {
         stopPrice: tpPrice, reduceOnly: true, workingType: "MARK_PRICE", priceProtect: true,
       });
+      checks.push({ name: "Take Profit", status: "pass", detail: `@ $${tpPrice.toLocaleString()}` });
       console.log(`[AUTO] TP order placed @ ${tpPrice}`);
     } catch (e: any) {
       console.error(`[AUTO] TP order failed [${symbol}]:`, e?.message);
       orderWarnings.push(`TP failed: ${(e?.message ?? "").slice(0, 150)}`);
+      checks.push({ name: "Take Profit", status: "block", detail: `Failed: ${(e?.message ?? "").slice(0, 80)}` });
     }
 
     // ── Native Trailing SL ──
@@ -740,10 +827,12 @@ async function checkAutoExecute(symbol: string, signal: AnySignal, strategyName:
       await binance.createOrder(symbol, "TRAILING_STOP_MARKET", closeSide, amount, undefined, {
         callbackRate, reduceOnly: true, workingType: "MARK_PRICE",
       });
+      checks.push({ name: "Trailing SL", status: "pass", detail: `${callbackRate}% callback` });
       console.log(`[AUTO] Trailing SL placed @ ${callbackRate}% callback`);
     } catch (e: any) {
       console.error(`[AUTO] Trailing SL order failed [${symbol}]:`, e?.message);
       orderWarnings.push(`SL failed: ${(e?.message ?? "").slice(0, 150)}`);
+      checks.push({ name: "Trailing SL", status: "block", detail: `Failed: ${(e?.message ?? "").slice(0, 80)}` });
     }
   }
 
@@ -752,10 +841,11 @@ async function checkAutoExecute(symbol: string, signal: AnySignal, strategyName:
      VALUES ($1, $2, $3, $4, $5, 'OPEN', $6, $7)`,
     [symbol, signal.action, fillPrice, amount, strategyName, leverage, feeUsdt]
   );
+  checks.push({ name: "Database", status: "pass", detail: `Recorded OPEN trade @ $${fillPrice.toLocaleString()}` });
   console.log(`[AUTO] DB recorded: ${signal.action} ${symbol} @ ${fillPrice} fee:${feeUsdt} USDT [${strategyName}]`);
 
-  // Push real-time trade event to SSE clients
   broadcastSSE("trade", { symbol, action: signal.action, strategy: strategyName, price: fillPrice, amount, leverage, timestamp: Date.now() });
+  pushValidation({ id: vid, timestamp: Date.now(), symbol, strategy: strategyName, action: signal.action, finalStatus: orderWarnings.length ? "executed" : "executed", checks });
 
   if (hasKeys) {
     const icon   = orderWarnings.length ? "⚠️" : "✅";
@@ -1320,6 +1410,7 @@ async function gatherSSEData() {
     },
     cooldownStatus,
     activeStrategies: [...activeStrategies],
+    validationLogs,
     timestamp: Date.now(),
   };
 }
