@@ -93,13 +93,14 @@ function getBlockReason(
   oiChangePct?: number | null,
   lsRatio?: number | null,
   cdInfo?: { inCooldown: boolean; status?: string } | undefined,
-  regime?: 'TRENDING' | 'RANGING' | 'NEUTRAL' | undefined
+  regime?: 'TRENDING' | 'RANGING' | 'NEUTRAL' | undefined,
+  adx?: number | null
 ): { label: string; color: string } {
   if (!isAutoPilot) return { label: 'Auto-pilot OFF', color: 'text-trading-muted' };
   if (cdInfo?.status === 'OPEN') return { label: 'Position open', color: 'text-orange-400' };
   if (cdInfo?.inCooldown) return { label: 'Cooldown active', color: 'text-orange-400' };
-  if (strategyId === 'MEAN-REV' && regime === 'TRENDING') return { label: 'Trending market — mean-rev off', color: 'text-orange-400' };
-  if (strategyId === 'MOMENTUM-ARB' && regime === 'RANGING') return { label: 'Ranging market — momentum off', color: 'text-orange-400' };
+  if (strategyId === 'MEAN-REV' && regime === 'TRENDING') return { label: `Blocked: TREND regime (ADX ${adx?.toFixed(0) ?? '?'})`, color: 'text-orange-400' };
+  if (strategyId === 'MOMENTUM-ARB' && regime === 'RANGING') return { label: `Blocked: RANGE regime (ADX ${adx?.toFixed(0) ?? '?'})`, color: 'text-orange-400' };
   if (action === 'HOLD') return { label: 'No signal', color: 'text-trading-muted' };
   if (!skipTrend) {
     if (trend === 'NEUTRAL') return { label: 'Trend neutral', color: 'text-orange-400' };
@@ -852,7 +853,7 @@ export default function App() {
                     {/* ── Strategy rows ── */}
                     <div className="space-y-1.5 mb-3">
                       {coin.ultraScalp && (() => {
-                        const r = getBlockReason(coin.ultraScalp.action, coin.trend, coin.ultraScalp.volumeRatio, 1.0, isAutoPilot, true, marketContext.fundingRates[coin.symbol], marketContext.fearGreed?.value, 'ULTRA-SCALP', coin.oiChangePct, coin.lsRatio, cooldownStatus[`${coin.symbol}|ULTRA-SCALP`], coin.regime);
+                        const r = getBlockReason(coin.ultraScalp.action, coin.trend, coin.ultraScalp.volumeRatio, 1.0, isAutoPilot, true, marketContext.fundingRates[coin.symbol], marketContext.fearGreed?.value, 'ULTRA-SCALP', coin.oiChangePct, coin.lsRatio, cooldownStatus[`${coin.symbol}|ULTRA-SCALP`], coin.regime, coin.adx);
                         const active = coin.ultraScalp.action !== 'HOLD';
                         return (
                           <div className={cn("rounded overflow-hidden border",
@@ -891,7 +892,7 @@ export default function App() {
                       })()}
 
                       {coin.momentumArb && (() => {
-                        const r = getBlockReason(coin.momentumArb.action, coin.trend, coin.momentumArb.volumeRatio, 1.0, isAutoPilot, false, marketContext.fundingRates[coin.symbol], marketContext.fearGreed?.value, 'MOMENTUM-ARB', coin.oiChangePct, coin.lsRatio, cooldownStatus[`${coin.symbol}|MOMENTUM-ARB`], coin.regime);
+                        const r = getBlockReason(coin.momentumArb.action, coin.trend, coin.momentumArb.volumeRatio, 1.0, isAutoPilot, false, marketContext.fundingRates[coin.symbol], marketContext.fearGreed?.value, 'MOMENTUM-ARB', coin.oiChangePct, coin.lsRatio, cooldownStatus[`${coin.symbol}|MOMENTUM-ARB`], coin.regime, coin.adx);
                         const active = coin.momentumArb.action !== 'HOLD';
                         return (
                           <div className={cn("rounded overflow-hidden border",
@@ -933,7 +934,7 @@ export default function App() {
                       })()}
 
                       {coin.meanRev && (() => {
-                        const r = getBlockReason(coin.meanRev.action, coin.trend, coin.meanRev.volumeRatio, 0.8, isAutoPilot, true, marketContext.fundingRates[coin.symbol], marketContext.fearGreed?.value, 'MEAN-REV', coin.oiChangePct, coin.lsRatio, cooldownStatus[`${coin.symbol}|MEAN-REV`], coin.regime);
+                        const r = getBlockReason(coin.meanRev.action, coin.trend, coin.meanRev.volumeRatio, 0.8, isAutoPilot, true, marketContext.fundingRates[coin.symbol], marketContext.fearGreed?.value, 'MEAN-REV', coin.oiChangePct, coin.lsRatio, cooldownStatus[`${coin.symbol}|MEAN-REV`], coin.regime, coin.adx);
                         const active = coin.meanRev.action !== 'HOLD';
                         const bbColor = coin.meanRev.bbPos === 'LOWER' ? 'text-trading-up'
                                       : coin.meanRev.bbPos === 'UPPER' ? 'text-trading-down'
