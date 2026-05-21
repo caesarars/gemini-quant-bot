@@ -1550,6 +1550,29 @@ app.post("/api/settings", async (req, res) => {
   } catch { res.status(500).json({ error: "Failed to update settings" }); }
 });
 
+app.post("/api/test-telegram", async (req, res) => {
+  const { type = "basic" } = req.body;
+  try {
+    if (type === "signal") {
+      await sendSignalAlert(
+        "BTC/USDT",
+        { action: "BUY", price: 64250, rsi: 34, atr: 125, atrPct: 0.19, volumeRatio: 1.8, score: 4.2 } as any,
+        "ULTRA-SCALP"
+      );
+    } else {
+      await sendTelegram(
+        `<b>🧪 NEXUSBOT Test Notification</b>\n\n` +
+        `Type: <code>${type}</code>\n` +
+        `Time: <code>${new Date().toISOString()}</code>\n\n` +
+        `If you receive this, your Telegram bot integration is working correctly ✅`
+      );
+    }
+    res.json({ ok: true, message: "Telegram test message sent" });
+  } catch (e: any) {
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
 app.get("/api/ohlcv/:symbol", async (req, res) => {
   const symbol    = decodeURIComponent(req.params.symbol);
   const limit     = Math.min(parseInt((req.query.limit as string) || "200"), 1000);

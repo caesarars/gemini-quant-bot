@@ -4,6 +4,9 @@ import {
   TrendingDown,
   Activity,
   ShieldCheck,
+  Shield,
+  Send,
+  Bell,
   Bot,
   Settings,
   History,
@@ -144,6 +147,22 @@ export default function App() {
   const [logs, setLogs] = useState<{ id: string; msg: string; time: string; type: string }[]>([]);
   const [isAutoPilot, setIsAutoPilot]             = useState(false);
   const [activeStrategies, setActiveStrategies]   = useState<string[]>(["ULTRA-SCALP", "MOMENTUM-ARB"]);
+  const [riskLevel, setRiskLevel]                 = useState<number>(1);
+  const [isSettingsOpen, setIsSettingsOpen]       = useState(false);
+  const [settingsLoading, setSettingsLoading]     = useState(false);
+  const [telegramTestLoading, setTelegramTestLoading] = useState(false);
+  const [botSettings, setBotSettings] = useState({
+    leverage: 10,
+    maxSlippage: 0.5,
+    takeProfitPct: 1.5,
+    stopLossPct: 0.8,
+    atrSlMult: 1.5,
+    atrTpMult: 4.0,
+    arbSlMult: 1.0,
+    arbTpMult: 3.0,
+    mrSlMult: 1.0,
+    mrTpMult: 2.0,
+  });
   const [cooldownStatus, setCooldownStatus]       = useState<Record<string, { inCooldown: boolean; strategy: string; status?: string }>>({});
   const [loadingAi, setLoadingAi] = useState<string | null>(null);
   const [marketContext, setMarketContext] = useState<{
@@ -193,6 +212,19 @@ export default function App() {
       .then((s) => {
         if (typeof s.is_auto_pilot === "boolean") setIsAutoPilot(s.is_auto_pilot);
         if (Array.isArray(s.active_strategies)) setActiveStrategies(s.active_strategies);
+        if (typeof s.risk_level === "number") setRiskLevel(s.risk_level);
+        setBotSettings(prev => ({
+          leverage:        s.leverage ?? prev.leverage,
+          maxSlippage:     s.max_slippage ?? prev.maxSlippage,
+          takeProfitPct:   s.take_profit_pct ?? prev.takeProfitPct,
+          stopLossPct:     s.stop_loss_pct ?? prev.stopLossPct,
+          atrSlMult:       s.atr_sl_mult ?? prev.atrSlMult,
+          atrTpMult:       s.atr_tp_mult ?? prev.atrTpMult,
+          arbSlMult:       s.arb_sl_mult ?? prev.arbSlMult,
+          arbTpMult:       s.arb_tp_mult ?? prev.arbTpMult,
+          mrSlMult:        s.mr_sl_mult ?? prev.mrSlMult,
+          mrTpMult:        s.mr_tp_mult ?? prev.mrTpMult,
+        }));
       })
       .catch(() => {});
   }, []);
@@ -452,116 +484,152 @@ export default function App() {
             <LineChartIcon className="w-4 h-4 text-trading-accent" />
             <span className="text-[10px] font-bold uppercase tracking-widest">Backtest</span>
           </button>
+          <button
+            onClick={() => setIsSettingsOpen(true)}
+            className="flex items-center gap-2 p-2 px-3 bg-trading-card border border-trading-border rounded hover:border-trading-muted transition-colors"
+          >
+            <Settings className="w-4 h-4 text-trading-accent" />
+            <span className="text-[10px] font-bold uppercase tracking-widest">Settings</span>
+          </button>
         </div>
       </header>
 
-      {/* Main Grid */}
-      <main className="flex-1 grid grid-cols-1 lg:grid-cols-[240px_1fr_280px] gap-[1px] bg-trading-border overflow-hidden">
-        
-        {/* Left Column: Execution Strategies */}
-        <aside className="bg-trading-bg p-5 flex flex-col overflow-y-auto">
-          <div className="flex items-center gap-3 text-[10px] uppercase text-trading-muted tracking-[2px] mb-4 after:content-[''] after:flex-1 after:h-[1px] after:bg-trading-border after:ml-3">
-            Strategies
-          </div>
-          <div className="space-y-3">
-            {([
-              { id: 'ULTRA-SCALP',     name: 'ULTRA-SCALP v2.1', desc: '1m · RSI+MACD+BB+EMA · Vol 1.5×',             available: true },
-              { id: 'MOMENTUM-ARB',    name: 'MOMENTUM ARB',      desc: '5m · EMA9/21 crossover · Vol 1.2×',          available: true },
-              { id: 'MEAN-REV',        name: 'MEAN REVERSION',    desc: '15m · BB band touch + RSI · No trend filter', available: true },
-              { id: 'VOLATILITY-CORE', name: 'VOLATILITY CORE',   desc: 'Coming soon — BB squeeze + ATR expansion',    available: false },
-            ] as const).map(strat => {
-              const isEnabled = activeStrategies.includes(strat.id);
-              return (
-                <div
-                  key={strat.id}
-                  onClick={() => strat.available && toggleStrategy(strat.id)}
-                  className={cn(
-                    "p-3 rounded border transition-all",
-                    strat.available ? "cursor-pointer" : "cursor-not-allowed opacity-40",
-                    isEnabled
-                      ? "bg-trading-card border-trading-accent shadow-[0_0_15px_rgba(0,209,255,0.1)]"
-                      : strat.available
-                        ? "bg-trading-card/50 border-trading-border hover:border-trading-muted"
-                        : "bg-trading-card/30 border-trading-border"
-                  )}
-                >
-                  <div className="flex items-center justify-between mb-1">
-                    <div className="text-[12px] font-bold">{strat.name}</div>
-                    {strat.available && (
-                      <span className={cn(
-                        "text-[8px] font-black uppercase tracking-wider border px-1.5 py-0.5 rounded",
-                        isEnabled ? "text-trading-accent border-trading-accent/40" : "text-trading-muted border-trading-muted/40"
-                      )}>
-                        {isEnabled ? "ON" : "OFF"}
-                      </span>
-                    )}
-                  </div>
-                  <div className="text-[10px] text-trading-muted leading-tight">{strat.desc}</div>
-                </div>
-              );
-            })}
-          </div>
+      {/* Main Layout */}
+      <main className="flex-1 flex flex-col gap-[1px] bg-trading-border overflow-hidden">
 
-          <div className="mt-8 flex-1 flex flex-col">
-            <div className="flex items-center gap-3 text-[10px] uppercase text-trading-muted tracking-[2px] mb-4">
-              Performance (USDT)
-              <div className="flex-1 h-[1px] bg-trading-border" />
-              <button
-                onClick={async () => {
-                  if (!confirm("Reset semua PnL history? Data paper trading akan dihapus.")) return;
-                  await fetch("/api/pnl-history", { method: "DELETE" });
-                  setPnlData([]);
-                }}
-                className="text-[9px] px-1.5 py-0.5 bg-trading-down/10 text-trading-down border border-trading-down/30 rounded hover:bg-trading-down/20 transition-colors font-bold uppercase tracking-wider"
-              >
-                Reset
-              </button>
-            </div>
-            <div className="flex-1 min-h-[200px] bg-trading-card/30 border border-trading-border rounded p-2">
-              <ResponsiveContainer width="100%" height="100%">
-                <LineChart data={pnlData}>
-                  <CartesianGrid strokeDasharray="3 3" stroke="#1A1D23" vertical={false} />
-                  <XAxis 
-                    dataKey="time" 
-                    hide 
-                  />
-                  <YAxis 
-                    hide 
-                    domain={['dataMin - 10', 'dataMax + 10']}
-                  />
-                  <Tooltip 
-                    contentStyle={{ backgroundColor: '#111318', border: '1px solid #1A1D23', fontSize: '10px' }}
-                    labelStyle={{ color: '#666' }}
-                  />
-                  <Line 
-                    type="monotone" 
-                    dataKey="value" 
-                    stroke="#00D1FF" 
-                    strokeWidth={2} 
-                    dot={{ fill: '#00D1FF', r: 2 }}
-                    activeDot={{ r: 4, stroke: '#00FFA3' }}
-                  />
-                </LineChart>
-              </ResponsiveContainer>
-            </div>
-          </div>
-
-          <div className="mt-auto pt-6 grid grid-cols-2 gap-[1px] bg-trading-border border border-trading-border">
-            {[
-              { label: 'Win Rate', val: '72.4%', color: 'text-trading-text' },
-              { label: 'Trades/24h', val: '1,402', color: 'text-trading-text' },
-              { label: 'Profit/Day', val: '+0.84%', color: 'text-trading-up' },
-              { label: 'Drawdown', val: '-0.12%', color: 'text-trading-down' }
-            ].map(stat => (
-              <div key={stat.label} className="bg-trading-bg p-3 text-center">
-                <div className="text-[9px] text-trading-muted uppercase">{stat.label}</div>
-                <div className={cn("text-sm font-bold mt-1", stat.color)}>{stat.val}</div>
+        {/* ── Hero: Performance (USDT) Chart ── */}
+        <section className="bg-trading-panel p-5 flex-none h-[280px] flex flex-col">
+          <div className="flex items-center justify-between mb-3">
+            <div className="flex items-center gap-3">
+              <div className="flex items-center gap-3 text-[10px] uppercase text-trading-muted tracking-[2px]">
+                <TrendingUp className="w-3.5 h-3.5" />
+                Performance (USDT)
               </div>
-            ))}
+              {(() => {
+                const last = pnlData[pnlData.length - 1]?.value ?? 0;
+                const first = pnlData[0]?.value ?? 0;
+                const totalRet = first !== 0 ? ((last - first) / Math.abs(first) * 100) : 0;
+                let maxDD = 0, peak = first;
+                for (const d of pnlData) {
+                  if (d.value > peak) peak = d.value;
+                  const dd = (peak - d.value) / Math.abs(peak) * 100;
+                  if (dd > maxDD) maxDD = dd;
+                }
+                const stats = [
+                  { label: 'Equity', val: `$${last.toFixed(2)}`, color: last >= first ? 'text-trading-up' : 'text-trading-down' },
+                  { label: 'Total Return', val: `${totalRet >= 0 ? '+' : ''}${totalRet.toFixed(2)}%`, color: totalRet >= 0 ? 'text-trading-up' : 'text-trading-down' },
+                  { label: 'Max Drawdown', val: `-${maxDD.toFixed(2)}%`, color: 'text-trading-down' },
+                  { label: 'Data Points', val: `${pnlData.length}`, color: 'text-trading-text' },
+                ];
+                return (
+                  <div className="flex items-center gap-2">
+                    {stats.map(s => (
+                      <div key={s.label} className="px-2.5 py-1 bg-trading-card border border-trading-border rounded flex items-center gap-1.5">
+                        <span className="text-[9px] text-trading-muted uppercase">{s.label}</span>
+                        <span className={cn("text-[11px] font-black font-mono", s.color)}>{s.val}</span>
+                      </div>
+                    ))}
+                  </div>
+                );
+              })()}
+            </div>
+            <button
+              onClick={async () => {
+                if (!confirm("Reset semua PnL history? Data paper trading akan dihapus.")) return;
+                await fetch("/api/pnl-history", { method: "DELETE" });
+                setPnlData([]);
+              }}
+              className="text-[9px] px-2 py-1 bg-trading-down/10 text-trading-down border border-trading-down/30 rounded hover:bg-trading-down/20 transition-colors font-bold uppercase tracking-wider"
+            >
+              Reset
+            </button>
           </div>
-        </aside>
+          <div className="flex-1 min-h-0 bg-trading-card/30 border border-trading-border rounded p-2">
+            <ResponsiveContainer width="100%" height="100%">
+              <LineChart data={pnlData}>
+                <CartesianGrid strokeDasharray="3 3" stroke="#1A1D23" vertical={false} />
+                <XAxis dataKey="time" hide />
+                <YAxis hide domain={['dataMin - 10', 'dataMax + 10']} />
+                <Tooltip
+                  contentStyle={{ backgroundColor: '#111318', border: '1px solid #1A1D23', fontSize: '10px' }}
+                  labelStyle={{ color: '#666' }}
+                />
+                <Line
+                  type="monotone"
+                  dataKey="value"
+                  stroke="#00D1FF"
+                  strokeWidth={2}
+                  dot={{ fill: '#00D1FF', r: 2 }}
+                  activeDot={{ r: 4, stroke: '#00FFA3' }}
+                />
+              </LineChart>
+            </ResponsiveContainer>
+          </div>
+        </section>
 
-        {/* Middle Column: Scanner Grid */}
+        {/* Bottom Grid: Strategies | Scanner | Activity */}
+        <div className="flex-1 grid grid-cols-1 lg:grid-cols-[220px_1fr_280px] gap-[1px] bg-trading-border overflow-hidden">
+
+          {/* Left Column: Execution Strategies */}
+          <aside className="bg-trading-bg p-4 flex flex-col overflow-y-auto">
+            <div className="flex items-center gap-3 text-[10px] uppercase text-trading-muted tracking-[2px] mb-3 after:content-[''] after:flex-1 after:h-[1px] after:bg-trading-border after:ml-3">
+              Strategies
+            </div>
+            <div className="space-y-2">
+              {([
+                { id: 'ULTRA-SCALP',     name: 'ULTRA-SCALP v2.1', desc: '1m · RSI+MACD+BB+EMA · Vol 1.5×',             available: true },
+                { id: 'MOMENTUM-ARB',    name: 'MOMENTUM ARB',      desc: '5m · EMA9/21 crossover · Vol 1.2×',          available: true },
+                { id: 'MEAN-REV',        name: 'MEAN REVERSION',    desc: '15m · BB band touch + RSI · No trend filter', available: true },
+                { id: 'VOLATILITY-CORE', name: 'VOLATILITY CORE',   desc: 'Coming soon — BB squeeze + ATR expansion',    available: false },
+              ] as const).map(strat => {
+                const isEnabled = activeStrategies.includes(strat.id);
+                return (
+                  <div
+                    key={strat.id}
+                    onClick={() => strat.available && toggleStrategy(strat.id)}
+                    className={cn(
+                      "p-2.5 rounded border transition-all",
+                      strat.available ? "cursor-pointer" : "cursor-not-allowed opacity-40",
+                      isEnabled
+                        ? "bg-trading-card border-trading-accent shadow-[0_0_15px_rgba(0,209,255,0.1)]"
+                        : strat.available
+                          ? "bg-trading-card/50 border-trading-border hover:border-trading-muted"
+                          : "bg-trading-card/30 border-trading-border"
+                    )}
+                  >
+                    <div className="flex items-center justify-between mb-1">
+                      <div className="text-[11px] font-bold">{strat.name}</div>
+                      {strat.available && (
+                        <span className={cn(
+                          "text-[8px] font-black uppercase tracking-wider border px-1.5 py-0.5 rounded",
+                          isEnabled ? "text-trading-accent border-trading-accent/40" : "text-trading-muted border-trading-muted/40"
+                        )}>
+                          {isEnabled ? "ON" : "OFF"}
+                        </span>
+                      )}
+                    </div>
+                    <div className="text-[9px] text-trading-muted leading-tight">{strat.desc}</div>
+                  </div>
+                );
+              })}
+            </div>
+
+            <div className="mt-auto pt-4 grid grid-cols-2 gap-[1px] bg-trading-border border border-trading-border">
+              {[
+                { label: 'Win Rate', val: '72.4%', color: 'text-trading-text' },
+                { label: 'Trades/24h', val: '1,402', color: 'text-trading-text' },
+                { label: 'Profit/Day', val: '+0.84%', color: 'text-trading-up' },
+                { label: 'Drawdown', val: '-0.12%', color: 'text-trading-down' }
+              ].map(stat => (
+                <div key={stat.label} className="bg-trading-bg p-2.5 text-center">
+                  <div className="text-[8px] text-trading-muted uppercase">{stat.label}</div>
+                  <div className={cn("text-xs font-bold mt-0.5", stat.color)}>{stat.val}</div>
+                </div>
+              ))}
+            </div>
+          </aside>
+
+          {/* Middle Column: Scanner Grid */}
         <section className="bg-trading-panel p-5 flex flex-col overflow-y-auto overflow-x-hidden">
           <div className="flex items-center gap-3 text-[10px] uppercase text-trading-muted tracking-[2px] mb-4 after:content-[''] after:flex-1 after:h-[1px] after:bg-trading-border after:ml-3">
             Active Multi-Asset Scanner
@@ -1077,6 +1145,7 @@ export default function App() {
           </div>
         </aside>
 
+        </div>
       </main>
 
       {/* ── Open Positions Modal ── */}
@@ -1494,6 +1563,286 @@ export default function App() {
                     )}
                   </div>
                 )}
+              </div>
+            </motion.div>
+          </div>
+        )}
+      </AnimatePresence>
+
+      {/* ── Settings Modal ── */}
+      <AnimatePresence>
+        {isSettingsOpen && (
+          <div className="fixed inset-0 z-[100] flex items-center justify-center p-4 md:p-6">
+            <motion.div
+              initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }}
+              className="absolute inset-0 bg-black/70 backdrop-blur-sm"
+              onClick={() => setIsSettingsOpen(false)}
+            />
+            <motion.div
+              initial={{ opacity: 0, scale: 0.95 }} animate={{ opacity: 1, scale: 1 }} exit={{ opacity: 0, scale: 0.95 }}
+              className="relative bg-trading-bg border border-trading-border rounded-xl w-full max-w-4xl max-h-[90vh] flex flex-col z-10 overflow-hidden"
+            >
+              {/* Header */}
+              <div className="flex items-center justify-between px-6 py-4 border-b border-trading-border shrink-0">
+                <div className="flex items-center gap-3">
+                  <Settings className="w-5 h-5 text-trading-accent" />
+                  <span className="font-black tracking-tight">BOT SETTINGS</span>
+                  <span className="text-[10px] text-trading-muted font-mono uppercase">Configure Trading Parameters</span>
+                </div>
+                <button onClick={() => setIsSettingsOpen(false)} className="text-trading-muted hover:text-white transition-colors">
+                  <X className="w-5 h-5" />
+                </button>
+              </div>
+
+              {/* Body */}
+              <div className="overflow-y-auto flex-1 p-6 space-y-8">
+
+                {/* ── Global Settings ── */}
+                <div className="space-y-4">
+                  <div className="flex items-center gap-3 text-[10px] uppercase text-trading-muted tracking-[2px]">
+                    <Shield className="w-3.5 h-3.5" />
+                    Global Risk & Execution
+                    <div className="flex-1 h-[1px] bg-trading-border" />
+                  </div>
+                  <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4">
+                    {/* Risk Level */}
+                    <div className="p-4 bg-trading-card border border-trading-border rounded space-y-3">
+                      <div className="flex items-center justify-between">
+                        <label className="text-[10px] uppercase text-trading-muted font-bold tracking-wider">Risk Per Trade</label>
+                        <span className="text-[13px] font-black text-trading-accent">{riskLevel.toFixed(1)}%</span>
+                      </div>
+                      <input
+                        type="range"
+                        min="0.1"
+                        max="5"
+                        step="0.1"
+                        value={riskLevel}
+                        onChange={e => setRiskLevel(parseFloat(e.target.value))}
+                        className="w-full h-1.5 bg-trading-border rounded-full appearance-none cursor-pointer accent-trading-accent"
+                      />
+                      <p className="text-[9px] text-trading-muted leading-relaxed">
+                        Account % risked per trade. ATR sizing: <code className="text-trading-accent">size = balance × risk% / (ATR × SLmult)</code>
+                      </p>
+                    </div>
+
+                    {/* Leverage */}
+                    <div className="p-4 bg-trading-card border border-trading-border rounded space-y-3">
+                      <div className="flex items-center justify-between">
+                        <label className="text-[10px] uppercase text-trading-muted font-bold tracking-wider">Leverage</label>
+                        <span className="text-[13px] font-black text-trading-accent">{botSettings.leverage}x</span>
+                      </div>
+                      <input
+                        type="range"
+                        min="1"
+                        max="125"
+                        step="1"
+                        value={botSettings.leverage}
+                        onChange={e => setBotSettings(prev => ({ ...prev, leverage: parseInt(e.target.value) }))}
+                        className="w-full h-1.5 bg-trading-border rounded-full appearance-none cursor-pointer accent-trading-accent"
+                      />
+                      <p className="text-[9px] text-trading-muted leading-relaxed">Futures leverage applied to all auto-executed positions.</p>
+                    </div>
+
+                    {/* Max Slippage */}
+                    <div className="p-4 bg-trading-card border border-trading-border rounded space-y-3">
+                      <div className="flex items-center justify-between">
+                        <label className="text-[10px] uppercase text-trading-muted font-bold tracking-wider">Max Slippage</label>
+                        <span className="text-[13px] font-black text-trading-accent">{botSettings.maxSlippage}%</span>
+                      </div>
+                      <input
+                        type="range"
+                        min="0.05"
+                        max="2"
+                        step="0.05"
+                        value={botSettings.maxSlippage}
+                        onChange={e => setBotSettings(prev => ({ ...prev, maxSlippage: parseFloat(e.target.value) }))}
+                        className="w-full h-1.5 bg-trading-border rounded-full appearance-none cursor-pointer accent-trading-accent"
+                      />
+                      <p className="text-[9px] text-trading-muted leading-relaxed">Maximum acceptable price slippage on market orders.</p>
+                    </div>
+                  </div>
+                </div>
+
+                {/* ── Strategy Multipliers ── */}
+                <div className="space-y-4">
+                  <div className="flex items-center gap-3 text-[10px] uppercase text-trading-muted tracking-[2px]">
+                    <Activity className="w-3.5 h-3.5" />
+                    Strategy SL / TP Multipliers
+                    <div className="flex-1 h-[1px] bg-trading-border" />
+                  </div>
+                  <div className="grid grid-cols-1 sm:grid-cols-3 gap-4">
+                    {/* ULTRA-SCALP */}
+                    <div className="p-4 bg-trading-card border border-trading-border rounded space-y-3">
+                      <div className="text-[11px] font-bold text-trading-accent uppercase tracking-wider">ULTRA-SCALP</div>
+                      <div className="space-y-2">
+                        <div className="flex items-center justify-between">
+                          <span className="text-[9px] text-trading-muted uppercase">SL Mult</span>
+                          <span className="text-[11px] font-black">{botSettings.atrSlMult}x</span>
+                        </div>
+                        <input
+                          type="range" min="0.5" max="3" step="0.1"
+                          value={botSettings.atrSlMult}
+                          onChange={e => setBotSettings(prev => ({ ...prev, atrSlMult: parseFloat(e.target.value) }))}
+                          className="w-full h-1 bg-trading-border rounded-full appearance-none cursor-pointer accent-trading-accent"
+                        />
+                        <div className="flex items-center justify-between">
+                          <span className="text-[9px] text-trading-muted uppercase">TP Mult</span>
+                          <span className="text-[11px] font-black">{botSettings.atrTpMult}x</span>
+                        </div>
+                        <input
+                          type="range" min="1" max="8" step="0.1"
+                          value={botSettings.atrTpMult}
+                          onChange={e => setBotSettings(prev => ({ ...prev, atrTpMult: parseFloat(e.target.value) }))}
+                          className="w-full h-1 bg-trading-border rounded-full appearance-none cursor-pointer accent-trading-accent"
+                        />
+                      </div>
+                    </div>
+
+                    {/* MOMENTUM-ARB */}
+                    <div className="p-4 bg-trading-card border border-trading-border rounded space-y-3">
+                      <div className="text-[11px] font-bold text-trading-accent uppercase tracking-wider">MOMENTUM-ARB</div>
+                      <div className="space-y-2">
+                        <div className="flex items-center justify-between">
+                          <span className="text-[9px] text-trading-muted uppercase">SL Mult</span>
+                          <span className="text-[11px] font-black">{botSettings.arbSlMult}x</span>
+                        </div>
+                        <input
+                          type="range" min="0.5" max="3" step="0.1"
+                          value={botSettings.arbSlMult}
+                          onChange={e => setBotSettings(prev => ({ ...prev, arbSlMult: parseFloat(e.target.value) }))}
+                          className="w-full h-1 bg-trading-border rounded-full appearance-none cursor-pointer accent-trading-accent"
+                        />
+                        <div className="flex items-center justify-between">
+                          <span className="text-[9px] text-trading-muted uppercase">TP Mult</span>
+                          <span className="text-[11px] font-black">{botSettings.arbTpMult}x</span>
+                        </div>
+                        <input
+                          type="range" min="1" max="8" step="0.1"
+                          value={botSettings.arbTpMult}
+                          onChange={e => setBotSettings(prev => ({ ...prev, arbTpMult: parseFloat(e.target.value) }))}
+                          className="w-full h-1 bg-trading-border rounded-full appearance-none cursor-pointer accent-trading-accent"
+                        />
+                      </div>
+                    </div>
+
+                    {/* MEAN-REV */}
+                    <div className="p-4 bg-trading-card border border-trading-border rounded space-y-3">
+                      <div className="text-[11px] font-bold text-trading-accent uppercase tracking-wider">MEAN-REV</div>
+                      <div className="space-y-2">
+                        <div className="flex items-center justify-between">
+                          <span className="text-[9px] text-trading-muted uppercase">SL Mult</span>
+                          <span className="text-[11px] font-black">{botSettings.mrSlMult}x</span>
+                        </div>
+                        <input
+                          type="range" min="0.5" max="3" step="0.1"
+                          value={botSettings.mrSlMult}
+                          onChange={e => setBotSettings(prev => ({ ...prev, mrSlMult: parseFloat(e.target.value) }))}
+                          className="w-full h-1 bg-trading-border rounded-full appearance-none cursor-pointer accent-trading-accent"
+                        />
+                        <div className="flex items-center justify-between">
+                          <span className="text-[9px] text-trading-muted uppercase">TP Mult</span>
+                          <span className="text-[11px] font-black">{botSettings.mrTpMult}x</span>
+                        </div>
+                        <input
+                          type="range" min="1" max="8" step="0.1"
+                          value={botSettings.mrTpMult}
+                          onChange={e => setBotSettings(prev => ({ ...prev, mrTpMult: parseFloat(e.target.value) }))}
+                          className="w-full h-1 bg-trading-border rounded-full appearance-none cursor-pointer accent-trading-accent"
+                        />
+                      </div>
+                    </div>
+                  </div>
+                </div>
+
+                {/* ── Telegram Test ── */}
+                <div className="space-y-4">
+                  <div className="flex items-center gap-3 text-[10px] uppercase text-trading-muted tracking-[2px]">
+                    <Send className="w-3.5 h-3.5" />
+                    Telegram Notifications
+                    <div className="flex-1 h-[1px] bg-trading-border" />
+                  </div>
+                  <div className="flex flex-wrap gap-3">
+                    <button
+                      onClick={async () => {
+                        setTelegramTestLoading(true);
+                        try {
+                          const r = await fetch("/api/test-telegram", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ type: "basic" }) });
+                          const d = await r.json();
+                          if (d.ok) addLog("Telegram test message sent", "success");
+                          else addLog(`Telegram test failed: ${d.error}`, "error");
+                        } catch (e: any) {
+                          addLog(`Telegram test error: ${e.message}`, "error");
+                        }
+                        setTelegramTestLoading(false);
+                      }}
+                      disabled={telegramTestLoading}
+                      className="flex items-center gap-2 px-4 py-2.5 bg-trading-card border border-trading-border rounded hover:border-trading-accent transition-colors disabled:opacity-50"
+                    >
+                      <Send className="w-4 h-4 text-trading-accent" />
+                      <span className="text-[11px] font-bold uppercase tracking-wider">{telegramTestLoading ? "Sending..." : "Test Basic Message"}</span>
+                    </button>
+                    <button
+                      onClick={async () => {
+                        setTelegramTestLoading(true);
+                        try {
+                          const r = await fetch("/api/test-telegram", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ type: "signal" }) });
+                          const d = await r.json();
+                          if (d.ok) addLog("Telegram signal alert test sent", "success");
+                          else addLog(`Telegram test failed: ${d.error}`, "error");
+                        } catch (e: any) {
+                          addLog(`Telegram test error: ${e.message}`, "error");
+                        }
+                        setTelegramTestLoading(false);
+                      }}
+                      disabled={telegramTestLoading}
+                      className="flex items-center gap-2 px-4 py-2.5 bg-trading-card border border-trading-border rounded hover:border-trading-accent transition-colors disabled:opacity-50"
+                    >
+                      <Bell className="w-4 h-4 text-trading-up" />
+                      <span className="text-[11px] font-bold uppercase tracking-wider">{telegramTestLoading ? "Sending..." : "Test Signal Alert"}</span>
+                    </button>
+                  </div>
+                  <p className="text-[9px] text-trading-muted leading-relaxed max-w-xl">
+                    Sends a test message to the configured Telegram chat. Requires <code className="text-trading-accent">TELEGRAM_BOT_TOKEN</code> and <code className="text-trading-accent">TELEGRAM_CHAT_ID</code> environment variables.
+                  </p>
+                </div>
+              </div>
+
+              {/* Footer Save */}
+              <div className="px-6 py-4 border-t border-trading-border bg-trading-card/30 shrink-0 flex items-center justify-between">
+                <span className="text-[10px] text-trading-muted">Changes apply immediately to the bot engine.</span>
+                <button
+                  onClick={async () => {
+                    setSettingsLoading(true);
+                    try {
+                      await fetch("/api/settings", {
+                        method: "POST",
+                        headers: { "Content-Type": "application/json" },
+                        body: JSON.stringify({
+                          riskLevel,
+                          leverage: botSettings.leverage,
+                          maxSlippage: botSettings.maxSlippage,
+                          takeProfitPct: botSettings.takeProfitPct,
+                          stopLossPct: botSettings.stopLossPct,
+                          atrSlMult: botSettings.atrSlMult,
+                          atrTpMult: botSettings.atrTpMult,
+                          arbSlMult: botSettings.arbSlMult,
+                          arbTpMult: botSettings.arbTpMult,
+                          mrSlMult: botSettings.mrSlMult,
+                          mrTpMult: botSettings.mrTpMult,
+                        }),
+                      });
+                      addLog("Bot settings saved", "success");
+                    } catch {
+                      addLog("Failed to save settings", "error");
+                    }
+                    setSettingsLoading(false);
+                    setIsSettingsOpen(false);
+                  }}
+                  disabled={settingsLoading}
+                  className="px-6 py-2.5 bg-trading-accent text-trading-bg rounded text-[12px] font-black uppercase tracking-widest hover:bg-trading-accent/80 transition-colors disabled:opacity-50"
+                >
+                  {settingsLoading ? "Saving..." : "Save All Settings"}
+                </button>
               </div>
             </motion.div>
           </div>
