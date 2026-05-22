@@ -260,9 +260,11 @@ function calculateSignal(ohlcv: number[][]) {
   const maxScore = Math.max(buyScore, sellScore);
   const MIN_SCORE = 3.0;
 
-  // RSI veto: don't short when already oversold, don't long when already overbought
-  const action = buyScore >= MIN_SCORE && buyScore > sellScore && rsi < 60  ? "BUY"  as const
-               : sellScore >= MIN_SCORE && sellScore > buyScore && rsi > 40 ? "SELL" as const
+  // RSI veto: don't short when already oversold, don't long when already overbought.
+  // Loosened to 30/70 — strong trends keep RSI pegged 60+ for many bars and the
+  // tighter 40/60 veto was killing legitimate continuation entries.
+  const action = buyScore >= MIN_SCORE && buyScore > sellScore && rsi < 70  ? "BUY"  as const
+               : sellScore >= MIN_SCORE && sellScore > buyScore && rsi > 30 ? "SELL" as const
                : "HOLD" as const;
   return { action, rsi, price, macd, bb, ema9, ema21, volumeRatio, atr, atrPct, score: maxScore, buyScore, sellScore };
 }
@@ -300,7 +302,9 @@ function calculateMomentumSignal(ohlcv: number[][]) {
   if (bearCross && rsi >= 45 && rsi < 55) score += 0.5;
   if (volumeRatio >= 1.2) score += 0.5;             // volume spike confirmation
 
-  const MIN_SCORE = 3.0;
+  // Loosened from 3.0 → 2.5: a fresh cross (+3) alone now qualifies, instead of
+  // requiring cross + RSI/volume confirmation. Cross itself is a strong filter.
+  const MIN_SCORE = 2.5;
   let action: "BUY" | "SELL" | "HOLD" = "HOLD";
   if (bullCross && score >= MIN_SCORE) action = "BUY";
   if (bearCross && score >= MIN_SCORE) action = "SELL";
@@ -329,12 +333,13 @@ function calculateMeanRevSignal(ohlcv: number[][]) {
   // ── Weighted scoring (max 5.0) ──
   let score = 0;
 
-  // BB band touch / proximity (weight up to 2)
-  if (price <= bb.lower * 1.003) score += 2;
+  // BB band touch / proximity (weight up to 2). Proximity widened from 0.3%
+  // to 1.0% — closes rarely land within 0.3% of the band on 15m candles.
+  if (price <= bb.lower * 1.010) score += 2;
   else if (bbPos === "LOWER") score += 1.5;
   else if (price < bb.middle && distFromMid > 0.5) score += 1;
 
-  if (price >= bb.upper * 0.997) score += 2;
+  if (price >= bb.upper * 0.990) score += 2;
   else if (bbPos === "UPPER") score += 1.5;
   else if (price > bb.middle && distFromMid > 0.5) score += 1;
 
@@ -352,8 +357,8 @@ function calculateMeanRevSignal(ohlcv: number[][]) {
 
   const MIN_SCORE = 3.0;
   let action: "BUY" | "SELL" | "HOLD" = "HOLD";
-  if (price <= bb.lower * 1.003 && score >= MIN_SCORE) action = "BUY";
-  if (price >= bb.upper * 0.997 && score >= MIN_SCORE) action = "SELL";
+  if (price <= bb.lower * 1.010 && score >= MIN_SCORE) action = "BUY";
+  if (price >= bb.upper * 0.990 && score >= MIN_SCORE) action = "SELL";
 
   return { action, rsi, price, volumeRatio, atr, atrPct, bbPos, score };
 }
@@ -434,15 +439,17 @@ function getTrend(symbol: string): "UP" | "DOWN" | "NEUTRAL" {
 }
 
 // Market regime detection using ADX on 15m trend buffer.
-// TRENDING = ADX > 25 (strong trend, disable mean-rev)
-// RANGING  = ADX < 20 (weak trend, disable momentum)
-// NEUTRAL  = ADX 20-25 (all strategies allowed)
+// Crypto perps frequently sit at ADX 25-32 during normal chop — the textbook
+// >25 trending boundary mislabels too much. Widened band keeps NEUTRAL dominant.
+// TRENDING = ADX > 32 (strong trend, disable mean-rev)
+// RANGING  = ADX < 18 (weak trend, disable momentum)
+// NEUTRAL  = ADX 18-32 (all strategies allowed)
 function getRegime(symbol: string): { regime: "TRENDING" | "RANGING" | "NEUTRAL"; adx: number; plusDI: number; minusDI: number } {
   const buf = trendBuffer.get(symbol) || [];
   if (buf.length < 29) return { regime: "NEUTRAL", adx: 0, plusDI: 0, minusDI: 0 };
   const { adx, plusDI, minusDI } = calcADX(buf, 14);
-  if (adx > 25) return { regime: "TRENDING", adx, plusDI, minusDI };
-  if (adx < 20) return { regime: "RANGING", adx, plusDI, minusDI };
+  if (adx > 32) return { regime: "TRENDING", adx, plusDI, minusDI };
+  if (adx < 18) return { regime: "RANGING", adx, plusDI, minusDI };
   return { regime: "NEUTRAL", adx, plusDI, minusDI };
 }
 
@@ -585,17 +592,20 @@ async function checkAutoExecute(symbol: string, signal: AnySignal, strategyName:
       console.log(`[TREND] ${symbol} SELL blocked — UP`); return;
     }
     if (trend === "NEUTRAL") {
-      checks.push({ name: "Trend", status: "block", detail: `Blocked — trend is NEUTRAL` });
-      pushValidation({ id: vid, timestamp: Date.now(), symbol, strategy: strategyName, action: signal.action, finalStatus: "blocked", checks });
-      console.log(`[TREND] ${symbol} blocked — NEUTRAL`); return;
+      checks.push({ name: "Trend", status: "pass", detail: `Trend NEUTRAL — allowed (score gate still applies)` });
+    } else {
+      checks.push({ name: "Trend", status: "pass", detail: `${signal.action} aligned with ${trend} trend` });
     }
-    checks.push({ name: "Trend", status: "pass", detail: `${signal.action} aligned with ${trend} trend` });
   } else {
     checks.push({ name: "Trend", status: "pass", detail: `Skipped — ${strategyName} ignores trend` });
   }
 
-  // Volume thresholds
-  const volThreshold = strategyName === "MEAN-REV" ? 0.8 : 1.0;
+  // Volume thresholds — loosened to match observed crypto perp volume variance.
+  // ULTRA-SCALP fires on 1m where vol is bursty; MEAN-REV is intentionally
+  // permissive because mean-reversion setups appear in quiet candles.
+  const volThreshold = strategyName === "MEAN-REV"     ? 0.6
+                     : strategyName === "MOMENTUM-ARB" ? 0.8
+                     :                                   0.7;
   const volRatio = strategyName === "ULTRA-SCALP"
     ? parseFloat(calcVolumeRatio((candleBuffer.get(symbol) || []).map(c => c[5])).toFixed(2))
     : signal.volumeRatio ?? 1;
@@ -615,10 +625,10 @@ async function checkAutoExecute(symbol: string, signal: AnySignal, strategyName:
       pushValidation({ id: vid, timestamp: Date.now(), symbol, strategy: strategyName, action: signal.action, finalStatus: "blocked", checks });
       console.log(`[FUNDING] ${symbol} BUY blocked — ${(fundingRate * 100).toFixed(4)}% > 0.05%`); return;
     }
-    if (signal.action === "SELL" && fundingRate < -0.0003) {
-      checks.push({ name: "Funding", status: "block", detail: `${(fundingRate * 100).toFixed(4)}% < -0.03% (shorts paying too much)` });
+    if (signal.action === "SELL" && fundingRate < -0.0006) {
+      checks.push({ name: "Funding", status: "block", detail: `${(fundingRate * 100).toFixed(4)}% < -0.06% (shorts paying too much)` });
       pushValidation({ id: vid, timestamp: Date.now(), symbol, strategy: strategyName, action: signal.action, finalStatus: "blocked", checks });
-      console.log(`[FUNDING] ${symbol} SELL blocked — ${(fundingRate * 100).toFixed(4)}% < -0.03%`); return;
+      console.log(`[FUNDING] ${symbol} SELL blocked — ${(fundingRate * 100).toFixed(4)}% < -0.06%`); return;
     }
     checks.push({ name: "Funding", status: "pass", detail: `${(fundingRate * 100).toFixed(4)}% within limits` });
   } else {
@@ -658,12 +668,12 @@ async function checkAutoExecute(symbol: string, signal: AnySignal, strategyName:
   // Open Interest filter
   const oiData = openInterestCache.get(symbol);
   if (oiData) {
-    if (strategyName === "MOMENTUM-ARB" && signal.action === "BUY" && oiData.oiChangePct < -2.0) {
+    if (strategyName === "MOMENTUM-ARB" && signal.action === "BUY" && oiData.oiChangePct < -4.0) {
       checks.push({ name: "Open Interest", status: "block", detail: `OI ${oiData.oiChangePct.toFixed(2)}% (short covering, not real demand)` });
       pushValidation({ id: vid, timestamp: Date.now(), symbol, strategy: strategyName, action: signal.action, finalStatus: "blocked", checks });
       console.log(`[OI] ${symbol} MOMENTUM-ARB BUY blocked — OI ${oiData.oiChangePct.toFixed(2)}%`); return;
     }
-    if (strategyName === "MEAN-REV" && signal.action === "SELL" && oiData.oiChangePct < -2.0) {
+    if (strategyName === "MEAN-REV" && signal.action === "SELL" && oiData.oiChangePct < -4.0) {
       checks.push({ name: "Open Interest", status: "block", detail: `OI ${oiData.oiChangePct.toFixed(2)}% (liquidation exhaustion near)` });
       pushValidation({ id: vid, timestamp: Date.now(), symbol, strategy: strategyName, action: signal.action, finalStatus: "blocked", checks });
       console.log(`[OI] ${symbol} MEAN-REV SELL blocked — OI ${oiData.oiChangePct.toFixed(2)}%`); return;
@@ -1823,15 +1833,17 @@ app.get("/api/diagnose", async (_req, res) => {
       if (strategyName === "MOMENTUM-ARB") {
         if (signal.action === "BUY"  && trend === "DOWN")    return `trend DOWN (need UP)`;
         if (signal.action === "SELL" && trend === "UP")      return `trend UP (need DOWN)`;
-        if (trend === "NEUTRAL")                             return `trend NEUTRAL`;
+        // NEUTRAL trend is no longer a block — falls through to score gate.
       }
-      const volThreshold = strategyName === "MEAN-REV" ? 0.8 : strategyName === "ULTRA-SCALP" ? 0.5 : 1.0;
+      const volThreshold = strategyName === "MEAN-REV"     ? 0.6
+                         : strategyName === "MOMENTUM-ARB" ? 0.8
+                         :                                   0.7;
       if ((signal.volumeRatio ?? 1) < volThreshold)
         return `vol ${(signal.volumeRatio ?? 0).toFixed(2)}× < ${volThreshold}×`;
       const fr = fundingRateCache.get(symbol);
       if (fr !== undefined) {
         if (signal.action === "BUY"  && fr >  0.0005) return `funding +${(fr*100).toFixed(4)}% > 0.05%`;
-        if (signal.action === "SELL" && fr < -0.0003) return `funding ${(fr*100).toFixed(4)}% < -0.03%`;
+        if (signal.action === "SELL" && fr < -0.0006) return `funding ${(fr*100).toFixed(4)}% < -0.06%`;
       }
       if (fearGreedCache) {
         const fg = fearGreedCache.value;
@@ -1842,9 +1854,9 @@ app.get("/api/diagnose", async (_req, res) => {
       }
       const oi = openInterestCache.get(symbol);
       if (oi) {
-        if (strategyName === "MOMENTUM-ARB" && signal.action === "BUY"  && oi.oiChangePct < -2)
+        if (strategyName === "MOMENTUM-ARB" && signal.action === "BUY"  && oi.oiChangePct < -4)
           return `OI ${oi.oiChangePct.toFixed(2)}% falling (MOMENTUM-ARB BUY)`;
-        if (strategyName === "MEAN-REV"     && signal.action === "SELL" && oi.oiChangePct < -2)
+        if (strategyName === "MEAN-REV"     && signal.action === "SELL" && oi.oiChangePct < -4)
           return `OI ${oi.oiChangePct.toFixed(2)}% falling (MEAN-REV SELL)`;
       }
       const ls = longShortCache.get(symbol);
@@ -1852,8 +1864,9 @@ app.get("/api/diagnose", async (_req, res) => {
         if (signal.action === "BUY"  && ls > 2.5) return `L/S ${ls.toFixed(2)} > 2.5 (over-long)`;
         if (signal.action === "SELL" && ls < 0.4) return `L/S ${ls.toFixed(2)} < 0.4 (over-short)`;
       }
-      // Score threshold check
-      if ((signal.score ?? 0) < 3.0) return `score ${(signal.score ?? 0).toFixed(1)} < 3.0 (weak signal)`;
+      // Score threshold check — MOMENTUM-ARB now uses 2.5 (loosened from 3.0)
+      const minScore = strategyName === "MOMENTUM-ARB" ? 2.5 : 3.0;
+      if ((signal.score ?? 0) < minScore) return `score ${(signal.score ?? 0).toFixed(1)} < ${minScore.toFixed(1)} (weak signal)`;
       return "PASS ✓ (cooldown not checked here — see /api/cooldown-status)";
     }
 
@@ -1917,6 +1930,259 @@ app.get("/api/diagnose", async (_req, res) => {
     }));
 
     res.json({ isAutoPilot, fearGreed: fearGreedCache, timestamp: new Date().toISOString(), results });
+  } catch (err: any) {
+    res.status(500).json({ error: err?.message });
+  }
+});
+
+// ── Threshold Analysis ────────────────────────────────────────────────────────
+//
+// Replays each indicator (ADX, volume ratio, RSI, BB proximity) at every historical
+// candle position in the `ohlcv` table and reports percentile distributions so the
+// user can see whether the current filter thresholds sit in a sensible zone or are
+// clipping too many candles.
+//
+// Usage:
+//   GET /api/threshold-analysis              → 72h window, all symbols
+//   GET /api/threshold-analysis?hours=168    → 7d window
+//   GET /api/threshold-analysis?symbol=BTC/USDT
+//   GET /api/threshold-analysis?summary=1    → just the recommendations, no raw percentiles
+//
+// Needs the bot to have been running long enough to populate ohlcv. The 15m series
+// is the binding constraint — you want at least ~100 15m candles (~25h) for ADX
+// percentiles to be meaningful.
+
+function percentile(arr: number[], p: number): number {
+  if (!arr.length) return 0;
+  const sorted = [...arr].sort((a, b) => a - b);
+  const idx = Math.min(sorted.length - 1, Math.floor((p / 100) * sorted.length));
+  return parseFloat(sorted[idx].toFixed(4));
+}
+
+function pctOf(arr: number[], pred: (v: number) => boolean): number {
+  if (!arr.length) return 0;
+  return parseFloat((arr.filter(pred).length / arr.length * 100).toFixed(1));
+}
+
+app.get("/api/threshold-analysis", async (req, res) => {
+  try {
+    const hours       = Math.min(720, Math.max(6, parseInt(String(req.query.hours ?? "72"), 10) || 72));
+    const symbolParam = req.query.symbol ? String(req.query.symbol) : null;
+    const summaryOnly = req.query.summary === "1" || req.query.summary === "true";
+    const cutoff      = Date.now() - hours * 3600 * 1000;
+    const targets     = symbolParam ? [symbolParam] : SYMBOLS;
+
+    // Current thresholds — kept here so the response self-documents what it's measuring against.
+    const CURRENT = {
+      adx: { trending: 32, ranging: 18 },
+      volume: { "1m": 0.7, "5m": 0.8, "15m": 0.6 },   // ULTRA-SCALP / MOMENTUM-ARB / MEAN-REV
+      bbProximityPct: 1.0,                              // MEAN-REV — 1.0% from band counts as "touch"
+      rsiVeto: { buy: 70, sell: 30 },                   // ULTRA-SCALP
+    };
+
+    const perSymbol: Record<string, any> = {};
+
+    for (const symbol of targets) {
+      const rows = await pool.query(
+        `SELECT timeframe, timestamp, open, high, low, close, volume
+         FROM ohlcv WHERE symbol = $1 AND timestamp >= $2
+         ORDER BY timeframe, timestamp ASC`,
+        [symbol, cutoff]
+      );
+      const byTf: Record<string, number[][]> = { "1m": [], "5m": [], "15m": [] };
+      for (const r of rows.rows) {
+        const tf = r.timeframe as string;
+        if (!byTf[tf]) continue;
+        byTf[tf].push([Number(r.timestamp), parseFloat(r.open), parseFloat(r.high), parseFloat(r.low), parseFloat(r.close), parseFloat(r.volume)]);
+      }
+      const c1m  = byTf["1m"];
+      const c5m  = byTf["5m"];
+      const c15m = byTf["15m"];
+
+      // ADX series over 15m (one ADX value per candle position once we have enough history)
+      const adxSeries: number[] = [];
+      for (let i = 30; i <= c15m.length; i++) {
+        const { adx } = calcADX(c15m.slice(0, i), 14);
+        if (adx > 0) adxSeries.push(adx);
+      }
+
+      // Rolling volume ratio per timeframe
+      const volSeriesFor = (candles: number[][]) => {
+        const vols = candles.map(c => c[5]);
+        const out: number[] = [];
+        for (let i = 21; i <= vols.length; i++) out.push(calcVolumeRatio(vols.slice(0, i)));
+        return out;
+      };
+      const vol1m  = volSeriesFor(c1m);
+      const vol5m  = volSeriesFor(c5m);
+      const vol15m = volSeriesFor(c15m);
+
+      // BB proximity over 15m — distance from each band as a % of band price.
+      // 0 = price is at or beyond the band; higher = farther into the channel.
+      const bbLowerDistPct: number[] = [];
+      const bbUpperDistPct: number[] = [];
+      for (let i = 20; i <= c15m.length; i++) {
+        const closes = c15m.slice(0, i).map(c => c[4]);
+        const bb     = calcBollingerBands(closes, 20, 2);
+        const price  = closes[closes.length - 1];
+        if (!isFinite(bb.lower) || !isFinite(bb.upper)) continue;
+        bbLowerDistPct.push(price <= bb.lower ? 0 : (price - bb.lower) / bb.lower * 100);
+        bbUpperDistPct.push(price >= bb.upper ? 0 : (bb.upper - price) / bb.upper * 100);
+      }
+
+      // RSI over 1m (ULTRA-SCALP timeframe) for veto-threshold tuning
+      const closes1m = c1m.map(c => c[4]);
+      const rsi1mSeries: number[] = [];
+      for (let i = 15; i <= closes1m.length; i++) rsi1mSeries.push(calcRSI(closes1m.slice(0, i)));
+
+      const adxStats = {
+        p10: percentile(adxSeries, 10),
+        p25: percentile(adxSeries, 25),
+        p50: percentile(adxSeries, 50),
+        p75: percentile(adxSeries, 75),
+        p90: percentile(adxSeries, 90),
+        currentTrending: CURRENT.adx.trending,
+        currentRanging:  CURRENT.adx.ranging,
+        pctTrending: pctOf(adxSeries, v => v > CURRENT.adx.trending),
+        pctRanging:  pctOf(adxSeries, v => v < CURRENT.adx.ranging),
+        pctNeutral:  pctOf(adxSeries, v => v >= CURRENT.adx.ranging && v <= CURRENT.adx.trending),
+      };
+
+      const volStats = (series: number[], tf: "1m" | "5m" | "15m") => ({
+        p20: percentile(series, 20),
+        p50: percentile(series, 50),
+        p80: percentile(series, 80),
+        currentThreshold: CURRENT.volume[tf],
+        pctBlocked: pctOf(series, v => v < CURRENT.volume[tf]),
+      });
+
+      const bbStats = {
+        lowerP10: percentile(bbLowerDistPct, 10),
+        lowerP25: percentile(bbLowerDistPct, 25),
+        upperP10: percentile(bbUpperDistPct, 10),
+        upperP25: percentile(bbUpperDistPct, 25),
+        currentThresholdPct: CURRENT.bbProximityPct,
+        pctTriggeringLower: pctOf(bbLowerDistPct, v => v <= CURRENT.bbProximityPct),
+        pctTriggeringUpper: pctOf(bbUpperDistPct, v => v <= CURRENT.bbProximityPct),
+      };
+
+      const rsiStats = {
+        p10: percentile(rsi1mSeries, 10),
+        p25: percentile(rsi1mSeries, 25),
+        p50: percentile(rsi1mSeries, 50),
+        p75: percentile(rsi1mSeries, 75),
+        p90: percentile(rsi1mSeries, 90),
+        currentBuyVeto:  CURRENT.rsiVeto.buy,
+        currentSellVeto: CURRENT.rsiVeto.sell,
+        pctVetoedBuy:  pctOf(rsi1mSeries, v => v >= CURRENT.rsiVeto.buy),
+        pctVetoedSell: pctOf(rsi1mSeries, v => v <= CURRENT.rsiVeto.sell),
+      };
+
+      // ── Recommendations — heuristic rules over the distributions ──
+      // Targets:
+      //   ADX: NEUTRAL band should cover ~50-70% (balanced regime gate)
+      //   Volume: filter should block ~20-35% of candles (selective but not strangling)
+      //   BB:    ~10-25% of candles should be within tolerance (MEAN-REV is selective)
+      //   RSI:   each veto should clip ~5-15% of candles
+      const recs: { filter: string; current: string; suggest: string; reason: string }[] = [];
+
+      if (adxSeries.length >= 50) {
+        if (adxStats.pctNeutral < 45) {
+          const target = { trending: percentile(adxSeries, 75), ranging: percentile(adxSeries, 25) };
+          recs.push({
+            filter: "ADX regime",
+            current: `TRENDING>${CURRENT.adx.trending}, RANGING<${CURRENT.adx.ranging} (neutral covers ${adxStats.pctNeutral}%)`,
+            suggest: `TRENDING>${target.trending.toFixed(1)}, RANGING<${target.ranging.toFixed(1)}`,
+            reason:  `Neutral band too narrow — only ${adxStats.pctNeutral}% of candles fall through. Widen to p25/p75 to get ~50%.`,
+          });
+        } else if (adxStats.pctNeutral > 80) {
+          recs.push({
+            filter: "ADX regime",
+            current: `TRENDING>${CURRENT.adx.trending}, RANGING<${CURRENT.adx.ranging} (neutral covers ${adxStats.pctNeutral}%)`,
+            suggest: `TRENDING>${percentile(adxSeries, 70).toFixed(1)}, RANGING<${percentile(adxSeries, 30).toFixed(1)}`,
+            reason:  `Regime gate barely activates (${adxStats.pctNeutral}% always neutral) — tighten to actually filter.`,
+          });
+        }
+      }
+
+      for (const [tf, stats] of Object.entries({ "1m": volStats(vol1m, "1m"), "5m": volStats(vol5m, "5m"), "15m": volStats(vol15m, "15m") })) {
+        if (stats.pctBlocked > 50) {
+          recs.push({
+            filter: `Volume (${tf})`,
+            current: `${stats.currentThreshold}× (blocks ${stats.pctBlocked}%)`,
+            suggest: `${percentile(tf === "1m" ? vol1m : tf === "5m" ? vol5m : vol15m, 25).toFixed(2)}×`,
+            reason:  `Current threshold rejects over half of candles — lower to p25 of observed distribution.`,
+          });
+        } else if (stats.pctBlocked < 10) {
+          recs.push({
+            filter: `Volume (${tf})`,
+            current: `${stats.currentThreshold}× (blocks ${stats.pctBlocked}%)`,
+            suggest: `${percentile(tf === "1m" ? vol1m : tf === "5m" ? vol5m : vol15m, 30).toFixed(2)}×`,
+            reason:  `Filter rarely engages — bump up to maintain volume selectivity.`,
+          });
+        }
+      }
+
+      const bbTrigger = (bbStats.pctTriggeringLower + bbStats.pctTriggeringUpper) / 2;
+      if (bbTrigger < 5 && bbLowerDistPct.length >= 50) {
+        recs.push({
+          filter: "MEAN-REV BB proximity",
+          current: `±${CURRENT.bbProximityPct}% (triggers on ~${bbTrigger.toFixed(1)}% of candles)`,
+          suggest: `±${percentile([...bbLowerDistPct, ...bbUpperDistPct], 15).toFixed(2)}%`,
+          reason:  `MEAN-REV almost never sees a band touch — widen tolerance to p15 of observed distance.`,
+        });
+      } else if (bbTrigger > 40 && bbLowerDistPct.length >= 50) {
+        recs.push({
+          filter: "MEAN-REV BB proximity",
+          current: `±${CURRENT.bbProximityPct}% (triggers on ~${bbTrigger.toFixed(1)}% of candles)`,
+          suggest: `±${percentile([...bbLowerDistPct, ...bbUpperDistPct], 15).toFixed(2)}%`,
+          reason:  `Tolerance too loose — too many candles count as "at the band". Tighten to p15.`,
+        });
+      }
+
+      if (rsi1mSeries.length >= 100) {
+        if (rsiStats.pctVetoedBuy < 3) {
+          recs.push({
+            filter: "ULTRA-SCALP RSI BUY veto",
+            current: `RSI ≥ ${CURRENT.rsiVeto.buy} blocks BUY (clips ${rsiStats.pctVetoedBuy}%)`,
+            suggest: `RSI ≥ ${percentile(rsi1mSeries, 90).toFixed(0)}`,
+            reason:  `Veto barely fires — tighten to p90 RSI so it actually catches overbought conditions.`,
+          });
+        } else if (rsiStats.pctVetoedBuy > 25) {
+          recs.push({
+            filter: "ULTRA-SCALP RSI BUY veto",
+            current: `RSI ≥ ${CURRENT.rsiVeto.buy} blocks BUY (clips ${rsiStats.pctVetoedBuy}%)`,
+            suggest: `RSI ≥ ${percentile(rsi1mSeries, 90).toFixed(0)}`,
+            reason:  `Veto too aggressive — loosen to p90 to stop killing trend-continuation BUYs.`,
+          });
+        }
+      }
+
+      perSymbol[symbol] = summaryOnly
+        ? { samples: { "1m": c1m.length, "5m": c5m.length, "15m": c15m.length }, recommendations: recs }
+        : {
+            samples:    { "1m": c1m.length, "5m": c5m.length, "15m": c15m.length },
+            adx_15m:    adxStats,
+            volume_1m:  volStats(vol1m,  "1m"),
+            volume_5m:  volStats(vol5m,  "5m"),
+            volume_15m: volStats(vol15m, "15m"),
+            bb_proximity_15m: bbStats,
+            rsi_1m:     rsiStats,
+            recommendations: recs,
+          };
+    }
+
+    res.json({
+      windowHours: hours,
+      timestamp: new Date().toISOString(),
+      currentThresholds: CURRENT,
+      symbols: perSymbol,
+      notes: [
+        "Targets: ADX neutral band 50-70% of candles; volume filter blocks 20-35%; BB triggers on 10-25%; RSI veto clips 5-15%.",
+        "Recommendations only appear when current threshold is outside healthy band. Empty recs = filter is well-tuned for this symbol.",
+        "Tuning is a guide, not a mandate — combine with what the bot's actual win rate is doing.",
+      ],
+    });
   } catch (err: any) {
     res.status(500).json({ error: err?.message });
   }
