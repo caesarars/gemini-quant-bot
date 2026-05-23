@@ -58,6 +58,7 @@ async function runMigrations() {
   await pool.query(`UPDATE bot_settings SET active_strategies = array_append(active_strategies, 'MEAN-REV') WHERE id = 'bot_config' AND NOT ('MEAN-REV' = ANY(COALESCE(active_strategies, '{}')))`);
   await pool.query(`ALTER TABLE bot_settings ADD COLUMN IF NOT EXISTS telegram_bot_token VARCHAR(255) DEFAULT NULL`);
   await pool.query(`ALTER TABLE bot_settings ADD COLUMN IF NOT EXISTS telegram_chat_id   VARCHAR(50)  DEFAULT NULL`);
+  await pool.query(`ALTER TABLE bot_settings ADD COLUMN IF NOT EXISTS taker_rate NUMERIC(8,6) DEFAULT 0.0004`);
 
 }
 
@@ -401,6 +402,8 @@ const lastMeanRevAttempt    = new Map<string, number>(SYMBOLS.map(s => [s, 0]));
 let scanResults: any[] = [];
 // Set of currently enabled strategies — all three active by default
 let activeStrategies = new Set<string>(["ULTRA-SCALP", "MOMENTUM-ARB", "MEAN-REV"]);
+// Taker fee rate — configurable via Settings, persisted in DB
+let takerRate = 0.0004;
 
 // ── Validation Log ─────────────────────────────────────────────────────────────
 // Real-time audit trail of every checkAutoExecute run so the frontend can show
@@ -459,9 +462,8 @@ function safeTpPrice(
   isLong: boolean, fillPrice: number, amount: number,
   rawTpPct: number, entryFeeUsdt: number, symbol: string
 ): number {
-  const TAKER_RATE = 0.0004;
   let tp = isLong ? fillPrice * (1 + rawTpPct) : fillPrice * (1 - rawTpPct);
-  const exitFee  = tp * amount * TAKER_RATE;
+  const exitFee  = tp * amount * takerRate;
   const totalFee = entryFeeUsdt + exitFee;
   const profit   = Math.abs(tp - fillPrice) * amount;
   if (profit < totalFee) {
@@ -797,8 +799,7 @@ async function checkAutoExecute(symbol: string, signal: AnySignal, strategyName:
   console.log(`[AUTO] ${signal.action} ${symbol} x${leverage} ATR:${signal.atrPct?.toFixed(3)}% risk:${(riskPct*100).toFixed(1)}% size:${amount.toFixed(4)} notional:$${(amount*signal.price).toFixed(2)}`);
 
   let fillPrice = signal.price;
-  const TAKER_RATE = 0.0004;
-  let feeUsdt = parseFloat((fillPrice * amount * TAKER_RATE).toFixed(6));
+  let feeUsdt = parseFloat((fillPrice * amount * takerRate).toFixed(6));
 
   const orderWarnings: string[] = [];
   let tpPrice      = 0;
@@ -814,7 +815,7 @@ async function checkAutoExecute(symbol: string, signal: AnySignal, strategyName:
       if (orderFee?.cost && orderFee?.currency === "USDT") {
         feeUsdt = parseFloat(Math.abs(orderFee.cost).toFixed(6));
       } else {
-        feeUsdt = parseFloat((fillPrice * amount * TAKER_RATE).toFixed(6));
+        feeUsdt = parseFloat((fillPrice * amount * takerRate).toFixed(6));
       }
       checks.push({ name: "Binance Order", status: "pass", detail: `Market ${side} filled @ $${fillPrice.toLocaleString()} fee $${feeUsdt}` });
       console.log(`[AUTO-FUTURES] ✓ ${signal.action} ${symbol} x${leverage} fill:${fillPrice} fee:${feeUsdt} USDT`);
@@ -1545,17 +1546,25 @@ app.get("/api/open-positions", async (_req, res) => {
       const lev          = trade.leverage || 1;
       const priceDelta   = isLong ? currentPrice - trade.entry_price : trade.entry_price - currentPrice;
       const grossPnl     = priceDelta * trade.amount;
+      const feeUsdt      = trade.fee_usdt ?? 0;
+      // Exit fee estimated at current mark/live price
+      const exitFeeEst   = currentPrice * trade.amount * takerRate;
+      const totalFeeEst  = parseFloat((feeUsdt + exitFeeEst).toFixed(6));
+      // Break-even: entry price adjusted so (price - entry) * amount = totalFee
+      const feePerUnit   = trade.amount > 0 ? totalFeeEst / trade.amount : 0;
+      const breakEvenPrice = parseFloat((isLong ? trade.entry_price + feePerUnit : trade.entry_price - feePerUnit).toFixed(4));
       // ROE% — matches Binance "Unrealized PnL%" which is leveraged return on margin
       const pnlPct       = (priceDelta / trade.entry_price) * 100 * lev;
-      const feeUsdt      = trade.fee_usdt ?? 0;
       return {
         ...trade,
-        side:          isLong ? "LONG" : "SHORT",
-        current_price: parseFloat(currentPrice.toFixed(4)),
-        pnl_usdt:      parseFloat(grossPnl.toFixed(4)),
-        net_pnl_usdt:  parseFloat((grossPnl - feeUsdt).toFixed(4)),
-        pnl_pct:       parseFloat(pnlPct.toFixed(3)),
-        fee_usdt:      parseFloat(feeUsdt.toFixed(6)),
+        side:            isLong ? "LONG" : "SHORT",
+        current_price:   parseFloat(currentPrice.toFixed(4)),
+        pnl_usdt:        parseFloat(grossPnl.toFixed(4)),
+        net_pnl_usdt:    parseFloat((grossPnl - totalFeeEst).toFixed(4)),
+        pnl_pct:         parseFloat(pnlPct.toFixed(3)),
+        fee_usdt:        parseFloat(feeUsdt.toFixed(6)),
+        total_fee_est:   totalFeeEst,
+        break_even_price: breakEvenPrice,
         using_mark_price: !!markPrice,
       };
     });
@@ -1677,7 +1686,7 @@ app.get("/api/settings", async (req, res) => {
 app.post("/api/settings", async (req, res) => {
   const { isAutoPilot, riskLevel, maxSlippage, takeProfitPct, stopLossPct, leverage,
           atrSlMult, atrTpMult, arbSlMult, arbTpMult, mrSlMult, mrTpMult, activeStrategiesVal,
-          telegramBotToken, telegramChatId } = req.body;
+          telegramBotToken, telegramChatId, takerRateVal } = req.body;
   const strategiesParam = Array.isArray(activeStrategiesVal) ? activeStrategiesVal : null;
   try {
     const r = await pool.query(
@@ -1696,18 +1705,24 @@ app.post("/api/settings", async (req, res) => {
            mr_sl_mult        = COALESCE($12, mr_sl_mult),
            mr_tp_mult        = COALESCE($13, mr_tp_mult),
            telegram_bot_token = NULLIF(COALESCE($14, telegram_bot_token), ''),
-           telegram_chat_id   = NULLIF(COALESCE($15, telegram_chat_id), '')
+           telegram_chat_id   = NULLIF(COALESCE($15, telegram_chat_id), ''),
+           taker_rate         = COALESCE($16, taker_rate)
        WHERE id = 'bot_config' RETURNING *`,
       [isAutoPilot ?? null, riskLevel ?? null, maxSlippage ?? null,
        takeProfitPct ?? null, stopLossPct ?? null, leverage ?? null,
        atrSlMult ?? null, atrTpMult ?? null, arbSlMult ?? null, arbTpMult ?? null,
        strategiesParam, mrSlMult ?? null, mrTpMult ?? null,
-       telegramBotToken ?? null, telegramChatId ?? null]
+       telegramBotToken ?? null, telegramChatId ?? null,
+       takerRateVal != null ? parseFloat(takerRateVal) : null]
     );
-    // Sync in-memory Set so WebSocket handlers react immediately
+    // Sync in-memory values so they take effect immediately without restart
     if (strategiesParam) {
       activeStrategies = new Set(strategiesParam);
       console.log(`[STRATEGY] Active: ${[...activeStrategies].join(", ")}`);
+    }
+    if (takerRateVal != null) {
+      takerRate = parseFloat(takerRateVal);
+      console.log(`[SETTINGS] Taker rate updated to ${(takerRate * 100).toFixed(4)}%`);
     }
     res.json(r.rows[0]);
   } catch { res.status(500).json({ error: "Failed to update settings" }); }
@@ -2647,10 +2662,11 @@ async function startServer() {
   await runMigrations();
   console.log("Migrations applied");
 
-  // Load persisted active strategies before seeding
-  const stRow = await pool.query("SELECT active_strategies FROM bot_settings WHERE id = 'bot_config'");
+  // Load persisted settings before seeding
+  const stRow = await pool.query("SELECT active_strategies, taker_rate FROM bot_settings WHERE id = 'bot_config'");
   activeStrategies = new Set(stRow.rows[0]?.active_strategies || ["ULTRA-SCALP", "MOMENTUM-ARB", "MEAN-REV"]);
-  console.log(`Active strategies: ${[...activeStrategies].join(", ")}`);
+  if (stRow.rows[0]?.taker_rate != null) takerRate = parseFloat(stRow.rows[0].taker_rate);
+  console.log(`Active strategies: ${[...activeStrategies].join(", ")} | Taker rate: ${(takerRate * 100).toFixed(4)}%`);
 
   await binance.loadMarkets();
   console.log("Markets loaded");

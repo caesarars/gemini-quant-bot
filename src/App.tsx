@@ -166,6 +166,7 @@ export default function App() {
     arbTpMult: 3.0,
     mrSlMult: 1.0,
     mrTpMult: 2.0,
+    takerRate: 0.0004,
   });
   const [cooldownStatus, setCooldownStatus]       = useState<Record<string, { inCooldown: boolean; strategy: string; status?: string }>>({});
   const [validationLogs, setValidationLogs] = useState<any[]>([]);
@@ -278,6 +279,7 @@ export default function App() {
           arbTpMult:       s.arb_tp_mult ?? prev.arbTpMult,
           mrSlMult:        s.mr_sl_mult ?? prev.mrSlMult,
           mrTpMult:        s.mr_tp_mult ?? prev.mrTpMult,
+          takerRate:       s.taker_rate != null ? parseFloat(s.taker_rate) : prev.takerRate,
         }));
         if (typeof s.telegram_bot_token === "string") setTelegramBotToken(s.telegram_bot_token);
         if (typeof s.telegram_chat_id   === "string") setTelegramChatId(s.telegram_chat_id);
@@ -704,7 +706,7 @@ export default function App() {
                         ) : skipped ? (
                           <span className="text-trading-muted">↳ Skipped — {v.checks[v.checks.length - 1]?.detail || "Auto-pilot OFF or HOLD"}</span>
                         ) : (
-                          <span className="text-trading-up">↳ Executed — {v.checks.filter((c: any) => c.status === "pass").length}/{v.checks.length} checks passed</span>
+                          <span className="text-trading-up">↳ Executed — {v.checks.filter((c: any) => c.status === "pass").length}/{v.checks.filter((c: any) => c.status !== "info").length} safety checks passed</span>
                         )}
                       </div>
                       {/* Mini check list */}
@@ -1450,8 +1452,13 @@ export default function App() {
                           </td>
                           <td className="px-6 py-4 font-mono text-trading-muted">{pos.amount}</td>
                           <td className="px-6 py-4 font-mono text-trading-muted">{pos.leverage}x</td>
-                          <td className="px-6 py-4 font-mono text-trading-down">
-                            -{pos.fee_usdt.toFixed(4)} USDT
+                          <td className="px-6 py-4">
+                            <div className="font-mono text-trading-down text-[11px]">
+                              -{((pos as any).total_fee_est ?? pos.fee_usdt).toFixed(4)} USDT
+                            </div>
+                            <div className="text-[9px] text-trading-muted font-mono mt-0.5">
+                              entry {pos.fee_usdt.toFixed(4)} + exit ~{((pos as any).total_fee_est - pos.fee_usdt).toFixed(4)}
+                            </div>
                           </td>
                           <td className="px-6 py-4">
                             <div className={cn("font-bold font-mono", pos.pnl_usdt >= 0 ? "text-trading-up" : "text-trading-down")}>
@@ -1463,6 +1470,11 @@ export default function App() {
                             <div className={cn("text-[9px] font-mono mt-0.5 font-bold", pos.net_pnl_usdt >= 0 ? "text-trading-up" : "text-trading-down")}>
                               Net: {pos.net_pnl_usdt >= 0 ? "+" : ""}{pos.net_pnl_usdt.toFixed(2)}
                             </div>
+                            {(pos as any).break_even_price && (
+                              <div className="text-[9px] font-mono mt-0.5 text-trading-muted">
+                                BE: ${(pos as any).break_even_price.toLocaleString()}
+                              </div>
+                            )}
                           </td>
                           <td className="px-6 py-4 text-right text-trading-muted font-mono">{pos.opened_at}</td>
                           <td className="px-4 py-4 text-right">
@@ -2287,6 +2299,28 @@ export default function App() {
                   </div>
                 </div>
 
+                {/* ── Fee Settings ── */}
+                <div className="space-y-4">
+                  <div className="flex items-center gap-3 text-[10px] uppercase text-trading-muted tracking-[2px]">
+                    <span className="text-[10px]">$</span>
+                    Fee Settings
+                    <div className="flex-1 h-[1px] bg-trading-border" />
+                  </div>
+                  <div className="space-y-1.5 max-w-xs">
+                    <label className="text-[10px] uppercase text-trading-muted font-bold tracking-wider">Taker Rate (%)</label>
+                    <input
+                      type="number"
+                      step="0.001"
+                      min="0"
+                      max="1"
+                      value={(botSettings.takerRate * 100).toFixed(4)}
+                      onChange={e => setBotSettings(prev => ({ ...prev, takerRate: parseFloat(e.target.value) / 100 || 0.0004 }))}
+                      className="w-full bg-trading-card border border-trading-border rounded px-3 py-2 text-[11px] text-trading-text focus:border-trading-accent focus:outline-none transition-colors"
+                    />
+                    <p className="text-[9px] text-trading-muted">Used for fee estimation and TP calculation. Common: <span className="text-trading-accent cursor-pointer" onClick={() => setBotSettings(prev => ({ ...prev, takerRate: 0.0004 }))}>Standard 0.04%</span> · <span className="text-trading-accent cursor-pointer" onClick={() => setBotSettings(prev => ({ ...prev, takerRate: 0.00036 }))}>BNB 0.036%</span> · <span className="text-trading-accent cursor-pointer" onClick={() => setBotSettings(prev => ({ ...prev, takerRate: 0.0002 }))}>VIP 0.02%</span></p>
+                  </div>
+                </div>
+
                 {/* ── Telegram Config ── */}
                 <div className="space-y-4">
                   <div className="flex items-center gap-3 text-[10px] uppercase text-trading-muted tracking-[2px]">
@@ -2390,6 +2424,7 @@ export default function App() {
                           mrTpMult: botSettings.mrTpMult,
                           telegramBotToken,
                           telegramChatId,
+                          takerRateVal: botSettings.takerRate,
                         }),
                       });
                       addLog("Bot settings saved", "success");
