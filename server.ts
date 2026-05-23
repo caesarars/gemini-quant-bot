@@ -520,14 +520,15 @@ function calcContextMultipliers(
 }
 
 // Fetch USDT balance from Binance futures (mock = 10,000 if no keys)
-let cachedBalance = 10000;
+let cachedBalance = 0;      // 0 forces fallback sizing until first real fetch
 let cachedBalanceAt = 0;
 async function getAccountBalance(): Promise<number> {
   if (!process.env.BINANCE_API_KEY || !process.env.BINANCE_SECRET_KEY) return 10000;
   if (Date.now() - cachedBalanceAt < 30_000) return cachedBalance; // cache 30s
   try {
     const bal = await binance.fetchBalance() as any;
-    cachedBalance = parseFloat(bal.total?.USDT || bal.USDT?.total || 10000);
+    // Use free (available) balance, not total — total includes locked margin of open positions
+    cachedBalance = parseFloat(bal.free?.USDT ?? bal.USDT?.free ?? bal.total?.USDT ?? 0);
     cachedBalanceAt = Date.now();
     balanceFetchFailures = 0; // reset on success
   } catch (e: any) {
@@ -760,6 +761,37 @@ async function checkAutoExecute(symbol: string, signal: AnySignal, strategyName:
   } else {
     amount = parseFloat((binance as any).amountToPrecision(symbol, amount));
     checks.push({ name: "Position Size", status: "pass", detail: `${amount.toFixed(4)} @ $${signal.price.toLocaleString()} (notional $${(amount * signal.price).toFixed(2)})` });
+  }
+
+  // ── Pre-flight margin guard ──
+  // required margin = notional / leverage; keep within 90% of free balance so
+  // fees and slippage don't push us over the edge (-2019 Margin insufficient).
+  if (hasKeys) {
+    const freshFree = await getAccountBalance();
+    const requiredMargin = (amount * signal.price) / leverage;
+    if (freshFree <= 0) {
+      checks.push({ name: "Margin Guard", status: "block", detail: `Free balance $${freshFree.toFixed(2)} — cannot size position` });
+      pushValidation({ id: vid, timestamp: Date.now(), symbol, strategy: strategyName, action: signal.action, finalStatus: "blocked", checks });
+      console.log(`[MARGIN] ${symbol} blocked — free balance $${freshFree.toFixed(2)}`);
+      return;
+    }
+    if (requiredMargin > freshFree * 0.9) {
+      // Scale down to fit within 90% of available free balance
+      const maxNotional = freshFree * 0.9 * leverage;
+      const scaledAmount = parseFloat((binance as any).amountToPrecision(symbol, maxNotional / signal.price));
+      checks.push({ name: "Margin Guard", status: "info", detail: `Scaled down: margin needed $${requiredMargin.toFixed(2)} > 90% of free $${freshFree.toFixed(2)} → notional $${(scaledAmount * signal.price).toFixed(2)}` });
+      console.log(`[MARGIN] ${symbol} scaled ${amount.toFixed(4)} → ${scaledAmount.toFixed(4)} (free balance $${freshFree.toFixed(2)})`);
+      amount = scaledAmount;
+      // If scaled amount is too small to trade, block
+      if (amount <= 0 || amount * signal.price < 5) {
+        checks.push({ name: "Margin Guard", status: "block", detail: `Insufficient free margin $${freshFree.toFixed(2)} for minimum trade size` });
+        pushValidation({ id: vid, timestamp: Date.now(), symbol, strategy: strategyName, action: signal.action, finalStatus: "blocked", checks });
+        console.log(`[MARGIN] ${symbol} blocked — scaled amount too small after guard`);
+        return;
+      }
+    } else {
+      checks.push({ name: "Margin Guard", status: "pass", detail: `Margin OK: $${requiredMargin.toFixed(2)} needed, $${freshFree.toFixed(2)} free` });
+    }
   }
 
   console.log(`[AUTO] ${signal.action} ${symbol} x${leverage} ATR:${signal.atrPct?.toFixed(3)}% risk:${(riskPct*100).toFixed(1)}% size:${amount.toFixed(4)} notional:$${(amount*signal.price).toFixed(2)}`);
