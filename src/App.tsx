@@ -1442,7 +1442,12 @@ export default function App() {
                             </span>
                           </td>
                           <td className="px-6 py-4 font-mono">${pos.entry_price.toLocaleString()}</td>
-                          <td className="px-6 py-4 font-mono">${pos.current_price.toLocaleString()}</td>
+                          <td className="px-6 py-4 font-mono">
+                            ${pos.current_price.toLocaleString()}
+                            {(pos as any).using_mark_price && (
+                              <span className="ml-1 text-[8px] px-1 py-0.5 bg-purple-500/15 text-purple-400 rounded font-bold">MARK</span>
+                            )}
+                          </td>
                           <td className="px-6 py-4 font-mono text-trading-muted">{pos.amount}</td>
                           <td className="px-6 py-4 font-mono text-trading-muted">{pos.leverage}x</td>
                           <td className="px-6 py-4 font-mono text-trading-down">
@@ -1453,7 +1458,7 @@ export default function App() {
                               {pos.pnl_usdt >= 0 ? "+" : ""}{pos.pnl_usdt.toFixed(2)} USDT
                             </div>
                             <div className={cn("text-[9px] font-mono mt-0.5", pos.pnl_pct >= 0 ? "text-trading-up" : "text-trading-down")}>
-                              {pos.pnl_pct >= 0 ? "+" : ""}{pos.pnl_pct.toFixed(3)}%
+                              ROE {pos.pnl_pct >= 0 ? "+" : ""}{pos.pnl_pct.toFixed(2)}%
                             </div>
                             <div className={cn("text-[9px] font-mono mt-0.5 font-bold", pos.net_pnl_usdt >= 0 ? "text-trading-up" : "text-trading-down")}>
                               Net: {pos.net_pnl_usdt >= 0 ? "+" : ""}{pos.net_pnl_usdt.toFixed(2)}

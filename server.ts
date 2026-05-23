@@ -1165,6 +1165,7 @@ const runMockTradeMonitor = async () => {
 // ── Market Context (Funding Rate + Fear & Greed) ────────────────────────────────
 
 const fundingRateCache = new Map<string, number>(); // symbol → rate (e.g. 0.0001 = 0.01% per 8h)
+const markPriceCache   = new Map<string, number>(); // symbol → mark price (Binance uses this for PnL)
 let fearGreedCache: { value: number; classification: string } | null = null;
 
 interface OIData { oi: number; oiChangePct: number }
@@ -1179,6 +1180,7 @@ async function fetchFundingRates() {
       const ccxtSym = toCcxtSym(item.symbol);
       if (SYMBOLS.includes(ccxtSym)) {
         fundingRateCache.set(ccxtSym, parseFloat(item.lastFundingRate));
+        if (item.markPrice) markPriceCache.set(ccxtSym, parseFloat(item.markPrice));
       }
     }
     console.log(`[FUNDING] Updated — BTC: ${((fundingRateCache.get("BTC/USDT") ?? 0) * 100).toFixed(4)}%`);
@@ -1535,11 +1537,16 @@ app.get("/api/open-positions", async (_req, res) => {
        FROM trades WHERE status = 'OPEN' ORDER BY timestamp DESC`
     );
     const positions = result.rows.map((trade: any) => {
+      // Priority: mark price (what Binance uses for PnL) → live scan price → entry price
+      const markPrice    = markPriceCache.get(trade.symbol);
       const live         = scanResults.find(r => r.symbol === trade.symbol);
-      const currentPrice = live?.price ?? trade.entry_price;
+      const currentPrice = markPrice ?? live?.price ?? trade.entry_price;
       const isLong       = trade.type === "BUY";
-      const grossPnl     = (isLong ? currentPrice - trade.entry_price : trade.entry_price - currentPrice) * trade.amount;
-      const pnlPct       = ((isLong ? currentPrice - trade.entry_price : trade.entry_price - currentPrice) / trade.entry_price) * 100;
+      const lev          = trade.leverage || 1;
+      const priceDelta   = isLong ? currentPrice - trade.entry_price : trade.entry_price - currentPrice;
+      const grossPnl     = priceDelta * trade.amount;
+      // ROE% — matches Binance "Unrealized PnL%" which is leveraged return on margin
+      const pnlPct       = (priceDelta / trade.entry_price) * 100 * lev;
       const feeUsdt      = trade.fee_usdt ?? 0;
       return {
         ...trade,
@@ -1549,6 +1556,7 @@ app.get("/api/open-positions", async (_req, res) => {
         net_pnl_usdt:  parseFloat((grossPnl - feeUsdt).toFixed(4)),
         pnl_pct:       parseFloat(pnlPct.toFixed(3)),
         fee_usdt:      parseFloat(feeUsdt.toFixed(6)),
+        using_mark_price: !!markPrice,
       };
     });
     res.json({ positions, last_sync: lastSyncAt });
