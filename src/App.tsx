@@ -40,6 +40,14 @@ interface StrategySignal {
   score?: number;
   buyScore?: number;
   sellScore?: number;
+  // SWING-LONG specific
+  emaAlign?: number;
+  macdBull?: boolean;
+  adxBull?: boolean;
+  ema20?: number;
+  ema50?: number;
+  ema200?: number;
+  adx?: number;
 }
 
 interface ScanResult {
@@ -54,9 +62,9 @@ interface ScanResult {
   oiChangePct?: number | null;
   lsRatio?: number | null;
   lastTickMs?: number;
-  ultraScalp?: StrategySignal;
   momentumArb?: StrategySignal;
   meanRev?: StrategySignal;
+  swingLong?: StrategySignal;
 }
 
 interface AIResult {
@@ -148,7 +156,7 @@ export default function App() {
   const [closingAll, setClosingAll]     = useState(false);
   const [logs, setLogs] = useState<{ id: string; msg: string; time: string; type: string }[]>([]);
   const [isAutoPilot, setIsAutoPilot]             = useState(false);
-  const [activeStrategies, setActiveStrategies]   = useState<string[]>(["ULTRA-SCALP", "MOMENTUM-ARB"]);
+  const [activeStrategies, setActiveStrategies]   = useState<string[]>(["MOMENTUM-ARB", "MEAN-REV", "SWING-LONG"]);
   const [riskLevel, setRiskLevel]                 = useState<number>(1);
   const [isSettingsOpen, setIsSettingsOpen]       = useState(false);
   const [settingsLoading, setSettingsLoading]     = useState(false);
@@ -167,6 +175,9 @@ export default function App() {
     mrSlMult: 1.0,
     mrTpMult: 2.0,
     takerRate: 0.0004,
+    swingLeverage: 3,
+    swingSlMult: 2.0,
+    swingTpMult: 8.0,
   });
   const [cooldownStatus, setCooldownStatus]       = useState<Record<string, { inCooldown: boolean; strategy: string; status?: string }>>({});
   const [validationLogs, setValidationLogs] = useState<any[]>([]);
@@ -183,7 +194,7 @@ export default function App() {
   const [isBacktestOpen, setIsBacktestOpen]   = useState(false);
   const [btSymbol, setBtSymbol]               = useState("BTC/USDT");
   const [btDays, setBtDays]                   = useState(7);
-  const [btStrategy, setBtStrategy]           = useState("ULTRA-SCALP");
+  const [btStrategy, setBtStrategy]           = useState("MOMENTUM-ARB");
   const [btLoading, setBtLoading]             = useState(false);
   const [btResult, setBtResult]               = useState<any>(null);
   const [isMarkovOpen, setIsMarkovOpen]       = useState(false);
@@ -279,7 +290,10 @@ export default function App() {
           arbTpMult:       s.arb_tp_mult ?? prev.arbTpMult,
           mrSlMult:        s.mr_sl_mult ?? prev.mrSlMult,
           mrTpMult:        s.mr_tp_mult ?? prev.mrTpMult,
-          takerRate:       s.taker_rate != null ? parseFloat(s.taker_rate) : prev.takerRate,
+          takerRate:       s.taker_rate    != null ? parseFloat(s.taker_rate)    : prev.takerRate,
+          swingLeverage:   s.swing_leverage != null ? parseInt(s.swing_leverage)   : prev.swingLeverage,
+          swingSlMult:     s.swing_sl_mult  != null ? parseFloat(s.swing_sl_mult)  : prev.swingSlMult,
+          swingTpMult:     s.swing_tp_mult  != null ? parseFloat(s.swing_tp_mult)  : prev.swingTpMult,
         }));
         if (typeof s.telegram_bot_token === "string") setTelegramBotToken(s.telegram_bot_token);
         if (typeof s.telegram_chat_id   === "string") setTelegramChatId(s.telegram_chat_id);
@@ -696,7 +710,7 @@ export default function App() {
                           <span className={cn("font-black uppercase",
                             v.action === 'BUY' ? "text-trading-up" : "text-trading-down"
                           )}>{v.action}</span>
-                          <span className="text-trading-muted">{v.strategy?.replace('MOMENTUM-ARB','MOM').replace('ULTRA-SCALP','SCALP').replace('MEAN-REV','MR')}</span>
+                          <span className="text-trading-muted">{v.strategy?.replace('MOMENTUM-ARB','MOM').replace('MEAN-REV','MR').replace('SWING-LONG','SWING')}</span>
                         </div>
                         <span className="text-[8px] text-trading-muted font-mono">{time}</span>
                       </div>
@@ -735,10 +749,10 @@ export default function App() {
             </div>
             <div className="space-y-2">
               {([
-                { id: 'ULTRA-SCALP',     name: 'ULTRA-SCALP v2.1', desc: '1m · RSI+MACD+BB+EMA · Vol 1.5×',             available: true },
-                { id: 'MOMENTUM-ARB',    name: 'MOMENTUM ARB',      desc: '5m · EMA9/21 crossover · Vol 1.2×',          available: true },
-                { id: 'MEAN-REV',        name: 'MEAN REVERSION',    desc: '15m · BB band touch + RSI · No trend filter', available: true },
-                { id: 'VOLATILITY-CORE', name: 'VOLATILITY CORE',   desc: 'Coming soon — BB squeeze + ATR expansion',    available: false },
+                { id: 'MOMENTUM-ARB',    name: 'MOMENTUM ARB',      desc: '5m · EMA9/21 crossover · Vol 1.2×',           available: true },
+                { id: 'MEAN-REV',        name: 'MEAN REVERSION',    desc: '15m · BB band touch + RSI · No trend filter',  available: true },
+                { id: 'SWING-LONG',      name: 'SWING LONG',        desc: '4h · EMA alignment · MACD · ADX · 24h hold',  available: true },
+                { id: 'VOLATILITY-CORE', name: 'VOLATILITY CORE',   desc: 'Coming soon — BB squeeze + ATR expansion',     available: false },
               ] as const).map(strat => {
                 const isEnabled = activeStrategies.includes(strat.id);
                 return (
@@ -795,9 +809,9 @@ export default function App() {
           
           <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-3">
             {scanResults.map((coin) => {
-              const bestAction = coin.ultraScalp?.action !== 'HOLD' ? coin.ultraScalp?.action
-                : coin.momentumArb?.action !== 'HOLD' ? coin.momentumArb?.action
-                : coin.meanRev?.action !== 'HOLD' ? coin.meanRev?.action : 'HOLD';
+              const bestAction = coin.momentumArb?.action !== 'HOLD' ? coin.momentumArb?.action
+                : coin.meanRev?.action !== 'HOLD' ? coin.meanRev?.action
+                : coin.swingLong?.action !== 'HOLD' ? coin.swingLong?.action : 'HOLD';
 
               const ageMs      = coin.lastTickMs ? now - coin.lastTickMs : Infinity;
               const isLive     = ageMs < 15_000;
@@ -807,10 +821,10 @@ export default function App() {
                                : ageMs < 60_000   ? `${Math.floor(ageMs / 1000)}s ago`
                                : `${Math.floor(ageMs / 60_000)}m ago`;
 
-              const hasTraded  = ['ULTRA-SCALP','MOMENTUM-ARB','MEAN-REV'].some(
+              const hasTraded  = ['MOMENTUM-ARB','MEAN-REV','SWING-LONG'].some(
                 s => cooldownStatus[`${coin.symbol}|${s}`]?.inCooldown
               );
-              const tradedStrategy = ['ULTRA-SCALP','MOMENTUM-ARB','MEAN-REV'].find(
+              const tradedStrategy = ['MOMENTUM-ARB','MEAN-REV','SWING-LONG'].find(
                 s => cooldownStatus[`${coin.symbol}|${s}`]?.inCooldown
               );
 
@@ -872,7 +886,7 @@ export default function App() {
                           {/* Trade fired badge */}
                           {hasTraded && (
                             <span className="text-[10px] px-2 py-0.5 bg-trading-up/15 text-trading-up border border-trading-up/30 rounded font-black uppercase tracking-wider animate-pulse">
-                              ✓ {tradedStrategy?.replace('MOMENTUM-ARB','MOM').replace('ULTRA-SCALP','SCALP').replace('MEAN-REV','MR')}
+                              ✓ {tradedStrategy?.replace('MOMENTUM-ARB','MOM').replace('MEAN-REV','MR')}
                             </span>
                           )}
                         </div>
@@ -899,77 +913,18 @@ export default function App() {
                         : isRecent ? "text-yellow-400"
                         :            "text-trading-muted"
                         )}>{ageLabel}</span>
-                        {(coin.ultraScalp?.atrPct ?? 0) > 0 && (
+                        {(coin.momentumArb?.atrPct ?? 0) > 0 && (
                           <span className={cn("text-[10px] font-bold px-2 py-0.5 rounded",
-                            (coin.ultraScalp?.atrPct ?? 0) >= 0.3  ? "bg-trading-down/10 text-trading-down"
-                          : (coin.ultraScalp?.atrPct ?? 0) >= 0.15 ? "bg-orange-400/10 text-orange-400"
-                          :                                            "bg-trading-muted/10 text-trading-muted"
-                          )}>ATR {coin.ultraScalp?.atrPct?.toFixed(2)}%</span>
+                            (coin.momentumArb?.atrPct ?? 0) >= 0.3  ? "bg-trading-down/10 text-trading-down"
+                          : (coin.momentumArb?.atrPct ?? 0) >= 0.15 ? "bg-orange-400/10 text-orange-400"
+                          :                                             "bg-trading-muted/10 text-trading-muted"
+                          )}>ATR {coin.momentumArb?.atrPct?.toFixed(2)}%</span>
                         )}
                       </div>
                     </div>
 
                     {/* ── Strategy rows ── */}
                     <div className="space-y-1.5 mb-3">
-                      {coin.ultraScalp && (() => {
-                        const r = getBlockReason(coin.ultraScalp.action, coin.trend, coin.ultraScalp.volumeRatio, 1.0, isAutoPilot, true, marketContext.fundingRates[coin.symbol], marketContext.fearGreed?.value, 'ULTRA-SCALP', coin.oiChangePct, coin.lsRatio, cooldownStatus[`${coin.symbol}|ULTRA-SCALP`], coin.regime, coin.adx);
-                        const active = coin.ultraScalp.action !== 'HOLD';
-                        return (
-                          <div className={cn("rounded overflow-hidden border",
-                            active ? "border-trading-border/60" : "border-transparent"
-                          )}>
-                            <div className={cn("flex items-center gap-2 px-2.5 py-2",
-                              active ? "bg-trading-bg/60" : "bg-trading-bg/30"
-                            )}>
-                              <span className="text-[11px] font-bold font-mono text-trading-muted w-[76px] shrink-0 uppercase tracking-wide">Scalp 1m</span>
-                              <span className={cn("px-2 py-0.5 rounded font-black text-[11px]",
-                                coin.ultraScalp.action === 'BUY'  ? "bg-trading-up/15 text-trading-up"
-                              : coin.ultraScalp.action === 'SELL' ? "bg-trading-down/15 text-trading-down"
-                              :                                      "bg-trading-muted/10 text-trading-muted"
-                              )}>{coin.ultraScalp.action}</span>
-                              {coin.ultraScalp.score !== undefined && (
-                                <span className={cn("text-[10px] font-bold px-1.5 py-0.5 rounded",
-                                  (coin.ultraScalp.score ?? 0) >= 4 ? "bg-trading-up/20 text-trading-up"
-                                  : (coin.ultraScalp.score ?? 0) >= 3 ? "bg-orange-400/20 text-orange-400"
-                                  :                                     "bg-trading-muted/10 text-trading-muted"
-                                )}>{(coin.ultraScalp.score ?? 0).toFixed(1)}</span>
-                              )}
-                              <span className="text-[11px] text-trading-muted">RSI {coin.ultraScalp.rsi.toFixed(0)}</span>
-                              {coin.ultraScalp.volumeRatio !== undefined && (
-                                <span className={cn("ml-auto text-[11px] font-bold",
-                                  coin.ultraScalp.volumeRatio >= 1.5 ? "text-trading-up"
-                                : coin.ultraScalp.volumeRatio >= 1.0 ? "text-trading-muted"
-                                :                                       "text-trading-down/70"
-                                )}>V {coin.ultraScalp.volumeRatio.toFixed(1)}×</span>
-                              )}
-                            </div>
-                            <div className={cn("flex items-center justify-between px-2.5 py-1.5 border-t border-trading-border/20",
-                              active ? "bg-trading-bg/50" : "bg-trading-bg/20"
-                            )}>
-                              <span className={cn("text-[11px] font-mono", r.color)}>↳ {r.label}</span>
-                              {active && (
-                                <button
-                                  onClick={() => executeManual(coin.symbol, 'ULTRA-SCALP', coin.ultraScalp!.action)}
-                                  disabled={executingKey === `${coin.symbol}|ULTRA-SCALP`}
-                                  className={cn(
-                                    "ml-2 shrink-0 px-2 py-0.5 rounded text-[9px] font-black uppercase tracking-wider border transition-all disabled:opacity-40",
-                                    executeConfirmKey === `${coin.symbol}|ULTRA-SCALP`
-                                      ? "bg-yellow-400/20 border-yellow-400 text-yellow-300 animate-pulse"
-                                      : coin.ultraScalp!.action === 'BUY'
-                                        ? "bg-trading-up/10 border-trading-up/50 text-trading-up hover:bg-trading-up/25"
-                                        : "bg-trading-down/10 border-trading-down/50 text-trading-down hover:bg-trading-down/25"
-                                  )}
-                                >
-                                  {executingKey === `${coin.symbol}|ULTRA-SCALP` ? '...' :
-                                   executeConfirmKey === `${coin.symbol}|ULTRA-SCALP` ? 'CONFIRM?' :
-                                   coin.ultraScalp!.action === 'BUY' ? '▶ LONG' : '▶ SHORT'}
-                                </button>
-                              )}
-                            </div>
-                          </div>
-                        );
-                      })()}
-
                       {coin.momentumArb && (() => {
                         const r = getBlockReason(coin.momentumArb.action, coin.trend, coin.momentumArb.volumeRatio, 1.0, isAutoPilot, false, marketContext.fundingRates[coin.symbol], marketContext.fearGreed?.value, 'MOMENTUM-ARB', coin.oiChangePct, coin.lsRatio, cooldownStatus[`${coin.symbol}|MOMENTUM-ARB`], coin.regime, coin.adx);
                         const active = coin.momentumArb.action !== 'HOLD';
@@ -1094,6 +1049,69 @@ export default function App() {
                           </div>
                         );
                       })()}
+
+                      {coin.swingLong && (() => {
+                        const active = coin.swingLong.action === 'BUY';
+                        const ea = coin.swingLong.emaAlign ?? 0;
+                        const emaColor = ea === 3 ? 'text-trading-up' : ea === 2 ? 'text-yellow-400' : 'text-trading-muted';
+                        return (
+                          <div className={cn("rounded overflow-hidden border",
+                            active ? "border-amber-500/40" : "border-transparent"
+                          )}>
+                            <div className={cn("flex items-center gap-2 px-2.5 py-2",
+                              active ? "bg-amber-500/8" : "bg-trading-bg/30"
+                            )}>
+                              <span className="text-[11px] font-bold font-mono text-amber-500/70 w-[76px] shrink-0 uppercase tracking-wide">Swing 4h</span>
+                              <span className={cn("px-2 py-0.5 rounded font-black text-[11px]",
+                                active ? "bg-trading-up/15 text-trading-up" : "bg-trading-muted/10 text-trading-muted"
+                              )}>{coin.swingLong.action}</span>
+                              {coin.swingLong.score !== undefined && (
+                                <span className={cn("text-[10px] font-bold px-1.5 py-0.5 rounded",
+                                  (coin.swingLong.score ?? 0) >= 5 ? "bg-trading-up/20 text-trading-up"
+                                  : (coin.swingLong.score ?? 0) >= 4 ? "bg-orange-400/20 text-orange-400"
+                                  :                                     "bg-trading-muted/10 text-trading-muted"
+                                )}>{(coin.swingLong.score ?? 0).toFixed(1)}/7</span>
+                              )}
+                              <span className="text-[11px] text-trading-muted">RSI {coin.swingLong.rsi.toFixed(0)}</span>
+                              <span className={cn("text-[11px] font-bold", emaColor)}>EMA {ea}/3</span>
+                              {coin.swingLong.macdBull !== undefined && (
+                                <span className={cn("text-[11px] font-bold", coin.swingLong.macdBull ? "text-trading-up" : "text-trading-muted")}>
+                                  {coin.swingLong.macdBull ? 'MACD↑' : 'MACD↓'}
+                                </span>
+                              )}
+                              {coin.swingLong.adxBull !== undefined && (
+                                <span className={cn("ml-auto text-[11px] font-bold", coin.swingLong.adxBull ? "text-trading-up" : "text-trading-muted")}>
+                                  ADX {coin.swingLong.adx?.toFixed(0) ?? '?'}{coin.swingLong.adxBull ? '↑' : ''}
+                                </span>
+                              )}
+                            </div>
+                            <div className={cn("flex items-center justify-between px-2.5 py-1.5 border-t border-trading-border/20",
+                              active ? "bg-amber-500/5" : "bg-trading-bg/20"
+                            )}>
+                              <span className="text-[11px] font-mono text-trading-muted">
+                                {active
+                                  ? `↳ 3× lev · 24h cooldown · EMA50${coin.swingLong.ema200 && coin.swingLong.ema50 ? (coin.swingLong.ema50 > coin.swingLong.ema200 ? '>EMA200 ✓' : '<EMA200 ✗') : ''}`
+                                  : `↳ Waiting: ${(coin.swingLong.score ?? 0).toFixed(1)}/5 conditions`}
+                              </span>
+                              {active && (
+                                <button
+                                  onClick={() => executeManual(coin.symbol, 'SWING-LONG', 'BUY')}
+                                  disabled={executingKey === `${coin.symbol}|SWING-LONG`}
+                                  className={cn(
+                                    "ml-2 shrink-0 px-2 py-0.5 rounded text-[9px] font-black uppercase tracking-wider border transition-all disabled:opacity-40",
+                                    executeConfirmKey === `${coin.symbol}|SWING-LONG`
+                                      ? "bg-yellow-400/20 border-yellow-400 text-yellow-300 animate-pulse"
+                                      : "bg-amber-500/10 border-amber-500/50 text-amber-400 hover:bg-amber-500/25"
+                                  )}
+                                >
+                                  {executingKey === `${coin.symbol}|SWING-LONG` ? '...' :
+                                   executeConfirmKey === `${coin.symbol}|SWING-LONG` ? 'CONFIRM?' : '▶ SWING LONG'}
+                                </button>
+                              )}
+                            </div>
+                          </div>
+                        );
+                      })()}
                     </div>
 
                     {/* ── Futures context row ── */}
@@ -1154,24 +1172,13 @@ export default function App() {
                         className="overflow-hidden"
                       >
                         <div className="pt-3 mt-0 border-t border-trading-border space-y-3 pl-4 pr-3 pb-3">
-                          <div className="grid grid-cols-2 gap-2">
-                            <div className="bg-trading-bg/40 p-2 rounded">
-                              <div className="text-[8px] text-trading-muted uppercase mb-1">Scalp Signal (1m)</div>
-                              <div className={cn("text-[11px] font-bold",
-                                coin.ultraScalp?.action === 'BUY' ? 'text-trading-up' :
-                                coin.ultraScalp?.action === 'SELL' ? 'text-trading-down' : 'text-trading-muted'
-                              )}>
-                                {coin.ultraScalp?.action === 'BUY' ? 'Bullish Setup' : coin.ultraScalp?.action === 'SELL' ? 'Bearish Pressure' : 'Consolidating'}
-                              </div>
-                            </div>
-                            <div className="bg-trading-bg/40 p-2 rounded">
-                              <div className="text-[8px] text-trading-muted uppercase mb-1">Momentum (5m)</div>
-                              <div className={cn("text-[11px] font-bold",
-                                coin.momentumArb?.action === 'BUY' ? 'text-trading-up' :
-                                coin.momentumArb?.action === 'SELL' ? 'text-trading-down' : 'text-trading-muted'
-                              )}>
-                                {coin.momentumArb?.cross === 'GOLDEN' ? 'Golden Cross ↑' : coin.momentumArb?.cross === 'DEATH' ? 'Death Cross ↓' : 'No Crossover'}
-                              </div>
+                          <div className="bg-trading-bg/40 p-2 rounded">
+                            <div className="text-[8px] text-trading-muted uppercase mb-1">Momentum (5m)</div>
+                            <div className={cn("text-[11px] font-bold",
+                              coin.momentumArb?.action === 'BUY' ? 'text-trading-up' :
+                              coin.momentumArb?.action === 'SELL' ? 'text-trading-down' : 'text-trading-muted'
+                            )}>
+                              {coin.momentumArb?.cross === 'GOLDEN' ? 'Golden Cross ↑' : coin.momentumArb?.cross === 'DEATH' ? 'Death Cross ↓' : 'No Crossover'}
                             </div>
                           </div>
                           <div className="flex flex-wrap gap-1">
@@ -1678,7 +1685,6 @@ export default function App() {
                   onChange={e => setBtStrategy(e.target.value)}
                   className="bg-trading-bg border border-trading-border rounded px-2 py-1.5 text-[11px] font-bold text-trading-text"
                 >
-                  <option value="ULTRA-SCALP">ULTRA-SCALP (1m)</option>
                   <option value="MOMENTUM-ARB">MOMENTUM-ARB (5m)</option>
                   <option value="MEAN-REV">MEAN-REV (15m)</option>
                 </select>
@@ -2215,34 +2221,7 @@ export default function App() {
                     Strategy SL / TP Multipliers
                     <div className="flex-1 h-[1px] bg-trading-border" />
                   </div>
-                  <div className="grid grid-cols-1 sm:grid-cols-3 gap-4">
-                    {/* ULTRA-SCALP */}
-                    <div className="p-4 bg-trading-card border border-trading-border rounded space-y-3">
-                      <div className="text-[11px] font-bold text-trading-accent uppercase tracking-wider">ULTRA-SCALP</div>
-                      <div className="space-y-2">
-                        <div className="flex items-center justify-between">
-                          <span className="text-[9px] text-trading-muted uppercase">SL Mult</span>
-                          <span className="text-[11px] font-black">{botSettings.atrSlMult}x</span>
-                        </div>
-                        <input
-                          type="range" min="0.5" max="3" step="0.1"
-                          value={botSettings.atrSlMult}
-                          onChange={e => setBotSettings(prev => ({ ...prev, atrSlMult: parseFloat(e.target.value) }))}
-                          className="w-full h-1 bg-trading-border rounded-full appearance-none cursor-pointer accent-trading-accent"
-                        />
-                        <div className="flex items-center justify-between">
-                          <span className="text-[9px] text-trading-muted uppercase">TP Mult</span>
-                          <span className="text-[11px] font-black">{botSettings.atrTpMult}x</span>
-                        </div>
-                        <input
-                          type="range" min="1" max="8" step="0.1"
-                          value={botSettings.atrTpMult}
-                          onChange={e => setBotSettings(prev => ({ ...prev, atrTpMult: parseFloat(e.target.value) }))}
-                          className="w-full h-1 bg-trading-border rounded-full appearance-none cursor-pointer accent-trading-accent"
-                        />
-                      </div>
-                    </div>
-
+                  <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
                     {/* MOMENTUM-ARB */}
                     <div className="p-4 bg-trading-card border border-trading-border rounded space-y-3">
                       <div className="text-[11px] font-bold text-trading-accent uppercase tracking-wider">MOMENTUM-ARB</div>
@@ -2295,6 +2274,44 @@ export default function App() {
                           className="w-full h-1 bg-trading-border rounded-full appearance-none cursor-pointer accent-trading-accent"
                         />
                       </div>
+                    </div>
+                  </div>
+                </div>
+
+                {/* ── SWING-LONG Settings ── */}
+                <div className="space-y-4">
+                  <div className="flex items-center gap-3 text-[10px] uppercase text-trading-muted tracking-[2px]">
+                    <span className="text-amber-500 text-[10px]">◆</span>
+                    Swing Long Strategy (4h)
+                    <div className="flex-1 h-[1px] bg-trading-border" />
+                  </div>
+                  <div className="grid grid-cols-3 gap-4 max-w-2xl">
+                    <div className="space-y-1.5">
+                      <label className="text-[10px] uppercase text-trading-muted font-bold tracking-wider">Leverage</label>
+                      <input type="number" min="1" max="20" step="1"
+                        value={botSettings.swingLeverage}
+                        onChange={e => setBotSettings(prev => ({ ...prev, swingLeverage: parseInt(e.target.value) || 3 }))}
+                        className="w-full bg-trading-card border border-trading-border rounded px-3 py-2 text-[11px] text-trading-text focus:border-amber-500 focus:outline-none transition-colors"
+                      />
+                      <p className="text-[9px] text-trading-muted">Recommended 2-5× for multi-day holds</p>
+                    </div>
+                    <div className="space-y-1.5">
+                      <label className="text-[10px] uppercase text-trading-muted font-bold tracking-wider">SL Mult (ATR×)</label>
+                      <input type="number" min="0.5" max="10" step="0.5"
+                        value={botSettings.swingSlMult}
+                        onChange={e => setBotSettings(prev => ({ ...prev, swingSlMult: parseFloat(e.target.value) || 2.0 }))}
+                        className="w-full bg-trading-card border border-trading-border rounded px-3 py-2 text-[11px] text-trading-text focus:border-amber-500 focus:outline-none transition-colors"
+                      />
+                      <p className="text-[9px] text-trading-muted">Stop loss = ATR(14,4h) × mult</p>
+                    </div>
+                    <div className="space-y-1.5">
+                      <label className="text-[10px] uppercase text-trading-muted font-bold tracking-wider">TP Mult (ATR×)</label>
+                      <input type="number" min="1" max="30" step="0.5"
+                        value={botSettings.swingTpMult}
+                        onChange={e => setBotSettings(prev => ({ ...prev, swingTpMult: parseFloat(e.target.value) || 8.0 }))}
+                        className="w-full bg-trading-card border border-trading-border rounded px-3 py-2 text-[11px] text-trading-text focus:border-amber-500 focus:outline-none transition-colors"
+                      />
+                      <p className="text-[9px] text-trading-muted">Target ≈ 3-15% move on 4h ATR</p>
                     </div>
                   </div>
                 </div>
@@ -2425,6 +2442,9 @@ export default function App() {
                           telegramBotToken,
                           telegramChatId,
                           takerRateVal: botSettings.takerRate,
+                          swingLeverageVal: botSettings.swingLeverage,
+                          swingSlMult: botSettings.swingSlMult,
+                          swingTpMult: botSettings.swingTpMult,
                         }),
                       });
                       addLog("Bot settings saved", "success");

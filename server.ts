@@ -51,7 +51,8 @@ async function runMigrations() {
   await pool.query(`ALTER TABLE bot_settings ADD COLUMN IF NOT EXISTS active_strategy   VARCHAR(30)  DEFAULT 'ULTRA-SCALP'`);
   await pool.query(`ALTER TABLE bot_settings ADD COLUMN IF NOT EXISTS arb_sl_mult      NUMERIC(5,2) DEFAULT 1.0`);
   await pool.query(`ALTER TABLE bot_settings ADD COLUMN IF NOT EXISTS arb_tp_mult      NUMERIC(5,2) DEFAULT 3.0`);
-  await pool.query(`ALTER TABLE bot_settings ADD COLUMN IF NOT EXISTS active_strategies TEXT[]       DEFAULT '{ULTRA-SCALP,MOMENTUM-ARB}'`);
+  await pool.query(`ALTER TABLE bot_settings ADD COLUMN IF NOT EXISTS active_strategies TEXT[]       DEFAULT '{MOMENTUM-ARB}'`);
+  await pool.query(`UPDATE bot_settings SET active_strategies = array_remove(active_strategies, 'ULTRA-SCALP') WHERE id = 'bot_config'`);
   await pool.query(`ALTER TABLE trades ADD COLUMN IF NOT EXISTS fee_usdt NUMERIC(20,8) DEFAULT 0`);
   await pool.query(`ALTER TABLE bot_settings ADD COLUMN IF NOT EXISTS mr_sl_mult NUMERIC(5,2) DEFAULT 1.0`);
   await pool.query(`ALTER TABLE bot_settings ADD COLUMN IF NOT EXISTS mr_tp_mult NUMERIC(5,2) DEFAULT 2.0`);
@@ -59,6 +60,10 @@ async function runMigrations() {
   await pool.query(`ALTER TABLE bot_settings ADD COLUMN IF NOT EXISTS telegram_bot_token VARCHAR(255) DEFAULT NULL`);
   await pool.query(`ALTER TABLE bot_settings ADD COLUMN IF NOT EXISTS telegram_chat_id   VARCHAR(50)  DEFAULT NULL`);
   await pool.query(`ALTER TABLE bot_settings ADD COLUMN IF NOT EXISTS taker_rate NUMERIC(8,6) DEFAULT 0.0004`);
+  await pool.query(`ALTER TABLE bot_settings ADD COLUMN IF NOT EXISTS swing_leverage  INTEGER      DEFAULT 3`);
+  await pool.query(`ALTER TABLE bot_settings ADD COLUMN IF NOT EXISTS swing_sl_mult   NUMERIC(5,2) DEFAULT 2.0`);
+  await pool.query(`ALTER TABLE bot_settings ADD COLUMN IF NOT EXISTS swing_tp_mult   NUMERIC(5,2) DEFAULT 8.0`);
+  await pool.query(`UPDATE bot_settings SET active_strategies = array_append(active_strategies, 'SWING-LONG') WHERE id = 'bot_config' AND NOT ('SWING-LONG' = ANY(COALESCE(active_strategies, '{}')))`);
 
 }
 
@@ -219,57 +224,6 @@ function calcADX(ohlcv: number[][], period = 14): { adx: number; plusDI: number;
   return { adx: parseFloat(adx.toFixed(2)), plusDI: parseFloat(plusDI.toFixed(2)), minusDI: parseFloat(minusDI.toFixed(2)) };
 }
 
-function calculateSignal(ohlcv: number[][]) {
-  if (!ohlcv || ohlcv.length < 26) return { action: "HOLD" as const, rsi: 50, price: 0, macd: null, bb: null, ema9: null, ema21: null, volumeRatio: 1, atr: 0, atrPct: 0, score: 0, buyScore: 0, sellScore: 0 };
-  const closes  = ohlcv.map(c => c[4]);
-  const volumes = ohlcv.map(c => c[5]);
-  const price   = closes[closes.length - 1];
-  const rsi     = parseFloat(calcRSI(closes).toFixed(2));
-  const macd    = calcMACD(closes);
-  const bb      = calcBollingerBands(closes);
-  const ema9    = parseFloat((calcEMA(closes, 9).at(-1)  || 0).toFixed(4));
-  const ema21   = parseFloat((calcEMA(closes, 21).at(-1) || 0).toFixed(4));
-  const volumeRatio = parseFloat(calcVolumeRatio(volumes).toFixed(2));
-  const atr     = parseFloat(calcATR(ohlcv).toFixed(6));
-  const atrPct  = price > 0 ? parseFloat((atr / price * 100).toFixed(4)) : 0;
-
-  // ── Weighted scoring (max 5.0) ──
-  let buyScore = 0, sellScore = 0;
-
-  // EMA9/21 alignment — strongest directional signal for scalps (weight 2)
-  if (ema9 > ema21) buyScore += 2;
-  if (ema9 < ema21) sellScore += 2;
-
-  // MACD momentum confirmation (weight 1.5)
-  if (macd.macd > macd.signal && macd.histogram > 0) buyScore += 1.5;
-  if (macd.macd < macd.signal && macd.histogram < 0) sellScore += 1.5;
-
-  // RSI extreme reversal zone (weight 1)
-  if (rsi < 35) buyScore += 1;
-  if (rsi > 65) sellScore += 1;
-
-  // Bollinger Bands touch / break (weight 1)
-  if (price < bb.lower) buyScore += 1;
-  if (price > bb.upper) sellScore += 1;
-
-  // Volume confirmation — only adds to the leading side (weight 0.5)
-  if (volumeRatio >= 1.0) {
-    if (buyScore > sellScore) buyScore += 0.5;
-    else if (sellScore > buyScore) sellScore += 0.5;
-  }
-
-  const maxScore = Math.max(buyScore, sellScore);
-  const MIN_SCORE = 3.0;
-
-  // RSI veto: don't short when already oversold, don't long when already overbought.
-  // Loosened to 30/70 — strong trends keep RSI pegged 60+ for many bars and the
-  // tighter 40/60 veto was killing legitimate continuation entries.
-  const action = buyScore >= MIN_SCORE && buyScore > sellScore && rsi < 70  ? "BUY"  as const
-               : sellScore >= MIN_SCORE && sellScore > buyScore && rsi > 30 ? "SELL" as const
-               : "HOLD" as const;
-  return { action, rsi, price, macd, bb, ema9, ema21, volumeRatio, atr, atrPct, score: maxScore, buyScore, sellScore };
-}
-
 // Returns signal for MOMENTUM ARB: EMA9/21 fresh crossover confirmed by RSI (5m candles)
 function calculateMomentumSignal(ohlcv: number[][]) {
   const empty = { action: "HOLD" as const, rsi: 50, price: 0, volumeRatio: 1, atr: 0, atrPct: 0, cross: null as string | null, score: 0 };
@@ -364,6 +318,62 @@ function calculateMeanRevSignal(ohlcv: number[][]) {
   return { action, rsi, price, volumeRatio, atr, atrPct, bbPos, score };
 }
 
+// ── SWING-LONG Strategy (4h, multi-day hold) ──────────────────────────────────
+// Long-only trend-following strategy on 4h candles.
+// Requires EMA alignment (price > EMA20 > EMA50 > EMA200), MACD bullish,
+// ADX directional, and healthy RSI. Holds positions for 1-7 days.
+function calculateSwingLongSignal(ohlcv: number[][]) {
+  const closes  = ohlcv.map(c => c[4]);
+  const volumes = ohlcv.map(c => c[5]);
+  const price   = closes[closes.length - 1];
+  const HOLD = { action: "HOLD" as const, price, rsi: 50, volumeRatio: 1, atr: 0, atrPct: 0, score: 0, buyScore: 0, sellScore: 0, emaAlign: 0, macdBull: false, adxBull: false, ema20: 0, ema50: 0, ema200: 0, adx: 0, plusDI: 0, minusDI: 0 };
+  if (ohlcv.length < 55) return HOLD;
+
+  const rsi         = parseFloat(calcRSI(closes).toFixed(2));
+  const atr         = parseFloat(calcATR(ohlcv, 14).toFixed(6));
+  const atrPct      = price > 0 ? parseFloat((atr / price * 100).toFixed(4)) : 0;
+  const volumeRatio = parseFloat(calcVolumeRatio(volumes).toFixed(2));
+
+  const ema20arr = calcEMA(closes, 20);
+  const ema50arr = calcEMA(closes, 50);
+  const ema20    = ema20arr[ema20arr.length - 1] ?? 0;
+  const ema50    = ema50arr[ema50arr.length - 1] ?? 0;
+
+  const hasLongData = ohlcv.length >= 200;
+  const ema200arr   = hasLongData ? calcEMA(closes, 200) : null;
+  const ema200      = ema200arr ? (ema200arr[ema200arr.length - 1] ?? 0) : 0;
+
+  // MACD: line = EMA12 - EMA26, signal = EMA9 of MACD line series
+  const ema12arr   = calcEMA(closes, 12);
+  const ema26arr   = calcEMA(closes, 26);
+  const macdSeries = ema12arr
+    .map((e12, i) => (isNaN(e12) || isNaN(ema26arr[i])) ? NaN : e12 - ema26arr[i])
+    .filter(v => !isNaN(v));
+  const macdSigArr = calcEMA(macdSeries, 9);
+  const macdLine   = macdSeries[macdSeries.length - 1] ?? 0;
+  const macdSig    = macdSigArr[macdSigArr.length - 1] ?? 0;
+  const macdBull   = macdLine > macdSig;
+
+  const { adx, plusDI, minusDI } = calcADX(ohlcv, 14);
+  const adxBull = adx > 20 && plusDI > minusDI;
+
+  // ── Score (max 7, BUY threshold = 5) ──
+  let score = 0, emaAlign = 0;
+  if (price > ema20 && ema20 > 0)                     { score += 1; emaAlign++; }
+  if (ema20  > ema50 && ema50 > 0)                    { score += 1; emaAlign++; }
+  if (hasLongData && ema200 > 0 && ema50 > ema200)    { score += 1; emaAlign++; }
+  if (rsi >= 40 && rsi <= 68)                         score += 1;
+  if (macdBull)                                       score += 1;
+  if (adxBull)                                        score += 1;
+  if (volumeRatio >= 1.0)                             score += 1;
+
+  // Hard gate: EMA50 > EMA200 required when data is available (no longs in bear structure)
+  const longTermBull = !hasLongData || (ema200 > 0 && ema50 > ema200);
+  const action: "BUY" | "HOLD" = (score >= 5 && longTermBull) ? "BUY" : "HOLD";
+
+  return { action, price, rsi, atr, atrPct, volumeRatio, score, buyScore: score, sellScore: 0, emaAlign, macdBull, adxBull, ema20, ema50, ema200, adx, plusDI, minusDI };
+}
+
 // ── OHLCV Persistence ──────────────────────────────────────────────────────────
 
 async function saveOHLCV(symbol: string, candles: number[][], timeframe = "1m") {
@@ -385,23 +395,23 @@ const SYMBOLS   = ["BTC/USDT", "ETH/USDT", "SOL/USDT", "XRP/USDT", "BNB/USDT", "
 const toWsSym   = (s: string) => s.replace("/", "").toLowerCase();    // BTC/USDT → btcusdt
 const toCcxtSym = (s: string) => s.slice(0, -4) + "/" + s.slice(-4); // BTCUSDT → BTC/USDT
 
-// Rolling 50-candle buffer per symbol (1m), updated by WebSocket
-const candleBuffer   = new Map<string, number[][]>(SYMBOLS.map(s => [s, []]));
 // 50-candle buffer (5m) for MOMENTUM ARB strategy
 const momentumBuffer = new Map<string, number[][]>(SYMBOLS.map(s => [s, []]));
 // 200-candle buffer (15m) for trend filter — EMA200 direction
 const trendBuffer    = new Map<string, number[][]>(SYMBOLS.map(s => [s, []]));
+// 250-candle buffer (4h) for SWING-LONG — covers EMA200 (~33 days)
+const swingBuffer    = new Map<string, number[][]>(SYMBOLS.map(s => [s, []]));
 // Per-strategy action + attempt trackers — transition detection + retry without flooding the exchange
-const lastUltraScalpAction  = new Map<string, string>(SYMBOLS.map(s => [s, "HOLD"]));
-const lastUltraScalpAttempt = new Map<string, number>(SYMBOLS.map(s => [s, 0]));
 const lastMomentumAction    = new Map<string, string>(SYMBOLS.map(s => [s, "HOLD"]));
 const lastMomentumAttempt   = new Map<string, number>(SYMBOLS.map(s => [s, 0]));
 const lastMeanRevAction     = new Map<string, string>(SYMBOLS.map(s => [s, "HOLD"]));
 const lastMeanRevAttempt    = new Map<string, number>(SYMBOLS.map(s => [s, 0]));
+const lastSwingAction       = new Map<string, string>(SYMBOLS.map(s => [s, "HOLD"]));
+const lastSwingAttempt      = new Map<string, number>(SYMBOLS.map(s => [s, 0]));
 
 let scanResults: any[] = [];
-// Set of currently enabled strategies — all three active by default
-let activeStrategies = new Set<string>(["ULTRA-SCALP", "MOMENTUM-ARB", "MEAN-REV"]);
+// Set of currently enabled strategies — includes SWING-LONG
+let activeStrategies = new Set<string>(["MOMENTUM-ARB", "MEAN-REV", "SWING-LONG"]);
 // Taker fee rate — configurable via Settings, persisted in DB
 let takerRate = 0.0004;
 
@@ -568,20 +578,28 @@ async function checkAutoExecute(symbol: string, signal: AnySignal, strategyName:
     return;
   }
 
-  // Regime-based strategy gating (ADX on 15m)
-  if (strategyName === "MEAN-REV" && regime === "TRENDING") {
-    checks.push({ name: "Regime Gate", status: "block", detail: `MEAN-REV blocked — ADX ${adx.toFixed(1)} (strong trend)` });
-    pushValidation({ id: vid, timestamp: Date.now(), symbol, strategy: strategyName, action: signal.action, finalStatus: "blocked", checks });
-    console.log(`[REGIME] ${symbol} MEAN-REV blocked — ADX ${adx} (strong trend)`);
-    return;
+  // Regime-based strategy gating (ADX on 15m).
+  // In manual mode (bypassAutoPilot) the gate is advisory only — the user chose to
+  // execute, so we warn but don't block. Auto mode keeps the hard block.
+  const meanRevConflict  = strategyName === "MEAN-REV"      && regime === "TRENDING";
+  const momentumConflict = strategyName === "MOMENTUM-ARB"  && regime === "RANGING";
+  if (meanRevConflict || momentumConflict) {
+    const reason = meanRevConflict
+      ? `ADX ${adx.toFixed(1)} (strong trend) — mean-rev contra-trend risk`
+      : `ADX ${adx.toFixed(1)} (ranging) — momentum needs directional move`;
+    if (bypassAutoPilot) {
+      // Manual override: log warning but allow execution
+      checks.push({ name: "Regime Gate", status: "info", detail: `⚠ MANUAL OVERRIDE — ${reason}` });
+      console.log(`[REGIME] ${symbol} ${strategyName} regime mismatch WARNED (manual override) — ${reason}`);
+    } else {
+      checks.push({ name: "Regime Gate", status: "block", detail: `${strategyName} blocked — ${reason}` });
+      pushValidation({ id: vid, timestamp: Date.now(), symbol, strategy: strategyName, action: signal.action, finalStatus: "blocked", checks });
+      console.log(`[REGIME] ${symbol} ${strategyName} blocked — ${reason}`);
+      return;
+    }
+  } else {
+    checks.push({ name: "Regime Gate", status: "pass", detail: `${strategyName} allowed in ${regime} regime` });
   }
-  if (strategyName === "MOMENTUM-ARB" && regime === "RANGING") {
-    checks.push({ name: "Regime Gate", status: "block", detail: `MOMENTUM-ARB blocked — ADX ${adx.toFixed(1)} (ranging market)` });
-    pushValidation({ id: vid, timestamp: Date.now(), symbol, strategy: strategyName, action: signal.action, finalStatus: "blocked", checks });
-    console.log(`[REGIME] ${symbol} MOMENTUM-ARB blocked — ADX ${adx} (ranging market)`);
-    return;
-  }
-  checks.push({ name: "Regime Gate", status: "pass", detail: `${strategyName} allowed in ${regime} regime` });
 
   // Trend filter — only MOMENTUM-ARB uses this
   if (strategyName === "MOMENTUM-ARB") {
@@ -604,15 +622,12 @@ async function checkAutoExecute(symbol: string, signal: AnySignal, strategyName:
     checks.push({ name: "Trend", status: "pass", detail: `Skipped — ${strategyName} ignores trend` });
   }
 
-  // Volume thresholds — loosened to match observed crypto perp volume variance.
-  // ULTRA-SCALP fires on 1m where vol is bursty; MEAN-REV is intentionally
-  // permissive because mean-reversion setups appear in quiet candles.
+  // Volume thresholds — MEAN-REV is intentionally permissive because
+  // mean-reversion setups appear in quiet candles.
   const volThreshold = strategyName === "MEAN-REV"     ? 0.6
                      : strategyName === "MOMENTUM-ARB" ? 0.8
                      :                                   0.7;
-  const volRatio = strategyName === "ULTRA-SCALP"
-    ? parseFloat(calcVolumeRatio((candleBuffer.get(symbol) || []).map(c => c[5])).toFixed(2))
-    : signal.volumeRatio ?? 1;
+  const volRatio = signal.volumeRatio ?? 1;
   if (volRatio < volThreshold) {
     checks.push({ name: "Volume", status: "block", detail: `${volRatio.toFixed(2)}× < ${volThreshold}× threshold` });
     pushValidation({ id: vid, timestamp: Date.now(), symbol, strategy: strategyName, action: signal.action, finalStatus: "blocked", checks });
@@ -719,7 +734,10 @@ async function checkAutoExecute(symbol: string, signal: AnySignal, strategyName:
   checks.push({ name: "Open Position", status: "pass", detail: `No open ${strategyName} position` });
 
   // 2. Cooldown per strategy
-  const cooldown = strategyName === "MOMENTUM-ARB" ? "15 minutes" : strategyName === "MEAN-REV" ? "30 minutes" : "5 minutes";
+  const cooldown = strategyName === "SWING-LONG"   ? "24 hours"
+                 : strategyName === "MOMENTUM-ARB" ? "15 minutes"
+                 : strategyName === "MEAN-REV"      ? "30 minutes"
+                 :                                   "5 minutes";
   const recent   = await pool.query(
     `SELECT id FROM trades WHERE symbol = $1 AND strategy = $2
      AND timestamp > NOW() - INTERVAL '${cooldown}' LIMIT 1`, [symbol, strategyName]
@@ -732,16 +750,19 @@ async function checkAutoExecute(symbol: string, signal: AnySignal, strategyName:
   }
   checks.push({ name: "Cooldown", status: "pass", detail: `None (${cooldown} window clear)` });
 
-  // ATR multipliers differ per strategy
-  const cfgRow   = await pool.query("SELECT leverage, risk_level, atr_sl_mult::float, atr_tp_mult::float, arb_sl_mult::float, arb_tp_mult::float, mr_sl_mult::float, mr_tp_mult::float FROM bot_settings WHERE id = 'bot_config'");
-  const leverage = cfgRow.rows[0]?.leverage || 10;
+  // ATR multipliers and leverage differ per strategy
+  const cfgRow   = await pool.query("SELECT leverage, risk_level, atr_sl_mult::float, atr_tp_mult::float, arb_sl_mult::float, arb_tp_mult::float, mr_sl_mult::float, mr_tp_mult::float, swing_leverage::int, swing_sl_mult::float, swing_tp_mult::float FROM bot_settings WHERE id = 'bot_config'");
+  const leverage = strategyName === "SWING-LONG" ? (cfgRow.rows[0]?.swing_leverage ?? 3)
+                 : cfgRow.rows[0]?.leverage || 10;
   const riskPct  = (cfgRow.rows[0]?.risk_level ?? 1) / 100;
-  const slMult   = strategyName === "MOMENTUM-ARB" ? (cfgRow.rows[0]?.arb_sl_mult ?? 1.0)
-                 : strategyName === "MEAN-REV"      ? (cfgRow.rows[0]?.mr_sl_mult  ?? 1.0)
-                 :                                    (cfgRow.rows[0]?.atr_sl_mult ?? 1.5);
-  const tpMult   = strategyName === "MOMENTUM-ARB" ? (cfgRow.rows[0]?.arb_tp_mult ?? 3.0)
-                 : strategyName === "MEAN-REV"      ? (cfgRow.rows[0]?.mr_tp_mult  ?? 2.0)
-                 :                                    (cfgRow.rows[0]?.atr_tp_mult ?? 4.0);
+  const slMult   = strategyName === "SWING-LONG"   ? (cfgRow.rows[0]?.swing_sl_mult ?? 2.0)
+                 : strategyName === "MOMENTUM-ARB" ? (cfgRow.rows[0]?.arb_sl_mult  ?? 1.0)
+                 : strategyName === "MEAN-REV"      ? (cfgRow.rows[0]?.mr_sl_mult   ?? 1.0)
+                 :                                    (cfgRow.rows[0]?.atr_sl_mult  ?? 1.5);
+  const tpMult   = strategyName === "SWING-LONG"   ? (cfgRow.rows[0]?.swing_tp_mult ?? 8.0)
+                 : strategyName === "MOMENTUM-ARB" ? (cfgRow.rows[0]?.arb_tp_mult  ?? 3.0)
+                 : strategyName === "MEAN-REV"      ? (cfgRow.rows[0]?.mr_tp_mult   ?? 2.0)
+                 :                                    (cfgRow.rows[0]?.atr_tp_mult  ?? 4.0);
   const side      = signal.action === "BUY" ? "buy" : "sell";
   const closeSide = signal.action === "BUY" ? "sell" : "buy";
   const isLong    = signal.action === "BUY";
@@ -834,7 +855,7 @@ async function checkAutoExecute(symbol: string, signal: AnySignal, strategyName:
 
     // ── ATR-based dynamic levels with market-context adjustment ──
     const atrPctFill = (signal.atr ?? 0) / fillPrice;
-    const vwap       = parseFloat(calcVWAP(candleBuffer.get(symbol) || []).toFixed(6));
+    const vwap       = parseFloat(calcVWAP(momentumBuffer.get(symbol) || []).toFixed(6));
     const oiD        = openInterestCache.get(symbol);
     const { tpBonus: tb, slMult: ctxSlMult } = calcContextMultipliers(
       signal.action, strategyName,
@@ -853,10 +874,37 @@ async function checkAutoExecute(symbol: string, signal: AnySignal, strategyName:
     }
     console.log(`[AUTO] ATR-SL:${(dynSlPct*100).toFixed(3)}% (cb:${callbackRate}%)  ATR-TP:${(dynTpPct*100).toFixed(3)}% @ ${tpPrice}`);
 
-    // ── Native TP order ──
+    // Wait for Binance position engine to register the fill before placing TP/SL.
+    // Without this, reduceOnly orders can be rejected because the position hasn't
+    // appeared yet from Binance's perspective.
+    await new Promise(r => setTimeout(r, 400));
+
+    // Fetch actual position size so TP/SL amount exactly matches what Binance holds.
+    // Using the computed `amount` risks reduceOnly rejection if exchange precision differs.
+    let tpSlAmount = amount;
     try {
-      await binance.createOrder(symbol, "TAKE_PROFIT_MARKET", closeSide, amount, undefined, {
-        stopPrice: tpPrice, reduceOnly: true, workingType: "MARK_PRICE", priceProtect: true,
+      const positions = await binance.fetchPositions([symbol]);
+      const pos = positions.find((p: any) => {
+        const sym = (p.symbol as string).split(":")[0];
+        return sym === symbol && Math.abs(Number(p.contracts ?? 0)) > 0;
+      });
+      if (pos) {
+        const posAmt = parseFloat((binance as any).amountToPrecision(symbol, Math.abs(Number(pos.contracts))));
+        if (posAmt > 0) {
+          tpSlAmount = posAmt;
+          console.log(`[AUTO] Using actual position size ${tpSlAmount} (computed was ${amount})`);
+        }
+      }
+    } catch (e: any) {
+      console.warn(`[AUTO] Could not fetch position size, using computed amount:`, e?.message);
+    }
+
+    // ── Native TP order ──
+    // priceProtect omitted — it causes false -4061 rejections when mark price is
+    // slightly ahead of fill price at placement time.
+    try {
+      await binance.createOrder(symbol, "TAKE_PROFIT_MARKET", closeSide, tpSlAmount, undefined, {
+        stopPrice: tpPrice, reduceOnly: true, workingType: "MARK_PRICE",
       });
       checks.push({ name: "Take Profit", status: "pass", detail: `@ $${tpPrice.toLocaleString()}` });
       console.log(`[AUTO] TP order placed @ ${tpPrice}`);
@@ -868,7 +916,7 @@ async function checkAutoExecute(symbol: string, signal: AnySignal, strategyName:
 
     // ── Native Trailing SL ──
     try {
-      await binance.createOrder(symbol, "TRAILING_STOP_MARKET", closeSide, amount, undefined, {
+      await binance.createOrder(symbol, "TRAILING_STOP_MARKET", closeSide, tpSlAmount, undefined, {
         callbackRate, reduceOnly: true, workingType: "MARK_PRICE",
       });
       checks.push({ name: "Trailing SL", status: "pass", detail: `${callbackRate}% callback` });
@@ -919,18 +967,11 @@ async function checkAutoExecute(symbol: string, signal: AnySignal, strategyName:
 // ── WebSocket — Binance Futures Kline Stream ───────────────────────────────────
 
 async function seedCandleBuffer() {
-  console.log(`[SEED] Fetching 1m + 5m + 15m candles (active: ${[...activeStrategies].join(", ")})...`);
+  console.log(`[SEED] Fetching 5m + 15m + 4h candles (active: ${[...activeStrategies].join(", ")})...`);
   await Promise.all(SYMBOLS.map(async symbol => {
     try {
-      // 1m — ULTRA-SCALP signal indicators
-      // Fetch +1 extra and drop the last candle — REST API always returns the currently-open
-      // (incomplete) candle as the final element, whose partial volume would skew the ratio.
-      const ohlcv1m = await binance.fetchOHLCV(symbol, "1m", undefined, 51);
-      const buf1m   = ohlcv1m.slice(0, -1).map((c: any[]) => c.map(Number) as number[]);
-      candleBuffer.set(symbol, buf1m);
-      await saveOHLCV(symbol, buf1m);
-
       // 5m — MOMENTUM ARB (50 candles ≈ 4 hours)
+      // Fetch +1 extra and drop the last (currently-open) candle so partial volume doesn't skew the ratio.
       const ohlcv5m = await binance.fetchOHLCV(symbol, "5m", undefined, 51);
       const buf5m   = ohlcv5m.slice(0, -1).map((c: any[]) => c.map(Number) as number[]);
       momentumBuffer.set(symbol, buf5m);
@@ -941,44 +982,87 @@ async function seedCandleBuffer() {
       trendBuffer.set(symbol, buf15m);
       await saveOHLCV(symbol, buf15m, "15m");
 
-      // Build initial scanResult for ALL strategies simultaneously
-      const trend  = getTrend(symbol);
+      // 4h — SWING-LONG (252 candles ≈ 42 days — enough for valid EMA200 on 4h)
+      const ohlcv4h = await binance.fetchOHLCV(symbol, "4h", undefined, 252);
+      const buf4h   = ohlcv4h.slice(0, -1).map((c: any[]) => c.map(Number) as number[]);
+      swingBuffer.set(symbol, buf4h);
+
+      // Build initial scanResult for all strategies simultaneously
+      const trend    = getTrend(symbol);
       const { regime, adx, plusDI, minusDI } = getRegime(symbol);
-      const sig1m  = calculateSignal(buf1m);
-      const sig5m  = calculateMomentumSignal(buf5m);
-      const sigMR  = calculateMeanRevSignal(buf15m);
-      const entry  = {
+      const sig5m    = calculateMomentumSignal(buf5m);
+      const sigMR    = calculateMeanRevSignal(buf15m);
+      const sigSwing = calculateSwingLongSignal(buf4h);
+      const entry    = {
         symbol,
-        price:       sig1m.price || sig5m.price,
+        price:       sig5m.price,
         trend,
         regime,
         adx,
         plusDI,
         minusDI,
-        vwap:        parseFloat(calcVWAP(buf1m).toFixed(6)),
+        vwap:        parseFloat(calcVWAP(buf5m).toFixed(6)),
         oiChangePct: openInterestCache.get(symbol)?.oiChangePct ?? null,
         lsRatio:     longShortCache.get(symbol) ?? null,
-        ultraScalp:  { action: sig1m.action, rsi: sig1m.rsi, volumeRatio: sig1m.volumeRatio, atrPct: sig1m.atrPct, score: sig1m.score, buyScore: sig1m.buyScore, sellScore: sig1m.sellScore },
         momentumArb: { action: sig5m.action, rsi: sig5m.rsi, volumeRatio: sig5m.volumeRatio, atrPct: sig5m.atrPct, cross: sig5m.cross, score: sig5m.score },
         meanRev:     { action: sigMR.action, rsi: sigMR.rsi, volumeRatio: sigMR.volumeRatio, atrPct: sigMR.atrPct, bbPos: sigMR.bbPos, score: sigMR.score },
+        swingLong:   { action: sigSwing.action, rsi: sigSwing.rsi, volumeRatio: sigSwing.volumeRatio, atrPct: sigSwing.atrPct, score: sigSwing.score, emaAlign: sigSwing.emaAlign, macdBull: sigSwing.macdBull, adxBull: sigSwing.adxBull, ema20: sigSwing.ema20, ema50: sigSwing.ema50, ema200: sigSwing.ema200, adx: sigSwing.adx },
       };
       const idx = scanResults.findIndex(r => r.symbol === symbol);
       if (idx >= 0) scanResults[idx] = entry; else scanResults.push(entry);
-      console.log(`[SEED] ${symbol} US:${sig1m.action} MA:${sig5m.action} MR:${sigMR.action} trend:${trend} regime:${regime}(ADX:${adx})`);
+      console.log(`[SEED] ${symbol} MA:${sig5m.action} MR:${sigMR.action} SW:${sigSwing.action}(${sigSwing.score.toFixed(1)}) trend:${trend} regime:${regime}(ADX:${adx})`);
     } catch (e: any) {
       console.error(`[SEED] ${symbol}:`, e?.message);
     }
   }));
 }
 
+// Refresh 4h swing buffers via REST every 15 min — 4h candles change slowly so
+// WebSocket is unnecessary; REST poll is cleaner and avoids stream count limits.
+async function refreshSwingBuffers() {
+  await Promise.all(SYMBOLS.map(async symbol => {
+    try {
+      const ohlcv4h = await binance.fetchOHLCV(symbol, "4h", undefined, 252);
+      const buf4h   = ohlcv4h.slice(0, -1).map((c: any[]) => c.map(Number) as number[]);
+      swingBuffer.set(symbol, buf4h);
+
+      if (buf4h.length < 55) return;
+      const signal = calculateSwingLongSignal(buf4h);
+
+      const idx = scanResults.findIndex(r => r.symbol === symbol);
+      if (idx >= 0) {
+        scanResults[idx].swingLong = {
+          action: signal.action, rsi: signal.rsi, volumeRatio: signal.volumeRatio,
+          atrPct: signal.atrPct, score: signal.score,
+          emaAlign: signal.emaAlign, macdBull: signal.macdBull, adxBull: signal.adxBull,
+          ema20: signal.ema20, ema50: signal.ema50, ema200: signal.ema200, adx: signal.adx,
+        };
+      }
+
+      const prevAction  = lastSwingAction.get(symbol) || "HOLD";
+      const lastAttempt = lastSwingAttempt.get(symbol) ?? 0;
+      const isNew   = signal.action === "BUY" && prevAction === "HOLD";
+      const isRetry = signal.action === "BUY" && (Date.now() - lastAttempt) > 30 * 60 * 1000;
+
+      if (activeStrategies.has("SWING-LONG") && (isNew || isRetry)) {
+        lastSwingAttempt.set(symbol, Date.now());
+        if (isNew) sendSignalAlert(symbol, signal as AnySignal, "SWING-LONG");
+        await checkAutoExecute(symbol, signal as AnySignal, "SWING-LONG");
+      }
+      lastSwingAction.set(symbol, signal.action);
+    } catch (e: any) {
+      console.error(`[SWING] Refresh error [${symbol}]:`, e?.message);
+    }
+  }));
+}
+
 function initWebSocket() {
-  const streams1m  = SYMBOLS.map(s => `${toWsSym(s)}@kline_1m`);
   const streams5m  = SYMBOLS.map(s => `${toWsSym(s)}@kline_5m`);
   const streams15m = SYMBOLS.map(s => `${toWsSym(s)}@kline_15m`);
-  const allStreams  = [...streams1m, ...streams5m, ...streams15m].join("/");
+  const allStreams  = [...streams5m, ...streams15m].join("/");
   const ws = new WebSocket(`wss://fstream.binance.com/stream?streams=${allStreams}`);
 
-  ws.on("open", () => console.log("[WS] Connected — 1m + 5m + 15m streams"));
+  ws.on("open", () => console.log("[WS] Connected — 5m + 15m streams"));
 
   ws.on("message", async (raw: Buffer) => {
     try {
@@ -1050,6 +1134,10 @@ function initWebSocket() {
           const entry  = scanResults[idx] || { symbol, price: signal.price, trend };
           entry.trend       = trend;
           entry.price       = signal.price;
+          entry.vwap        = parseFloat(calcVWAP(buf5).toFixed(6));
+          entry.oiChangePct = openInterestCache.get(symbol)?.oiChangePct ?? null;
+          entry.lsRatio     = longShortCache.get(symbol) ?? null;
+          entry.lastTickMs  = Date.now();
           entry.momentumArb = { action: signal.action, rsi: signal.rsi, volumeRatio: signal.volumeRatio, atrPct: signal.atrPct, cross: signal.cross, score: signal.score };
           if (idx >= 0) scanResults[idx] = entry; else scanResults.push(entry);
 
@@ -1065,51 +1153,6 @@ function initWebSocket() {
           lastMomentumAction.set(symbol, signal.action);
         }
         return;
-      }
-
-      // ── 1m: ULTRA-SCALP — compute on every tick, execute on HOLD→BUY/SELL transition ──
-      const buffer = candleBuffer.get(symbol) || [];
-      if (k.x) {
-        buffer.push(candle);
-        if (buffer.length > 50) buffer.shift();
-        candleBuffer.set(symbol, buffer);
-        await saveOHLCV(symbol, [candle]);
-      }
-
-      // Append live in-progress candle so signal reacts in real-time, not at candle close
-      const liveBuffer = buffer.length > 0 ? (k.x ? buffer : [...buffer, candle]) : buffer;
-      if (liveBuffer.length >= 26) {
-        const signal = calculateSignal(liveBuffer);
-        const trend  = getTrend(symbol);
-        const idx    = scanResults.findIndex(r => r.symbol === symbol);
-        const entry  = scanResults[idx] || { symbol, price: signal.price, trend };
-        entry.trend       = trend;
-        entry.price       = signal.price;
-        entry.vwap        = parseFloat(calcVWAP(liveBuffer).toFixed(6));
-        entry.oiChangePct = openInterestCache.get(symbol)?.oiChangePct ?? null;
-        entry.lsRatio     = longShortCache.get(symbol) ?? null;
-        // Use closed-candle volume ratio for the scan result so the frontend displays the same
-        // value that checkAutoExecute actually checks (not the partial in-progress candle's volume).
-        const closedVolumeRatio = parseFloat(calcVolumeRatio(buffer.map(c => c[5])).toFixed(2));
-        entry.ultraScalp  = { action: signal.action, rsi: signal.rsi, volumeRatio: closedVolumeRatio, atrPct: signal.atrPct, score: signal.score, buyScore: signal.buyScore, sellScore: signal.sellScore };
-        entry.lastTickMs  = Date.now();
-        if (idx >= 0) scanResults[idx] = entry; else scanResults.push(entry);
-
-        // Fire on HOLD→signal transition, OR retry every 3 min if the signal persists.
-        // Without retry, a single blocked shot (e.g. volume low at candle start) wastes the entire BUY streak.
-        const prevAction  = lastUltraScalpAction.get(symbol)  || "HOLD";
-        const lastAttempt = lastUltraScalpAttempt.get(symbol) ?? 0;
-        const isNewSignal = signal.action !== "HOLD" && prevAction === "HOLD";
-        const isRetry     = signal.action !== "HOLD" && (Date.now() - lastAttempt) > 60 * 1000;
-        if (activeStrategies.has("ULTRA-SCALP") && (isNewSignal || isRetry)) {
-          lastUltraScalpAttempt.set(symbol, Date.now());
-          if (isNewSignal) sendSignalAlert(symbol, signal, "ULTRA-SCALP");
-          await checkAutoExecute(symbol, signal, "ULTRA-SCALP");
-        }
-        lastUltraScalpAction.set(symbol, signal.action);
-      } else {
-        const idx = scanResults.findIndex(r => r.symbol === symbol);
-        if (idx >= 0) scanResults[idx] = { ...scanResults[idx], price: +k.c };
       }
     } catch (e: any) {
       console.error("[WS] Message error:", e?.message);
@@ -1259,11 +1302,7 @@ async function sendSignalAlert(symbol: string, signal: AnySignal, strategyName: 
 
   // Rationale lines based on strategy
   const lines: string[] = [];
-  if (strategyName === "ULTRA-SCALP") {
-    if ((signal.buyScore ?? 0) >= 2 || (signal.sellScore ?? 0) >= 2) lines.push(`• EMA9/21 aligned (+2.0)`);
-    if ((signal.buyScore ?? 0) >= 1.5 || (signal.sellScore ?? 0) >= 1.5) lines.push(`• MACD momentum (+1.5)`);
-    if (signal.rsi < 35 || signal.rsi > 65) lines.push(`• RSI extreme (+1.0)`);
-  } else if (strategyName === "MOMENTUM-ARB") {
+  if (strategyName === "MOMENTUM-ARB") {
     lines.push(`• Fresh EMA crossover (+3.0)`);
     if (signal.rsi > 55 && isLong) lines.push(`• RSI momentum > 55 (+1.0)`);
     if (signal.rsi < 45 && !isLong) lines.push(`• RSI momentum < 45 (+1.0)`);
@@ -1686,7 +1725,8 @@ app.get("/api/settings", async (req, res) => {
 app.post("/api/settings", async (req, res) => {
   const { isAutoPilot, riskLevel, maxSlippage, takeProfitPct, stopLossPct, leverage,
           atrSlMult, atrTpMult, arbSlMult, arbTpMult, mrSlMult, mrTpMult, activeStrategiesVal,
-          telegramBotToken, telegramChatId, takerRateVal } = req.body;
+          telegramBotToken, telegramChatId, takerRateVal,
+          swingLeverageVal, swingSlMult, swingTpMult } = req.body;
   const strategiesParam = Array.isArray(activeStrategiesVal) ? activeStrategiesVal : null;
   try {
     const r = await pool.query(
@@ -1706,14 +1746,19 @@ app.post("/api/settings", async (req, res) => {
            mr_tp_mult        = COALESCE($13, mr_tp_mult),
            telegram_bot_token = NULLIF(COALESCE($14, telegram_bot_token), ''),
            telegram_chat_id   = NULLIF(COALESCE($15, telegram_chat_id), ''),
-           taker_rate         = COALESCE($16, taker_rate)
+           taker_rate         = COALESCE($16, taker_rate),
+           swing_leverage     = COALESCE($17, swing_leverage),
+           swing_sl_mult      = COALESCE($18, swing_sl_mult),
+           swing_tp_mult      = COALESCE($19, swing_tp_mult)
        WHERE id = 'bot_config' RETURNING *`,
       [isAutoPilot ?? null, riskLevel ?? null, maxSlippage ?? null,
        takeProfitPct ?? null, stopLossPct ?? null, leverage ?? null,
        atrSlMult ?? null, atrTpMult ?? null, arbSlMult ?? null, arbTpMult ?? null,
        strategiesParam, mrSlMult ?? null, mrTpMult ?? null,
        telegramBotToken ?? null, telegramChatId ?? null,
-       takerRateVal != null ? parseFloat(takerRateVal) : null]
+       takerRateVal != null ? parseFloat(takerRateVal) : null,
+       swingLeverageVal != null ? parseInt(swingLeverageVal) : null,
+       swingSlMult ?? null, swingTpMult ?? null]
     );
     // Sync in-memory values so they take effect immediately without restart
     if (strategiesParam) {
@@ -1735,7 +1780,7 @@ app.post("/api/test-telegram", async (req, res) => {
       await sendSignalAlert(
         "BTC/USDT",
         { action: "BUY", price: 64250, rsi: 34, atr: 125, atrPct: 0.19, volumeRatio: 1.8, score: 4.2 } as any,
-        "ULTRA-SCALP"
+        "MOMENTUM-ARB"
       );
     } else {
       await sendTelegram(
@@ -1835,14 +1880,14 @@ app.post("/api/ai-confirm", async (req, res) => {
 app.post("/api/manual-execute", async (req, res) => {
   const { symbol, strategy } = req.body as { symbol: string; strategy: string };
   if (!symbol || !strategy) return res.status(400).json({ error: "symbol and strategy required" });
-  if (!["ULTRA-SCALP", "MOMENTUM-ARB", "MEAN-REV"].includes(strategy))
+  if (!["MOMENTUM-ARB", "MEAN-REV", "SWING-LONG"].includes(strategy))
     return res.status(400).json({ error: `Unknown strategy: ${strategy}` });
 
   let signal: AnySignal;
-  if (strategy === "ULTRA-SCALP") {
-    signal = calculateSignal(candleBuffer.get(symbol) || []) as AnySignal;
-  } else if (strategy === "MOMENTUM-ARB") {
+  if (strategy === "MOMENTUM-ARB") {
     signal = calculateMomentumSignal(momentumBuffer.get(symbol) || []) as AnySignal;
+  } else if (strategy === "SWING-LONG") {
+    signal = calculateSwingLongSignal(swingBuffer.get(symbol) || []) as AnySignal;
   } else {
     signal = calculateMeanRevSignal(trendBuffer.get(symbol) || []) as AnySignal;
   }
@@ -1890,15 +1935,15 @@ app.get("/api/check-api", async (req, res) => {
 
 // ── Force-test a real order for a specific symbol/strategy ───────────────────
 app.post("/api/test-trade", async (req, res) => {
-  const { symbol, strategy = "ULTRA-SCALP", action = "BUY" } = req.body;
+  const { symbol, strategy = "MOMENTUM-ARB", action = "BUY" } = req.body;
   if (!symbol) return res.status(400).json({ error: "symbol required" });
-  const buf = strategy === "MOMENTUM-ARB" ? momentumBuffer.get(symbol)
-            : strategy === "MEAN-REV"     ? trendBuffer.get(symbol)
-            :                               candleBuffer.get(symbol);
+  const buf = strategy === "MEAN-REV"  ? trendBuffer.get(symbol)
+            : strategy === "SWING-LONG" ? swingBuffer.get(symbol)
+            :                            momentumBuffer.get(symbol);
   if (!buf || buf.length < 10) return res.status(400).json({ error: "buffer not ready" });
-  const signal = strategy === "MOMENTUM-ARB" ? calculateMomentumSignal(buf)
-               : strategy === "MEAN-REV"     ? calculateMeanRevSignal(buf)
-               :                               calculateSignal(buf);
+  const signal = strategy === "MEAN-REV"  ? calculateMeanRevSignal(buf)
+               : strategy === "SWING-LONG" ? calculateSwingLongSignal(buf)
+               :                            calculateMomentumSignal(buf);
   const forced = { ...signal, action: action as "BUY" | "SELL" };
   try {
     await checkAutoExecute(symbol, forced, strategy);
@@ -1979,10 +2024,8 @@ app.get("/api/diagnose", async (_req, res) => {
     }
 
     const results = await Promise.all(SYMBOLS.map(async symbol => {
-      const buf1m  = candleBuffer.get(symbol)  || [];
       const buf5m  = momentumBuffer.get(symbol) || [];
       const buf15m = trendBuffer.get(symbol)    || [];
-      const sig1m  = calculateSignal(buf1m);
       const sig5m  = calculateMomentumSignal(buf5m);
       const sig15m = calculateMeanRevSignal(buf15m);
       const fr     = fundingRateCache.get(symbol);
@@ -2005,7 +2048,7 @@ app.get("/api/diagnose", async (_req, res) => {
         trend: getTrend(symbol),
         regime,
         adx,
-        buffers: { "1m": buf1m.length, "5m": buf5m.length, "15m": buf15m.length },
+        buffers: { "5m": buf5m.length, "15m": buf15m.length },
         openTrades: openTrades.length,
         cooldownBlocking: cooldownBlocking.length > 0,
         context: {
@@ -2014,7 +2057,6 @@ app.get("/api/diagnose", async (_req, res) => {
           lsRatio:      ls ?? null,
         },
         strategies: {
-          "ULTRA-SCALP":  { action: sig1m.action,  rsi: sig1m.rsi,  vol: sig1m.volumeRatio,  atrPct: sig1m.atrPct,  block: addCooldownNote(filterBlock(sig1m,  "ULTRA-SCALP",  symbol)) },
           "MOMENTUM-ARB": { action: sig5m.action,  rsi: sig5m.rsi,  vol: sig5m.volumeRatio,  atrPct: sig5m.atrPct,  cross: (sig5m as any).cross, block: addCooldownNote(filterBlock(sig5m,  "MOMENTUM-ARB", symbol)) },
           "MEAN-REV":     { action: sig15m.action, rsi: sig15m.rsi, vol: sig15m.volumeRatio, atrPct: sig15m.atrPct, bbPos: (sig15m as any).bbPos, block: addCooldownNote(filterBlock(sig15m, "MEAN-REV",     symbol)) },
         },
@@ -2067,9 +2109,8 @@ app.get("/api/threshold-analysis", async (req, res) => {
     // Current thresholds — kept here so the response self-documents what it's measuring against.
     const CURRENT = {
       adx: { trending: 32, ranging: 18 },
-      volume: { "1m": 0.7, "5m": 0.8, "15m": 0.6 },   // ULTRA-SCALP / MOMENTUM-ARB / MEAN-REV
-      bbProximityPct: 1.0,                              // MEAN-REV — 1.0% from band counts as "touch"
-      rsiVeto: { buy: 70, sell: 30 },                   // ULTRA-SCALP
+      volume: { "5m": 0.8, "15m": 0.6 },   // MOMENTUM-ARB / MEAN-REV
+      bbProximityPct: 1.0,                  // MEAN-REV — 1.0% from band counts as "touch"
     };
 
     const perSymbol: Record<string, any> = {};
@@ -2081,13 +2122,12 @@ app.get("/api/threshold-analysis", async (req, res) => {
          ORDER BY timeframe, timestamp ASC`,
         [symbol, cutoff]
       );
-      const byTf: Record<string, number[][]> = { "1m": [], "5m": [], "15m": [] };
+      const byTf: Record<string, number[][]> = { "5m": [], "15m": [] };
       for (const r of rows.rows) {
         const tf = r.timeframe as string;
         if (!byTf[tf]) continue;
         byTf[tf].push([Number(r.timestamp), parseFloat(r.open), parseFloat(r.high), parseFloat(r.low), parseFloat(r.close), parseFloat(r.volume)]);
       }
-      const c1m  = byTf["1m"];
       const c5m  = byTf["5m"];
       const c15m = byTf["15m"];
 
@@ -2105,7 +2145,6 @@ app.get("/api/threshold-analysis", async (req, res) => {
         for (let i = 21; i <= vols.length; i++) out.push(calcVolumeRatio(vols.slice(0, i)));
         return out;
       };
-      const vol1m  = volSeriesFor(c1m);
       const vol5m  = volSeriesFor(c5m);
       const vol15m = volSeriesFor(c15m);
 
@@ -2122,11 +2161,6 @@ app.get("/api/threshold-analysis", async (req, res) => {
         bbUpperDistPct.push(price >= bb.upper ? 0 : (bb.upper - price) / bb.upper * 100);
       }
 
-      // RSI over 1m (ULTRA-SCALP timeframe) for veto-threshold tuning
-      const closes1m = c1m.map(c => c[4]);
-      const rsi1mSeries: number[] = [];
-      for (let i = 15; i <= closes1m.length; i++) rsi1mSeries.push(calcRSI(closes1m.slice(0, i)));
-
       const adxStats = {
         p10: percentile(adxSeries, 10),
         p25: percentile(adxSeries, 25),
@@ -2140,7 +2174,7 @@ app.get("/api/threshold-analysis", async (req, res) => {
         pctNeutral:  pctOf(adxSeries, v => v >= CURRENT.adx.ranging && v <= CURRENT.adx.trending),
       };
 
-      const volStats = (series: number[], tf: "1m" | "5m" | "15m") => ({
+      const volStats = (series: number[], tf: "5m" | "15m") => ({
         p20: percentile(series, 20),
         p50: percentile(series, 50),
         p80: percentile(series, 80),
@@ -2158,24 +2192,11 @@ app.get("/api/threshold-analysis", async (req, res) => {
         pctTriggeringUpper: pctOf(bbUpperDistPct, v => v <= CURRENT.bbProximityPct),
       };
 
-      const rsiStats = {
-        p10: percentile(rsi1mSeries, 10),
-        p25: percentile(rsi1mSeries, 25),
-        p50: percentile(rsi1mSeries, 50),
-        p75: percentile(rsi1mSeries, 75),
-        p90: percentile(rsi1mSeries, 90),
-        currentBuyVeto:  CURRENT.rsiVeto.buy,
-        currentSellVeto: CURRENT.rsiVeto.sell,
-        pctVetoedBuy:  pctOf(rsi1mSeries, v => v >= CURRENT.rsiVeto.buy),
-        pctVetoedSell: pctOf(rsi1mSeries, v => v <= CURRENT.rsiVeto.sell),
-      };
-
       // ── Recommendations — heuristic rules over the distributions ──
       // Targets:
       //   ADX: NEUTRAL band should cover ~50-70% (balanced regime gate)
       //   Volume: filter should block ~20-35% of candles (selective but not strangling)
       //   BB:    ~10-25% of candles should be within tolerance (MEAN-REV is selective)
-      //   RSI:   each veto should clip ~5-15% of candles
       const recs: { filter: string; current: string; suggest: string; reason: string }[] = [];
 
       if (adxSeries.length >= 50) {
@@ -2197,19 +2218,19 @@ app.get("/api/threshold-analysis", async (req, res) => {
         }
       }
 
-      for (const [tf, stats] of Object.entries({ "1m": volStats(vol1m, "1m"), "5m": volStats(vol5m, "5m"), "15m": volStats(vol15m, "15m") })) {
+      for (const [tf, stats] of Object.entries({ "5m": volStats(vol5m, "5m"), "15m": volStats(vol15m, "15m") })) {
         if (stats.pctBlocked > 50) {
           recs.push({
             filter: `Volume (${tf})`,
             current: `${stats.currentThreshold}× (blocks ${stats.pctBlocked}%)`,
-            suggest: `${percentile(tf === "1m" ? vol1m : tf === "5m" ? vol5m : vol15m, 25).toFixed(2)}×`,
+            suggest: `${percentile(tf === "5m" ? vol5m : vol15m, 25).toFixed(2)}×`,
             reason:  `Current threshold rejects over half of candles — lower to p25 of observed distribution.`,
           });
         } else if (stats.pctBlocked < 10) {
           recs.push({
             filter: `Volume (${tf})`,
             current: `${stats.currentThreshold}× (blocks ${stats.pctBlocked}%)`,
-            suggest: `${percentile(tf === "1m" ? vol1m : tf === "5m" ? vol5m : vol15m, 30).toFixed(2)}×`,
+            suggest: `${percentile(tf === "5m" ? vol5m : vol15m, 30).toFixed(2)}×`,
             reason:  `Filter rarely engages — bump up to maintain volume selectivity.`,
           });
         }
@@ -2232,34 +2253,14 @@ app.get("/api/threshold-analysis", async (req, res) => {
         });
       }
 
-      if (rsi1mSeries.length >= 100) {
-        if (rsiStats.pctVetoedBuy < 3) {
-          recs.push({
-            filter: "ULTRA-SCALP RSI BUY veto",
-            current: `RSI ≥ ${CURRENT.rsiVeto.buy} blocks BUY (clips ${rsiStats.pctVetoedBuy}%)`,
-            suggest: `RSI ≥ ${percentile(rsi1mSeries, 90).toFixed(0)}`,
-            reason:  `Veto barely fires — tighten to p90 RSI so it actually catches overbought conditions.`,
-          });
-        } else if (rsiStats.pctVetoedBuy > 25) {
-          recs.push({
-            filter: "ULTRA-SCALP RSI BUY veto",
-            current: `RSI ≥ ${CURRENT.rsiVeto.buy} blocks BUY (clips ${rsiStats.pctVetoedBuy}%)`,
-            suggest: `RSI ≥ ${percentile(rsi1mSeries, 90).toFixed(0)}`,
-            reason:  `Veto too aggressive — loosen to p90 to stop killing trend-continuation BUYs.`,
-          });
-        }
-      }
-
       perSymbol[symbol] = summaryOnly
-        ? { samples: { "1m": c1m.length, "5m": c5m.length, "15m": c15m.length }, recommendations: recs }
+        ? { samples: { "5m": c5m.length, "15m": c15m.length }, recommendations: recs }
         : {
-            samples:    { "1m": c1m.length, "5m": c5m.length, "15m": c15m.length },
+            samples:    { "5m": c5m.length, "15m": c15m.length },
             adx_15m:    adxStats,
-            volume_1m:  volStats(vol1m,  "1m"),
             volume_5m:  volStats(vol5m,  "5m"),
             volume_15m: volStats(vol15m, "15m"),
             bb_proximity_15m: bbStats,
-            rsi_1m:     rsiStats,
             recommendations: recs,
           };
     }
@@ -2270,7 +2271,7 @@ app.get("/api/threshold-analysis", async (req, res) => {
       currentThresholds: CURRENT,
       symbols: perSymbol,
       notes: [
-        "Targets: ADX neutral band 50-70% of candles; volume filter blocks 20-35%; BB triggers on 10-25%; RSI veto clips 5-15%.",
+        "Targets: ADX neutral band 50-70% of candles; volume filter blocks 20-35%; BB triggers on 10-25%.",
         "Recommendations only appear when current threshold is outside healthy band. Empty recs = filter is well-tuned for this symbol.",
         "Tuning is a guide, not a mandate — combine with what the bot's actual win rate is doing.",
       ],
@@ -2323,7 +2324,7 @@ function resampleTo15m(candles1m: number[][]): number[][] {
 app.get("/api/backtest", async (req, res) => {
   const symbol = (req.query.symbol as string) || "BTC/USDT";
   const days   = Math.min(parseInt((req.query.days as string) || "7"), 30);
-  const strategyName = (req.query.strategy as string) || "ULTRA-SCALP";
+  const strategyName = (req.query.strategy as string) || "MOMENTUM-ARB";
 
   try {
     const since = Date.now() - days * 24 * 60 * 60 * 1000;
@@ -2365,12 +2366,13 @@ app.get("/api/backtest", async (req, res) => {
       skipTrend = true;
       cooldownMs = 30 * 60 * 1000;
     } else {
-      candles = candles1m;
-      windowSize = 26;
-      signalFn = calculateSignal;
+      // Default to MOMENTUM-ARB for any unrecognised strategy
+      candles = resampleTo5m(candles1m);
+      windowSize = 22;
+      signalFn = calculateMomentumSignal;
       volThreshold = 1.0;
-      skipTrend = true;
-      cooldownMs = 5 * 60 * 1000;
+      skipTrend = false;
+      cooldownMs = 15 * 60 * 1000;
     }
 
     const cfg = await pool.query(`
@@ -2664,7 +2666,7 @@ async function startServer() {
 
   // Load persisted settings before seeding
   const stRow = await pool.query("SELECT active_strategies, taker_rate FROM bot_settings WHERE id = 'bot_config'");
-  activeStrategies = new Set(stRow.rows[0]?.active_strategies || ["ULTRA-SCALP", "MOMENTUM-ARB", "MEAN-REV"]);
+  activeStrategies = new Set(stRow.rows[0]?.active_strategies || ["MOMENTUM-ARB", "MEAN-REV", "SWING-LONG"]);
   if (stRow.rows[0]?.taker_rate != null) takerRate = parseFloat(stRow.rows[0].taker_rate);
   console.log(`Active strategies: ${[...activeStrategies].join(", ")} | Taker rate: ${(takerRate * 100).toFixed(4)}%`);
 
@@ -2681,6 +2683,9 @@ async function startServer() {
   // Seed candle buffer via REST, then hand off to WebSocket
   await seedCandleBuffer();
   initWebSocket();
+
+  // 4h SWING-LONG buffer: refresh every 15 min (new 4h candle closes every 240 min)
+  setInterval(refreshSwingBuffers, 15 * 60 * 1000);
 
   // SSE snapshot interval — push dashboard data to all connected clients every 2s
   setInterval(async () => {
