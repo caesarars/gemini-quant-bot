@@ -170,6 +170,8 @@ export default function App() {
   const [cooldownStatus, setCooldownStatus]       = useState<Record<string, { inCooldown: boolean; strategy: string; status?: string }>>({});
   const [validationLogs, setValidationLogs] = useState<any[]>([]);
   const [loadingAi, setLoadingAi] = useState<string | null>(null);
+  const [executingKey, setExecutingKey] = useState<string | null>(null);
+  const [executeConfirmKey, setExecuteConfirmKey] = useState<string | null>(null);
   const [marketContext, setMarketContext] = useState<{
     fearGreed: { value: number; classification: string } | null;
     fundingRates: Record<string, number>;
@@ -203,6 +205,34 @@ export default function App() {
       setBtResult(d);
     } catch { setBtResult({ error: "Request failed" }); }
     setBtLoading(false);
+  };
+
+  const executeManual = async (symbol: string, strategy: string, action: string) => {
+    const key = `${symbol}|${strategy}`;
+    // Two-tap confirm: first click sets confirm state, second click within 3s executes
+    if (executeConfirmKey !== key) {
+      setExecuteConfirmKey(key);
+      setTimeout(() => setExecuteConfirmKey(prev => prev === key ? null : prev), 3000);
+      return;
+    }
+    setExecuteConfirmKey(null);
+    setExecutingKey(key);
+    try {
+      const r = await fetch("/api/manual-execute", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ symbol, strategy }),
+      });
+      const d = await r.json();
+      if (d.ok) {
+        addLog(`▶ MANUAL ${d.action} ${symbol} via ${strategy} @ $${d.price?.toLocaleString()} — check Validation Log`, "success");
+      } else {
+        addLog(`✗ Manual execute failed: ${d.error}`, "error");
+      }
+    } catch (e: any) {
+      addLog(`✗ Manual execute error: ${e.message}`, "error");
+    }
+    setExecutingKey(null);
   };
 
   const runMarkov = async () => {
@@ -911,9 +941,29 @@ export default function App() {
                                 )}>V {coin.ultraScalp.volumeRatio.toFixed(1)}×</span>
                               )}
                             </div>
-                            <div className={cn("px-2.5 py-1.5 text-[11px] font-mono border-t border-trading-border/20",
-                              active ? "bg-trading-bg/50" : "bg-trading-bg/20", r.color
-                            )}>↳ {r.label}</div>
+                            <div className={cn("flex items-center justify-between px-2.5 py-1.5 border-t border-trading-border/20",
+                              active ? "bg-trading-bg/50" : "bg-trading-bg/20"
+                            )}>
+                              <span className={cn("text-[11px] font-mono", r.color)}>↳ {r.label}</span>
+                              {active && (
+                                <button
+                                  onClick={() => executeManual(coin.symbol, 'ULTRA-SCALP', coin.ultraScalp!.action)}
+                                  disabled={executingKey === `${coin.symbol}|ULTRA-SCALP`}
+                                  className={cn(
+                                    "ml-2 shrink-0 px-2 py-0.5 rounded text-[9px] font-black uppercase tracking-wider border transition-all disabled:opacity-40",
+                                    executeConfirmKey === `${coin.symbol}|ULTRA-SCALP`
+                                      ? "bg-yellow-400/20 border-yellow-400 text-yellow-300 animate-pulse"
+                                      : coin.ultraScalp!.action === 'BUY'
+                                        ? "bg-trading-up/10 border-trading-up/50 text-trading-up hover:bg-trading-up/25"
+                                        : "bg-trading-down/10 border-trading-down/50 text-trading-down hover:bg-trading-down/25"
+                                  )}
+                                >
+                                  {executingKey === `${coin.symbol}|ULTRA-SCALP` ? '...' :
+                                   executeConfirmKey === `${coin.symbol}|ULTRA-SCALP` ? 'CONFIRM?' :
+                                   coin.ultraScalp!.action === 'BUY' ? '▶ LONG' : '▶ SHORT'}
+                                </button>
+                              )}
+                            </div>
                           </div>
                         );
                       })()}
@@ -953,9 +1003,29 @@ export default function App() {
                                 )}>V {coin.momentumArb.volumeRatio.toFixed(1)}×</span>
                               )}
                             </div>
-                            <div className={cn("px-2.5 py-1.5 text-[11px] font-mono border-t border-trading-border/20",
-                              active ? "bg-trading-bg/50" : "bg-trading-bg/20", r.color
-                            )}>↳ {r.label}</div>
+                            <div className={cn("flex items-center justify-between px-2.5 py-1.5 border-t border-trading-border/20",
+                              active ? "bg-trading-bg/50" : "bg-trading-bg/20"
+                            )}>
+                              <span className={cn("text-[11px] font-mono", r.color)}>↳ {r.label}</span>
+                              {active && (
+                                <button
+                                  onClick={() => executeManual(coin.symbol, 'MOMENTUM-ARB', coin.momentumArb!.action)}
+                                  disabled={executingKey === `${coin.symbol}|MOMENTUM-ARB`}
+                                  className={cn(
+                                    "ml-2 shrink-0 px-2 py-0.5 rounded text-[9px] font-black uppercase tracking-wider border transition-all disabled:opacity-40",
+                                    executeConfirmKey === `${coin.symbol}|MOMENTUM-ARB`
+                                      ? "bg-yellow-400/20 border-yellow-400 text-yellow-300 animate-pulse"
+                                      : coin.momentumArb!.action === 'BUY'
+                                        ? "bg-trading-up/10 border-trading-up/50 text-trading-up hover:bg-trading-up/25"
+                                        : "bg-trading-down/10 border-trading-down/50 text-trading-down hover:bg-trading-down/25"
+                                  )}
+                                >
+                                  {executingKey === `${coin.symbol}|MOMENTUM-ARB` ? '...' :
+                                   executeConfirmKey === `${coin.symbol}|MOMENTUM-ARB` ? 'CONFIRM?' :
+                                   coin.momentumArb!.action === 'BUY' ? '▶ LONG' : '▶ SHORT'}
+                                </button>
+                              )}
+                            </div>
                           </div>
                         );
                       })()}
@@ -996,9 +1066,29 @@ export default function App() {
                                 )}>V {coin.meanRev.volumeRatio.toFixed(1)}×</span>
                               )}
                             </div>
-                            <div className={cn("px-2.5 py-1.5 text-[11px] font-mono border-t border-trading-border/20",
-                              active ? "bg-trading-accent/5" : "bg-trading-bg/20", r.color
-                            )}>↳ {r.label}</div>
+                            <div className={cn("flex items-center justify-between px-2.5 py-1.5 border-t border-trading-border/20",
+                              active ? "bg-trading-accent/5" : "bg-trading-bg/20"
+                            )}>
+                              <span className={cn("text-[11px] font-mono", r.color)}>↳ {r.label}</span>
+                              {active && (
+                                <button
+                                  onClick={() => executeManual(coin.symbol, 'MEAN-REV', coin.meanRev!.action)}
+                                  disabled={executingKey === `${coin.symbol}|MEAN-REV`}
+                                  className={cn(
+                                    "ml-2 shrink-0 px-2 py-0.5 rounded text-[9px] font-black uppercase tracking-wider border transition-all disabled:opacity-40",
+                                    executeConfirmKey === `${coin.symbol}|MEAN-REV`
+                                      ? "bg-yellow-400/20 border-yellow-400 text-yellow-300 animate-pulse"
+                                      : coin.meanRev!.action === 'BUY'
+                                        ? "bg-trading-up/10 border-trading-up/50 text-trading-up hover:bg-trading-up/25"
+                                        : "bg-trading-down/10 border-trading-down/50 text-trading-down hover:bg-trading-down/25"
+                                  )}
+                                >
+                                  {executingKey === `${coin.symbol}|MEAN-REV` ? '...' :
+                                   executeConfirmKey === `${coin.symbol}|MEAN-REV` ? 'CONFIRM?' :
+                                   coin.meanRev!.action === 'BUY' ? '▶ LONG' : '▶ SHORT'}
+                                </button>
+                              )}
+                            </div>
                           </div>
                         );
                       })()}

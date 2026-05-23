@@ -544,22 +544,23 @@ async function getAccountBalance(): Promise<number> {
 
 type AnySignal = { action: "BUY" | "SELL" | "HOLD"; price: number; rsi: number; volumeRatio: number; atr: number; atrPct: number; score?: number; buyScore?: number; sellScore?: number; cross?: string | null; bbPos?: string | null };
 
-async function checkAutoExecute(symbol: string, signal: AnySignal, strategyName: string) {
+async function checkAutoExecute(symbol: string, signal: AnySignal, strategyName: string, bypassAutoPilot = false) {
   const vid = Math.random().toString(36).slice(2, 8);
   const checks: ValidationCheck[] = [];
 
   const settingsRow = await pool.query("SELECT is_auto_pilot FROM bot_settings WHERE id = 'bot_config'");
   const isAutoPilot = settingsRow.rows[0]?.is_auto_pilot || false;
+  const autoPilotPass = isAutoPilot || bypassAutoPilot;
 
   const trend = getTrend(symbol);
   const { regime, adx } = getRegime(symbol);
-  console.log(`[${strategyName}] ${symbol} → ${signal.action} RSI:${signal.rsi} trend:${trend} regime:${regime}(ADX:${adx}) autoPilot:${isAutoPilot}`);
+  console.log(`[${strategyName}] ${symbol} → ${signal.action} RSI:${signal.rsi} trend:${trend} regime:${regime}(ADX:${adx}) autoPilot:${isAutoPilot} manual:${bypassAutoPilot}`);
 
   checks.push({ name: "Signal", status: "info", detail: `${signal.action}  RSI:${signal.rsi}  Score:${(signal.score ?? 0).toFixed(1)}` });
-  checks.push({ name: "Auto-Pilot", status: isAutoPilot ? "pass" : "block", detail: isAutoPilot ? "ON" : "OFF — execution disabled" });
+  checks.push({ name: "Auto-Pilot", status: autoPilotPass ? "pass" : "block", detail: bypassAutoPilot ? "MANUAL OVERRIDE" : isAutoPilot ? "ON" : "OFF — execution disabled" });
   checks.push({ name: "Regime", status: "info", detail: `${regime} (ADX ${adx.toFixed(1)})` });
 
-  if (!isAutoPilot || signal.action === "HOLD") {
+  if (!autoPilotPass || signal.action === "HOLD") {
     pushValidation({ id: vid, timestamp: Date.now(), symbol, strategy: strategyName, action: signal.action, finalStatus: "skipped", checks });
     return;
   }
@@ -1769,6 +1770,42 @@ app.post("/api/ai-confirm", async (req, res) => {
     const [verdict, confidence, reason] = text.split("|");
     res.json({ verdict: verdict?.trim() || "WAIT", confidence: parseInt(confidence) || 0, reason: reason?.trim() || "No reason" });
   } catch { res.status(500).json({ error: "AI Confirmation Failed" }); }
+});
+
+// ── Manual Trade Execution ────────────────────────────────────────────────────
+// Recalculates the live signal from the in-memory candle buffer and runs the
+// full checkAutoExecute filter chain (bypassing only the auto-pilot gate).
+// All other guards — regime, trend, volume, funding, cooldown, position limit —
+// still apply so you can't fire a duplicate or over-leveraged position by hand.
+app.post("/api/manual-execute", async (req, res) => {
+  const { symbol, strategy } = req.body as { symbol: string; strategy: string };
+  if (!symbol || !strategy) return res.status(400).json({ error: "symbol and strategy required" });
+  if (!["ULTRA-SCALP", "MOMENTUM-ARB", "MEAN-REV"].includes(strategy))
+    return res.status(400).json({ error: `Unknown strategy: ${strategy}` });
+
+  let signal: AnySignal;
+  if (strategy === "ULTRA-SCALP") {
+    signal = calculateSignal(candleBuffer.get(symbol) || []) as AnySignal;
+  } else if (strategy === "MOMENTUM-ARB") {
+    signal = calculateMomentumSignal(momentumBuffer.get(symbol) || []) as AnySignal;
+  } else {
+    signal = calculateMeanRevSignal(trendBuffer.get(symbol) || []) as AnySignal;
+  }
+
+  if (signal.action === "HOLD") {
+    return res.status(422).json({ error: `Current ${strategy} signal for ${symbol} is HOLD — nothing to execute` });
+  }
+
+  console.log(`[MANUAL] ${symbol} ${strategy} → ${signal.action} @ $${signal.price}`);
+
+  try {
+    // bypassAutoPilot=true — skips the auto-pilot gate, all other filters still run
+    await checkAutoExecute(symbol, signal, strategy, true);
+    res.json({ ok: true, action: signal.action, price: signal.price, strategy, symbol, message: `Manual ${signal.action} ${symbol} via ${strategy} queued — check Validation Log` });
+  } catch (err: any) {
+    console.error("[MANUAL] error:", err?.message);
+    res.status(500).json({ error: err?.message });
+  }
 });
 
 app.get("/api/balance", async (req, res) => {
