@@ -2475,6 +2475,92 @@ app.get("/api/backtest", async (req, res) => {
   }
 });
 
+// ── Markov Chain Analysis ─────────────────────────────────────────────────────
+
+type MarkovState = 'BEAR' | 'STAGNANT' | 'BULL';
+const MARKOV_ALL: MarkovState[] = ['BEAR', 'STAGNANT', 'BULL'];
+
+function classifyMarkovState(returnPct: number, bearThresh: number, bullThresh: number): MarkovState {
+  if (returnPct < bearThresh) return 'BEAR';
+  if (returnPct > bullThresh) return 'BULL';
+  return 'STAGNANT';
+}
+
+function buildTransitionMatrix(states: MarkovState[]) {
+  const counts: Record<string, Record<string, number>> = {
+    BEAR:     { BEAR: 0, STAGNANT: 0, BULL: 0 },
+    STAGNANT: { BEAR: 0, STAGNANT: 0, BULL: 0 },
+    BULL:     { BEAR: 0, STAGNANT: 0, BULL: 0 },
+  };
+  for (let i = 0; i < states.length - 1; i++) counts[states[i]][states[i + 1]]++;
+  const matrix: Record<string, Record<string, number>> = {};
+  for (const from of MARKOV_ALL) {
+    const total = counts[from].BEAR + counts[from].STAGNANT + counts[from].BULL;
+    matrix[from] = {
+      BEAR:     total > 0 ? parseFloat((counts[from].BEAR     / total).toFixed(4)) : 0,
+      STAGNANT: total > 0 ? parseFloat((counts[from].STAGNANT / total).toFixed(4)) : 0,
+      BULL:     total > 0 ? parseFloat((counts[from].BULL     / total).toFixed(4)) : 0,
+    };
+  }
+  return matrix;
+}
+
+app.get("/api/markov/:symbol", async (req, res) => {
+  const symbol     = decodeURIComponent(req.params.symbol);
+  const timeframe  = (req.query.timeframe as string) || "15m";
+  const limit      = Math.min(parseInt((req.query.limit as string) || "500"), 2000);
+  const bearThresh = parseFloat((req.query.bear as string) || "-1.5");
+  const bullThresh = parseFloat((req.query.bull as string) || "1.5");
+
+  try {
+    const r = await pool.query(
+      `SELECT timestamp, close::float FROM ohlcv
+       WHERE symbol = $1 AND timeframe = $2
+       ORDER BY timestamp ASC LIMIT $3`,
+      [symbol, timeframe, limit]
+    );
+    const rows = r.rows;
+    if (rows.length < 10) return res.json({ error: "Not enough data", candleCount: rows.length });
+
+    const seq: { ts: number; close: number; returnPct: number; state: MarkovState }[] = [];
+    for (let i = 1; i < rows.length; i++) {
+      const ret = (rows[i].close - rows[i - 1].close) / rows[i - 1].close * 100;
+      seq.push({ ts: rows[i].timestamp, close: rows[i].close, returnPct: parseFloat(ret.toFixed(4)), state: classifyMarkovState(ret, bearThresh, bullThresh) });
+    }
+
+    const allStates   = seq.map(s => s.state);
+    const matrix      = buildTransitionMatrix(allStates);
+    const currentState = allStates[allStates.length - 1] || 'STAGNANT';
+    const prediction   = matrix[currentState] as Record<string, number>;
+    const maxProb      = Math.max(...Object.values(prediction));
+    const nextState    = (Object.entries(prediction).sort((a, b) => b[1] - a[1])[0]?.[0] || 'STAGNANT') as MarkovState;
+
+    let signal: 'BUY' | 'SELL' | 'HOLD' = 'HOLD';
+    if (nextState === 'BULL' && maxProb >= 0.45) signal = 'BUY';
+    else if (nextState === 'BEAR' && maxProb >= 0.45) signal = 'SELL';
+
+    const dist = { BEAR: 0, STAGNANT: 0, BULL: 0 };
+    for (const s of allStates) dist[s]++;
+    const total = allStates.length;
+
+    res.json({
+      symbol, timeframe, candleCount: rows.length,
+      bearThreshold: bearThresh, bullThreshold: bullThresh,
+      currentState, matrix, prediction, predictedNext: nextState, signal,
+      confidence: parseFloat((maxProb * 100).toFixed(1)),
+      distribution: {
+        BEAR:     parseFloat((dist.BEAR     / total * 100).toFixed(1)),
+        STAGNANT: parseFloat((dist.STAGNANT / total * 100).toFixed(1)),
+        BULL:     parseFloat((dist.BULL     / total * 100).toFixed(1)),
+      },
+      recentStates: seq.slice(-60),
+      timestamp: Date.now(),
+    });
+  } catch (err: any) {
+    res.status(500).json({ error: err?.message });
+  }
+});
+
 // ── Startup ────────────────────────────────────────────────────────────────────
 
 async function startServer() {

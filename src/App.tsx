@@ -15,7 +15,8 @@ import {
   AlertTriangle,
   LineChart as LineChartIcon,
   X,
-  BarChart2
+  BarChart2,
+  GitBranch,
 } from "lucide-react";
 import { motion, AnimatePresence } from "motion/react";
 import { cn } from "./lib/utils";
@@ -182,6 +183,13 @@ export default function App() {
   const [btStrategy, setBtStrategy]           = useState("ULTRA-SCALP");
   const [btLoading, setBtLoading]             = useState(false);
   const [btResult, setBtResult]               = useState<any>(null);
+  const [isMarkovOpen, setIsMarkovOpen]       = useState(false);
+  const [markovSymbol, setMarkovSymbol]       = useState("BTC/USDT");
+  const [markovTf, setMarkovTf]               = useState("15m");
+  const [markovBear, setMarkovBear]           = useState(-1.5);
+  const [markovBull, setMarkovBull]           = useState(1.5);
+  const [markovLoading, setMarkovLoading]     = useState(false);
+  const [markovResult, setMarkovResult]       = useState<any>(null);
   // Increments every second so scan-age badges re-render without full data refresh
   const [now, setNow] = useState(Date.now());
   useEffect(() => { const t = setInterval(() => setNow(Date.now()), 1000); return () => clearInterval(t); }, []);
@@ -195,6 +203,18 @@ export default function App() {
       setBtResult(d);
     } catch { setBtResult({ error: "Request failed" }); }
     setBtLoading(false);
+  };
+
+  const runMarkov = async () => {
+    setMarkovLoading(true);
+    setMarkovResult(null);
+    try {
+      const url = `/api/markov/${encodeURIComponent(markovSymbol)}?timeframe=${markovTf}&bear=${markovBear}&bull=${markovBull}&limit=500`;
+      const r = await fetch(url);
+      const d = await r.json();
+      setMarkovResult(d);
+    } catch { setMarkovResult({ error: "Request failed" }); }
+    setMarkovLoading(false);
   };
 
   const addLog = (msg: string, type: string = "info") => {
@@ -499,6 +519,13 @@ export default function App() {
           >
             <LineChartIcon className="w-4 h-4 text-trading-accent" />
             <span className="text-[10px] font-bold uppercase tracking-widest">Backtest</span>
+          </button>
+          <button
+            onClick={() => setIsMarkovOpen(true)}
+            className="flex items-center gap-2 p-2 px-3 bg-trading-card border border-trading-border rounded hover:border-purple-400 transition-colors"
+          >
+            <GitBranch className="w-4 h-4 text-purple-400" />
+            <span className="text-[10px] font-bold uppercase tracking-widest text-purple-400">Markov</span>
           </button>
           <button
             onClick={() => setIsSettingsOpen(true)}
@@ -1662,6 +1689,318 @@ export default function App() {
                     )}
                   </div>
                 )}
+              </div>
+            </motion.div>
+          </div>
+        )}
+      </AnimatePresence>
+
+      {/* ── Markov Chain Dashboard Modal ── */}
+      <AnimatePresence>
+        {isMarkovOpen && (
+          <div className="fixed inset-0 z-[100] flex items-center justify-center p-4 md:p-6">
+            <motion.div
+              initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }}
+              className="absolute inset-0 bg-black/70 backdrop-blur-sm"
+              onClick={() => setIsMarkovOpen(false)}
+            />
+            <motion.div
+              initial={{ opacity: 0, scale: 0.95 }} animate={{ opacity: 1, scale: 1 }} exit={{ opacity: 0, scale: 0.95 }}
+              className="relative bg-trading-bg border border-purple-500/30 rounded-xl w-full max-w-5xl max-h-[92vh] flex flex-col z-10 overflow-hidden"
+            >
+              {/* Header */}
+              <div className="flex items-center justify-between px-6 py-4 border-b border-trading-border shrink-0">
+                <div className="flex items-center gap-3">
+                  <GitBranch className="w-5 h-5 text-purple-400" />
+                  <span className="font-black tracking-tight">MARKOV CHAIN ANALYSIS</span>
+                  <span className="text-[10px] text-trading-muted font-mono uppercase">Regime & Transition Model</span>
+                </div>
+                <button onClick={() => setIsMarkovOpen(false)} className="text-trading-muted hover:text-white transition-colors">
+                  <X className="w-5 h-5" />
+                </button>
+              </div>
+
+              {/* Body */}
+              <div className="overflow-y-auto flex-1 p-6 space-y-6">
+
+                {/* Controls */}
+                <div className="grid grid-cols-1 md:grid-cols-[1fr_auto_auto_auto] gap-4 items-end">
+                  {/* Symbol */}
+                  <div className="space-y-2">
+                    <div className="text-[10px] uppercase text-trading-muted tracking-[2px]">Symbol</div>
+                    <div className="flex flex-wrap gap-1.5">
+                      {["BTC/USDT","ETH/USDT","SOL/USDT","XRP/USDT","BNB/USDT","AVAX/USDT","ARB/USDT","OP/USDT"].map(s => (
+                        <button
+                          key={s}
+                          onClick={() => setMarkovSymbol(s)}
+                          className={cn(
+                            "px-2.5 py-1 text-[10px] font-bold rounded border transition-colors",
+                            markovSymbol === s
+                              ? "bg-purple-500/20 border-purple-400 text-purple-300"
+                              : "bg-trading-card border-trading-border text-trading-muted hover:border-purple-400/50"
+                          )}
+                        >
+                          {s.replace("/USDT", "")}
+                        </button>
+                      ))}
+                    </div>
+                  </div>
+                  {/* Timeframe */}
+                  <div className="space-y-2">
+                    <div className="text-[10px] uppercase text-trading-muted tracking-[2px]">Timeframe</div>
+                    <div className="flex gap-1.5">
+                      {["1m","5m","15m"].map(tf => (
+                        <button
+                          key={tf}
+                          onClick={() => setMarkovTf(tf)}
+                          className={cn(
+                            "px-3 py-1.5 text-[10px] font-bold rounded border transition-colors",
+                            markovTf === tf
+                              ? "bg-purple-500/20 border-purple-400 text-purple-300"
+                              : "bg-trading-card border-trading-border text-trading-muted hover:border-purple-400/50"
+                          )}
+                        >
+                          {tf}
+                        </button>
+                      ))}
+                    </div>
+                  </div>
+                  {/* Thresholds */}
+                  <div className="space-y-2">
+                    <div className="text-[10px] uppercase text-trading-muted tracking-[2px]">Thresholds</div>
+                    <div className="flex items-center gap-2">
+                      <div className="flex items-center gap-1">
+                        <span className="text-[9px] text-trading-down">Bear &lt;</span>
+                        <input
+                          type="number" step="0.1" value={markovBear}
+                          onChange={e => setMarkovBear(parseFloat(e.target.value) || -1.5)}
+                          className="w-14 px-1.5 py-1 text-[10px] font-mono bg-trading-card border border-trading-border rounded text-trading-down text-center"
+                        />
+                        <span className="text-[9px] text-trading-muted">%</span>
+                      </div>
+                      <div className="flex items-center gap-1">
+                        <span className="text-[9px] text-trading-up">Bull &gt;</span>
+                        <input
+                          type="number" step="0.1" value={markovBull}
+                          onChange={e => setMarkovBull(parseFloat(e.target.value) || 1.5)}
+                          className="w-14 px-1.5 py-1 text-[10px] font-mono bg-trading-card border border-trading-border rounded text-trading-up text-center"
+                        />
+                        <span className="text-[9px] text-trading-muted">%</span>
+                      </div>
+                    </div>
+                  </div>
+                  {/* Run */}
+                  <button
+                    onClick={runMarkov}
+                    disabled={markovLoading}
+                    className="px-5 py-2 bg-purple-600 hover:bg-purple-500 disabled:opacity-50 text-white rounded text-[11px] font-black uppercase tracking-widest transition-colors"
+                  >
+                    {markovLoading ? "Analyzing..." : "Analyze"}
+                  </button>
+                </div>
+
+                {/* How it works explainer */}
+                {!markovResult && !markovLoading && (
+                  <div className="bg-trading-card border border-purple-500/20 rounded-lg p-5 space-y-3">
+                    <div className="text-[11px] font-bold text-purple-300 uppercase tracking-wider">How Markov Chain Analysis Works</div>
+                    <div className="grid grid-cols-1 md:grid-cols-3 gap-4 text-[10px] text-trading-muted leading-relaxed">
+                      <div className="space-y-1.5">
+                        <div className="font-bold text-trading-text">1. State Discretization</div>
+                        <div>Each candle's percentage return is classified into one of three states: <span className="text-trading-down font-bold">BEAR</span> (drop &gt; |threshold|), <span className="text-trading-muted font-bold">STAGNANT</span> (flat), or <span className="text-trading-up font-bold">BULL</span> (rise &gt; threshold). Raw continuous prices become a finite sequence of regimes.</div>
+                      </div>
+                      <div className="space-y-1.5">
+                        <div className="font-bold text-trading-text">2. Transition Matrix</div>
+                        <div>The bot counts every consecutive state pair in history — e.g., how often does a BULL candle immediately follow a BEAR candle? Dividing by row totals gives conditional probabilities: P(next state | current state).</div>
+                      </div>
+                      <div className="space-y-1.5">
+                        <div className="font-bold text-trading-text">3. Signal Generation</div>
+                        <div>The current state's row in the matrix shows where the market is most likely to move next. If P(BULL next) ≥ 45%, the engine emits a <span className="text-trading-up font-bold">BUY</span> signal. If P(BEAR next) ≥ 45%, a <span className="text-trading-down font-bold">SELL</span> signal. Otherwise <span className="text-trading-muted font-bold">HOLD</span>.</div>
+                      </div>
+                    </div>
+                  </div>
+                )}
+
+                {/* Loading */}
+                {markovLoading && (
+                  <div className="flex items-center justify-center py-16 text-trading-muted text-[11px] gap-3">
+                    <div className="w-5 h-5 border-2 border-purple-400 border-t-transparent rounded-full animate-spin" />
+                    Building transition matrix from {markovTf} candle history...
+                  </div>
+                )}
+
+                {/* Error */}
+                {markovResult?.error && (
+                  <div className="bg-trading-down/10 border border-trading-down/30 rounded p-4 text-trading-down text-[11px]">
+                    {markovResult.error} {markovResult.candleCount !== undefined && `(${markovResult.candleCount} candles available — need at least 10)`}
+                  </div>
+                )}
+
+                {/* Results */}
+                {markovResult && !markovResult.error && (() => {
+                  const { currentState, predictedNext, signal, confidence, matrix, prediction, distribution, recentStates, candleCount, timeframe: tf } = markovResult;
+                  const stateColor = (s: string) =>
+                    s === 'BULL' ? 'text-trading-up' : s === 'BEAR' ? 'text-trading-down' : 'text-trading-muted';
+                  const stateBg = (s: string) =>
+                    s === 'BULL' ? 'bg-trading-up/15 border-trading-up/40' : s === 'BEAR' ? 'bg-trading-down/15 border-trading-down/40' : 'bg-trading-muted/10 border-trading-muted/30';
+                  const stateChip = (s: string) =>
+                    s === 'BULL' ? 'bg-trading-up/30' : s === 'BEAR' ? 'bg-trading-down/30' : 'bg-trading-muted/20';
+                  const cellIntensity = (prob: number) => {
+                    const alpha = Math.round(prob * 60 + 5);
+                    if (prob >= 0.5) return `bg-purple-500/${alpha > 60 ? 60 : alpha} text-purple-200`;
+                    if (prob >= 0.3) return `bg-purple-500/20 text-purple-300`;
+                    return 'bg-trading-card/50 text-trading-muted';
+                  };
+
+                  return (
+                    <div className="space-y-5">
+                      {/* Info bar */}
+                      <div className="flex items-center gap-3 text-[9px] text-trading-muted">
+                        <span className="px-2 py-1 bg-trading-card border border-trading-border rounded font-mono">{markovSymbol} · {tf}</span>
+                        <span className="px-2 py-1 bg-trading-card border border-trading-border rounded font-mono">{candleCount} candles analysed</span>
+                        <span className="px-2 py-1 bg-trading-card border border-trading-border rounded font-mono">Bear &lt; {markovBear}% · Bull &gt; {markovBull}%</span>
+                      </div>
+
+                      {/* Top row: Current State | Predicted Next | Signal */}
+                      <div className="grid grid-cols-3 gap-4">
+                        {/* Current State */}
+                        <div className={cn("rounded-lg border p-5 flex flex-col items-center justify-center gap-2", stateBg(currentState))}>
+                          <div className="text-[9px] uppercase text-trading-muted tracking-[2px]">Current State</div>
+                          <div className={cn("text-3xl font-black tracking-tight", stateColor(currentState))}>{currentState}</div>
+                          <div className="text-[9px] text-trading-muted">Most recent {tf} candle</div>
+                        </div>
+
+                        {/* Prediction bars */}
+                        <div className="rounded-lg border border-trading-border bg-trading-card p-4 space-y-3">
+                          <div className="text-[9px] uppercase text-trading-muted tracking-[2px]">Next State Probabilities</div>
+                          {(['BEAR','STAGNANT','BULL'] as const).map(s => {
+                            const prob = (prediction?.[s] ?? 0) * 100;
+                            return (
+                              <div key={s} className="space-y-1">
+                                <div className="flex justify-between text-[9px]">
+                                  <span className={stateColor(s)}>{s}</span>
+                                  <span className="font-mono font-bold text-trading-text">{prob.toFixed(1)}%</span>
+                                </div>
+                                <div className="h-1.5 bg-trading-border rounded-full overflow-hidden">
+                                  <div
+                                    className={cn("h-full rounded-full transition-all", s === 'BULL' ? 'bg-trading-up' : s === 'BEAR' ? 'bg-trading-down' : 'bg-trading-muted')}
+                                    style={{ width: `${prob}%` }}
+                                  />
+                                </div>
+                              </div>
+                            );
+                          })}
+                        </div>
+
+                        {/* Signal */}
+                        <div className={cn(
+                          "rounded-lg border p-5 flex flex-col items-center justify-center gap-2",
+                          signal === 'BUY'  ? 'bg-trading-up/10 border-trading-up/40' :
+                          signal === 'SELL' ? 'bg-trading-down/10 border-trading-down/40' :
+                          'bg-trading-card border-trading-border'
+                        )}>
+                          <div className="text-[9px] uppercase text-trading-muted tracking-[2px]">Markov Signal</div>
+                          <div className={cn("text-3xl font-black",
+                            signal === 'BUY'  ? 'text-trading-up' :
+                            signal === 'SELL' ? 'text-trading-down' :
+                            'text-trading-muted'
+                          )}>{signal}</div>
+                          <div className="text-[9px] text-trading-muted">Confidence: <span className="font-bold text-trading-text">{confidence}%</span></div>
+                          <div className="text-[9px] text-trading-muted">Predicted: <span className={cn("font-bold", stateColor(predictedNext))}>{predictedNext}</span></div>
+                        </div>
+                      </div>
+
+                      {/* Transition Matrix + Distribution */}
+                      <div className="grid grid-cols-1 md:grid-cols-[1fr_auto] gap-4">
+                        {/* Matrix */}
+                        <div className="bg-trading-card border border-trading-border rounded-lg p-4 space-y-3">
+                          <div className="text-[10px] uppercase text-trading-muted tracking-[2px]">Transition Probability Matrix</div>
+                          <div className="text-[9px] text-trading-muted mb-2">P(next state | current state) — each row sums to 1.0</div>
+                          <table className="w-full text-[10px] border-separate border-spacing-1">
+                            <thead>
+                              <tr>
+                                <th className="text-left text-trading-muted font-bold py-1 pr-3">FROM \ TO →</th>
+                                {(['BEAR','STAGNANT','BULL'] as const).map(s => (
+                                  <th key={s} className={cn("px-3 py-1 rounded text-center font-bold", stateColor(s))}>{s}</th>
+                                ))}
+                              </tr>
+                            </thead>
+                            <tbody>
+                              {(['BEAR','STAGNANT','BULL'] as const).map(from => (
+                                <tr key={from} className={cn(from === currentState ? 'ring-1 ring-purple-400/50 rounded' : '')}>
+                                  <td className={cn("pr-3 py-1.5 font-bold", stateColor(from), from === currentState ? 'text-purple-300' : '')}>
+                                    {from}
+                                    {from === currentState && <span className="ml-1 text-[8px] text-purple-400">← NOW</span>}
+                                  </td>
+                                  {(['BEAR','STAGNANT','BULL'] as const).map(to => {
+                                    const prob = matrix?.[from]?.[to] ?? 0;
+                                    const isMaxInRow = prob === Math.max(...(['BEAR','STAGNANT','BULL'] as const).map(t => matrix?.[from]?.[t] ?? 0));
+                                    return (
+                                      <td key={to} className={cn("px-3 py-1.5 text-center rounded font-mono", cellIntensity(prob), isMaxInRow && prob > 0 ? 'ring-1 ring-purple-400/40' : '')}>
+                                        {(prob * 100).toFixed(1)}%
+                                      </td>
+                                    );
+                                  })}
+                                </tr>
+                              ))}
+                            </tbody>
+                          </table>
+                        </div>
+
+                        {/* Distribution */}
+                        <div className="bg-trading-card border border-trading-border rounded-lg p-4 space-y-4 min-w-[180px]">
+                          <div className="text-[10px] uppercase text-trading-muted tracking-[2px]">State Distribution</div>
+                          {(['BEAR','STAGNANT','BULL'] as const).map(s => (
+                            <div key={s} className="space-y-1.5">
+                              <div className="flex justify-between text-[9px]">
+                                <span className={cn("font-bold", stateColor(s))}>{s}</span>
+                                <span className="font-mono text-trading-text">{distribution?.[s] ?? 0}%</span>
+                              </div>
+                              <div className="h-2 bg-trading-border rounded-full overflow-hidden">
+                                <div
+                                  className={cn("h-full rounded-full", s === 'BULL' ? 'bg-trading-up/70' : s === 'BEAR' ? 'bg-trading-down/70' : 'bg-trading-muted/50')}
+                                  style={{ width: `${distribution?.[s] ?? 0}%` }}
+                                />
+                              </div>
+                            </div>
+                          ))}
+                          <div className="pt-2 border-t border-trading-border text-[9px] text-trading-muted space-y-1">
+                            <div>Total states: <span className="font-mono text-trading-text">{(candleCount - 1)}</span></div>
+                            <div className="leading-relaxed">Distribution shows how often each regime appears historically.</div>
+                          </div>
+                        </div>
+                      </div>
+
+                      {/* Recent State Timeline */}
+                      {recentStates?.length > 0 && (
+                        <div className="bg-trading-card border border-trading-border rounded-lg p-4 space-y-3">
+                          <div className="flex items-center justify-between">
+                            <div className="text-[10px] uppercase text-trading-muted tracking-[2px]">Recent State Timeline</div>
+                            <div className="text-[9px] text-trading-muted">last {recentStates.length} candles · left = oldest · right = newest</div>
+                          </div>
+                          <div className="flex flex-wrap gap-0.5">
+                            {recentStates.map((s: any, i: number) => (
+                              <div
+                                key={i}
+                                title={`${new Date(s.ts).toLocaleTimeString()} · ${s.returnPct > 0 ? '+' : ''}${s.returnPct}% · ${s.state}`}
+                                className={cn("w-4 h-4 rounded-[2px] cursor-default transition-opacity hover:opacity-80", stateChip(s.state))}
+                              />
+                            ))}
+                          </div>
+                          <div className="flex items-center gap-4 text-[9px] text-trading-muted">
+                            <div className="flex items-center gap-1"><div className="w-3 h-3 rounded-[2px] bg-trading-down/30" /> BEAR</div>
+                            <div className="flex items-center gap-1"><div className="w-3 h-3 rounded-[2px] bg-trading-muted/20" /> STAGNANT</div>
+                            <div className="flex items-center gap-1"><div className="w-3 h-3 rounded-[2px] bg-trading-up/30" /> BULL</div>
+                          </div>
+                        </div>
+                      )}
+
+                      {/* Limitation note */}
+                      <div className="bg-trading-card/50 border border-trading-border/50 rounded p-3 text-[9px] text-trading-muted leading-relaxed">
+                        <span className="font-bold text-trading-text">Limitation:</span> A first-order Markov chain only considers the current state, not history. Crypto regimes are influenced by hidden factors (order flow, liquidation cascades, macro) that a basic chain cannot capture. Use this signal alongside your existing indicator stack — not as a standalone trigger.
+                      </div>
+                    </div>
+                  );
+                })()}
               </div>
             </motion.div>
           </div>
