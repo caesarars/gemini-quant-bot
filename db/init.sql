@@ -51,24 +51,31 @@ CREATE TABLE IF NOT EXISTS ohlcv (
 
 CREATE INDEX IF NOT EXISTS idx_ohlcv_symbol_ts ON ohlcv (symbol, timeframe, timestamp DESC);
 
+CREATE TABLE IF NOT EXISTS signals (
+  id            UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  symbol        VARCHAR(20) NOT NULL,
+  side          VARCHAR(10) NOT NULL CHECK (side IN ('LONG','SHORT')),
+  strategy      VARCHAR(100) NOT NULL,
+  timeframe     VARCHAR(10) NOT NULL,
+  entry_price   NUMERIC(20,8) NOT NULL,
+  tp_price      NUMERIC(20,8) NOT NULL,
+  sl_price      NUMERIC(20,8) NOT NULL,
+  confidence    NUMERIC(4,2),
+  est_duration  VARCHAR(50),
+  context       JSONB,
+  status        VARCHAR(20) DEFAULT 'ACTIVE' CHECK (status IN ('ACTIVE','EXPIRED','HIT_TP','HIT_SL')),
+  telegram_sent BOOLEAN DEFAULT false,
+  sent_at       TIMESTAMPTZ DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_signals_symbol_sent ON signals (symbol, sent_at DESC);
+CREATE INDEX IF NOT EXISTS idx_signals_status ON signals (status);
+
 -- Default settings row
 INSERT INTO bot_settings (id) VALUES ('bot_config') ON CONFLICT (id) DO NOTHING;
 
--- Seed trade history
-INSERT INTO trades (symbol, type, entry_price, exit_price, pnl, amount, strategy, status) VALUES
-  ('BTC/USDT', 'BUY',  64102.5, 64150.2, 47.7,  0.01, 'ULTRA-SCALP v2.1', 'CLOSED'),
-  ('ETH/USDT', 'SELL', 3452.1,  3448.5,  -3.6,  0.1,  'ULTRA-SCALP v2.1', 'CLOSED'),
-  ('SOL/USDT', 'BUY',  141.2,   142.08,  0.88,  1,    'MOMENTUM ARB',     'CLOSED'),
-  ('BTC/USDT', 'BUY',  64081.2, 64112.5, 31.3,  0.01, 'ULTRA-SCALP v2.1', 'CLOSED'),
-  ('SOL/USDT', 'BUY',  140.5,   141.1,   0.6,   1,    'VOLATILITY CORE',  'CLOSED');
-
--- Seed PnL snapshots (last 8 hours)
-INSERT INTO pnl_snapshots (timestamp, total_value, pnl_percent) VALUES
-  (EXTRACT(EPOCH FROM NOW() - INTERVAL '7 hours') * 1000, 10000, 0.00),
-  (EXTRACT(EPOCH FROM NOW() - INTERVAL '6 hours') * 1000, 10012, 0.12),
-  (EXTRACT(EPOCH FROM NOW() - INTERVAL '5 hours') * 1000, 10008, 0.08),
-  (EXTRACT(EPOCH FROM NOW() - INTERVAL '4 hours') * 1000, 10025, 0.25),
-  (EXTRACT(EPOCH FROM NOW() - INTERVAL '3 hours') * 1000, 10042, 0.42),
-  (EXTRACT(EPOCH FROM NOW() - INTERVAL '2 hours') * 1000, 10038, 0.38),
-  (EXTRACT(EPOCH FROM NOW() - INTERVAL '1 hour')  * 1000, 10055, 0.55),
-  (EXTRACT(EPOCH FROM NOW())                       * 1000, 10068, 0.68);
+-- Seed signal history (sample)
+INSERT INTO signals (symbol, side, strategy, timeframe, entry_price, tp_price, sl_price, confidence, est_duration, status, telegram_sent, sent_at) VALUES
+  ('BTC/USDT', 'LONG',  'MOMENTUM-ARB', '5m',  64102.50, 64600.00, 63800.00, 4.2, '30–60 min',   'HIT_TP', true, NOW() - INTERVAL '2 hours'),
+  ('ETH/USDT', 'SHORT', 'MEAN-REV',     '15m', 3452.10,  3400.00,  3480.00,  3.8, '1–4 hours',   'EXPIRED', true, NOW() - INTERVAL '5 hours'),
+  ('SOL/USDT', 'LONG',  'SWING-LONG',   '4h',  141.20,   150.00,   135.00,   4.5, '1–3 days',    'ACTIVE', true, NOW() - INTERVAL '1 hour');

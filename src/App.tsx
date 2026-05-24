@@ -73,6 +73,33 @@ interface AIResult {
   reason: string;
 }
 
+interface PaperTrade {
+  id: string;
+  symbol: string;
+  strategy: string;
+  side: 'LONG' | 'SHORT';
+  entry_price: number;
+  tp_price: number;
+  sl_price: number;
+  status: 'OPEN' | 'TP' | 'SL' | 'MANUAL' | 'EXPIRED';
+  open_time: string;
+  close_time?: string;
+  close_price?: number;
+  pnl_pct?: number;
+  signal_score?: number;
+}
+
+interface StrategyStats {
+  strategy: string;
+  total_trades: number;
+  win_trades: number;
+  loss_trades: number;
+  total_pnl_pct: number;
+  avg_win_pct: number;
+  avg_loss_pct: number;
+  last_updated: string;
+}
+
 interface OpenPosition {
   id: string;
   symbol: string;
@@ -94,7 +121,6 @@ function getBlockReason(
   trend: 'UP' | 'DOWN' | 'NEUTRAL' | undefined,
   volumeRatio: number | undefined,
   volThreshold: number,
-  isAutoPilot: boolean,
   skipTrend = false,
   fundingRate?: number,
   fearGreed?: number | null,
@@ -105,9 +131,6 @@ function getBlockReason(
   regime?: 'TRENDING' | 'RANGING' | 'NEUTRAL' | undefined,
   adx?: number | null
 ): { label: string; color: string } {
-  if (!isAutoPilot) return { label: 'Auto-pilot OFF', color: 'text-trading-muted' };
-  if (cdInfo?.status === 'OPEN') return { label: 'Position open', color: 'text-orange-400' };
-  if (cdInfo?.inCooldown) return { label: 'Cooldown active', color: 'text-orange-400' };
   if (strategyId === 'MEAN-REV' && regime === 'TRENDING') return { label: `Blocked: TREND regime (ADX ${adx?.toFixed(0) ?? '?'})`, color: 'text-orange-400' };
   if (strategyId === 'MOMENTUM-ARB' && regime === 'RANGING') return { label: `Blocked: RANGE regime (ADX ${adx?.toFixed(0) ?? '?'})`, color: 'text-orange-400' };
   if (action === 'HOLD') return { label: 'No signal', color: 'text-trading-muted' };
@@ -144,18 +167,9 @@ function getBlockReason(
 
 export default function App() {
   const [scanResults, setScanResults] = useState<ScanResult[]>([]);
-  const [balance, setBalance] = useState<Record<string, number>>({});
-  const [pnlData, setPnlData] = useState<any[]>([]);
-  const [tradeHistory, setTradeHistory] = useState<any[]>([]);
-  const [isHistoryOpen, setIsHistoryOpen] = useState(false);
-  const [isPositionsOpen, setIsPositionsOpen] = useState(false);
-  const [openPositions, setOpenPositions] = useState<OpenPosition[]>([]);
-  const [lastSync, setLastSync] = useState<string | null>(null);
-  const [isSyncing, setIsSyncing]       = useState(false);
-  const [closingId, setClosingId]       = useState<string | null>(null);
-  const [closingAll, setClosingAll]     = useState(false);
+  const [signals, setSignals] = useState<any[]>([]);
+  const [isSignalsOpen, setIsSignalsOpen] = useState(false);
   const [logs, setLogs] = useState<{ id: string; msg: string; time: string; type: string }[]>([]);
-  const [isAutoPilot, setIsAutoPilot]             = useState(false);
   const [activeStrategies, setActiveStrategies]   = useState<string[]>(["MOMENTUM-ARB", "MEAN-REV", "SWING-LONG"]);
   const [riskLevel, setRiskLevel]                 = useState<number>(1);
   const [isSettingsOpen, setIsSettingsOpen]       = useState(false);
@@ -181,9 +195,12 @@ export default function App() {
   });
   const [cooldownStatus, setCooldownStatus]       = useState<Record<string, { inCooldown: boolean; strategy: string; status?: string }>>({});
   const [validationLogs, setValidationLogs] = useState<any[]>([]);
+  const [paperTrades, setPaperTrades]       = useState<PaperTrade[]>([]);
+  const [strategyStats, setStrategyStats]   = useState<StrategyStats[]>([]);
+  const [isPaperTradesOpen, setIsPaperTradesOpen] = useState(false);
+  const [paperMode, setPaperMode]           = useState(true);
+  const [paperTab, setPaperTab]             = useState<'open' | 'history' | 'performance'>('open');
   const [loadingAi, setLoadingAi] = useState<string | null>(null);
-  const [executingKey, setExecutingKey] = useState<string | null>(null);
-  const [executeConfirmKey, setExecuteConfirmKey] = useState<string | null>(null);
   const [marketContext, setMarketContext] = useState<{
     fearGreed: { value: number; classification: string } | null;
     fundingRates: Record<string, number>;
@@ -219,32 +236,22 @@ export default function App() {
     setBtLoading(false);
   };
 
-  const executeManual = async (symbol: string, strategy: string, action: string) => {
-    const key = `${symbol}|${strategy}`;
-    // Two-tap confirm: first click sets confirm state, second click within 3s executes
-    if (executeConfirmKey !== key) {
-      setExecuteConfirmKey(key);
-      setTimeout(() => setExecuteConfirmKey(prev => prev === key ? null : prev), 3000);
-      return;
-    }
-    setExecuteConfirmKey(null);
-    setExecutingKey(key);
+  const sendManualSignal = async (symbol: string, strategy: string, side: string) => {
     try {
-      const r = await fetch("/api/manual-execute", {
+      const r = await fetch("/api/send-signal", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ symbol, strategy }),
+        body: JSON.stringify({ symbol, side, strategy, entry: 0, tp: 0, sl: 0 }),
       });
       const d = await r.json();
       if (d.ok) {
-        addLog(`▶ MANUAL ${d.action} ${symbol} via ${strategy} @ $${d.price?.toLocaleString()} — check Validation Log`, "success");
+        addLog(`📡 Signal sent: ${side} ${symbol} via ${strategy}`, "success");
       } else {
-        addLog(`✗ Manual execute failed: ${d.error}`, "error");
+        addLog(`✗ Signal send failed: ${d.error}`, "error");
       }
     } catch (e: any) {
-      addLog(`✗ Manual execute error: ${e.message}`, "error");
+      addLog(`✗ Signal send error: ${e.message}`, "error");
     }
-    setExecutingKey(null);
   };
 
   const runMarkov = async () => {
@@ -276,7 +283,6 @@ export default function App() {
     fetch("/api/settings")
       .then((r) => r.json())
       .then((s) => {
-        if (typeof s.is_auto_pilot === "boolean") setIsAutoPilot(s.is_auto_pilot);
         if (Array.isArray(s.active_strategies)) setActiveStrategies(s.active_strategies);
         if (typeof s.risk_level === "number") setRiskLevel(s.risk_level);
         setBotSettings(prev => ({
@@ -297,6 +303,7 @@ export default function App() {
         }));
         if (typeof s.telegram_bot_token === "string") setTelegramBotToken(s.telegram_bot_token);
         if (typeof s.telegram_chat_id   === "string") setTelegramChatId(s.telegram_chat_id);
+        if (s.paper_mode != null) setPaperMode(Boolean(s.paper_mode));
       })
       .catch(() => {});
   }, []);
@@ -315,37 +322,32 @@ export default function App() {
     addLog(`Active: ${next.join(", ")}`, "info");
   };
 
-  const refreshPositions = async () => {
-    const r = await fetch("/api/open-positions");
+  const fetchSignals = async () => {
+    const r = await fetch("/api/signals");
     const d = await r.json();
-    setOpenPositions(d.positions ?? []);
-    if (d.last_sync) setLastSync(d.last_sync);
+    setSignals(d ?? []);
   };
 
-  const closePosition = async (id: string) => {
-    setClosingId(id);
+  const expireSignal = async (id: string) => {
     try {
-      const r = await fetch(`/api/close-position/${id}`, { method: "POST" });
-      const d = await r.json();
-      if (!r.ok) { addLog(`Close failed: ${d.error}`, "error"); return; }
-      addLog(`Closed ${d.symbol} @ ${d.exitPrice} PnL: ${d.pnlUsdt >= 0 ? "+" : ""}${d.pnlUsdt.toFixed(2)} USDT`, d.pnlUsdt >= 0 ? "success" : "error");
-      await refreshPositions();
-    } finally {
-      setClosingId(null);
+      await fetch(`/api/signals/${id}/expire`, { method: "POST" });
+      addLog(`Signal expired`, "info");
+      await fetchSignals();
+    } catch (e: any) {
+      addLog(`Expire failed: ${e.message}`, "error");
     }
   };
 
-  const closeAllPositions = async () => {
-    if (!confirm(`Close semua ${openPositions.length} posisi sekarang?`)) return;
-    setClosingAll(true);
+  const fetchPaperData = async () => {
     try {
-      const r = await fetch("/api/close-all-positions", { method: "POST" });
-      const d = await r.json();
-      if (!r.ok) { addLog(`Close all failed: ${d.error}`, "error"); return; }
-      addLog(`Closed ${d.closed} positions`, "success");
-      await refreshPositions();
-    } finally {
-      setClosingAll(false);
+      const [ptRes, ssRes] = await Promise.all([
+        fetch("/api/paper-trades"),
+        fetch("/api/strategy-stats"),
+      ]);
+      if (ptRes.ok) setPaperTrades(await ptRes.json());
+      if (ssRes.ok) setStrategyStats(await ssRes.json());
+    } catch (err) {
+      console.error("[PAPER] Failed to fetch paper data", err);
     }
   };
 
@@ -354,12 +356,10 @@ export default function App() {
     // 1. Fetch static/less-frequent data once on mount
     const fetchStaticData = async () => {
       try {
-        const [checkRes, balRes, pnlRes, historyRes, posRes] = await Promise.all([
+        const [checkRes, sigRes, settingsRes] = await Promise.all([
           fetch("/api/check-api"),
-          fetch("/api/balance"),
-          fetch("/api/pnl-history"),
-          fetch("/api/trade-history"),
-          fetch("/api/open-positions"),
+          fetch("/api/signals"),
+          fetch("/api/settings"),
         ]);
 
         if (checkRes.ok) {
@@ -369,24 +369,19 @@ export default function App() {
             addLog(`API ERROR: ${checkData.reason}`, 'error');
           }
         }
-        if (balRes.ok) {
-          const balData = await balRes.json();
-          setBalance(balData.total);
-          if (balData.fallback === 'mock') setApiStatus('mock');
-        }
-        if (pnlRes.ok) setPnlData(await pnlRes.json());
-        if (historyRes.ok) setTradeHistory(await historyRes.json());
-        if (posRes.ok) {
-          const posData = await posRes.json();
-          setOpenPositions(posData.positions ?? []);
-          if (posData.last_sync) setLastSync(posData.last_sync);
+        if (sigRes.ok) setSignals(await sigRes.json());
+        if (settingsRes.ok) {
+          const s = await settingsRes.json();
+          if (s.paper_mode != null) setPaperMode(Boolean(s.paper_mode));
         }
       } catch (err) {
         console.error("[INIT] Failed to fetch static data", err);
       }
     };
 
+
     fetchStaticData();
+    fetchPaperData();
 
     // 2. SSE for real-time scanner + market context + cooldown
     let es: EventSource | null = null;
@@ -425,19 +420,13 @@ export default function App() {
         }
       });
 
-      es.addEventListener("trade", (ev: any) => {
+      es.addEventListener("signal", (ev: any) => {
         try {
           const data = JSON.parse(ev.data);
-          addLog(`Trade: ${data.action} ${data.symbol} @ $${data.price.toLocaleString()} [${data.strategy}]`, 'success');
-          // Re-fetch positions & trade history after a trade
-          fetch("/api/open-positions").then(r => r.json()).then(d => {
-            setOpenPositions(d.positions ?? []);
-            if (d.last_sync) setLastSync(d.last_sync);
-          }).catch(() => {});
-          fetch("/api/trade-history").then(r => r.json()).then(setTradeHistory).catch(() => {});
-          fetch("/api/balance").then(r => r.json()).then(d => setBalance(d.total)).catch(() => {});
+          addLog(`Signal: ${data.side} ${data.symbol} @ $${data.entryPrice.toLocaleString()} [${data.strategy}]`, 'success');
+          setSignals(prev => [data, ...prev].slice(0, 50));
         } catch (err) {
-          console.error("[SSE] trade event error:", err);
+          console.error("[SSE] signal event error:", err);
         }
       });
 
@@ -450,16 +439,14 @@ export default function App() {
         }
       });
 
-      es.addEventListener("sync", (ev: any) => {
+      es.addEventListener("paper_trade_closed", (ev: any) => {
         try {
+          fetchPaperData();
           const data = JSON.parse(ev.data);
-          addLog(`Positions synced at ${new Date(data.timestamp).toLocaleTimeString()}`, 'info');
-          fetch("/api/open-positions").then(r => r.json()).then(d => {
-            setOpenPositions(d.positions ?? []);
-            if (d.last_sync) setLastSync(d.last_sync);
-          }).catch(() => {});
+          const sign = data.pnlPct >= 0 ? "+" : "";
+          addLog(`Paper ${data.reason}: ${data.symbol} ${sign}${data.pnlPct?.toFixed(2)}% [${data.strategy}]`, data.reason === "TP" ? "success" : "error");
         } catch (err) {
-          console.error("[SSE] sync event error:", err);
+          console.error("[SSE] paper_trade_closed error:", err);
         }
       });
 
@@ -481,10 +468,10 @@ export default function App() {
 
     connectSSE();
 
-    // 3. Light backup fetch every 30s for balance & PnL (in case SSE misses something)
+    // 3. Light backup fetch every 30s for signals + paper trades
     const backupInterval = setInterval(() => {
-      fetch("/api/balance").then(r => r.json()).then(d => setBalance(d.total)).catch(() => {});
-      fetch("/api/pnl-history").then(r => r.json()).then(setPnlData).catch(() => {});
+      fetch("/api/signals").then(r => r.json()).then(setSignals).catch(() => {});
+      fetchPaperData();
     }, 30000);
 
     return () => {
@@ -539,25 +526,30 @@ export default function App() {
             </span>
           </div>
           <div className="text-trading-muted">LATENCY: <span className="text-trading-up">14ms</span></div>
-          <div className="text-trading-muted">BAL: <span className="text-trading-text">{balance['USDT']?.toLocaleString() || '0.00'} USDT</span></div>
+          <div className="text-trading-muted">SIGNALS: <span className="text-trading-text">{signals.length}</span></div>
           <button
-            onClick={() => setIsPositionsOpen(true)}
+            onClick={() => setIsSignalsOpen(true)}
             className="relative flex items-center gap-2 p-2 px-3 bg-trading-card border border-trading-border rounded hover:border-trading-muted transition-colors"
           >
             <BarChart2 className="w-4 h-4 text-trading-up" />
-            <span className="text-[10px] font-bold uppercase tracking-widest">Positions</span>
-            {openPositions.length > 0 && (
+            <span className="text-[10px] font-bold uppercase tracking-widest">Signals</span>
+            {signals.length > 0 && (
               <span className="absolute -top-1.5 -right-1.5 w-4 h-4 bg-trading-up text-trading-bg text-[9px] font-black rounded-full flex items-center justify-center">
-                {openPositions.length}
+                {signals.length}
               </span>
             )}
           </button>
           <button
-            onClick={() => setIsHistoryOpen(true)}
-            className="flex items-center gap-2 p-2 px-3 bg-trading-card border border-trading-border rounded hover:border-trading-muted transition-colors"
+            onClick={() => { setIsPaperTradesOpen(true); setPaperTab('open'); }}
+            className="relative flex items-center gap-2 p-2 px-3 bg-trading-card border border-trading-border rounded hover:border-cyan-400 transition-colors"
           >
-            <History className="w-4 h-4 text-trading-accent" />
-            <span className="text-[10px] font-bold uppercase tracking-widest">History</span>
+            <Shield className="w-4 h-4 text-cyan-400" />
+            <span className="text-[10px] font-bold uppercase tracking-widest text-cyan-400">Paper</span>
+            {paperTrades.filter(t => t.status === 'OPEN').length > 0 && (
+              <span className="absolute -top-1.5 -right-1.5 w-4 h-4 bg-cyan-400 text-trading-bg text-[9px] font-black rounded-full flex items-center justify-center">
+                {paperTrades.filter(t => t.status === 'OPEN').length}
+              </span>
+            )}
           </button>
           <button
             onClick={() => setIsBacktestOpen(true)}
@@ -586,73 +578,34 @@ export default function App() {
       {/* Main Layout */}
       <main className="flex-1 flex flex-col gap-[1px] bg-trading-border overflow-hidden">
 
-        {/* ── Hero: Performance (USDT) Chart ── */}
+        {/* ── Hero: Recent Signals ── */}
         <section className="bg-trading-panel p-5 flex-none h-[280px] flex flex-col">
           <div className="flex items-center justify-between mb-3">
-            <div className="flex items-center gap-3">
-              <div className="flex items-center gap-3 text-[10px] uppercase text-trading-muted tracking-[2px]">
-                <TrendingUp className="w-3.5 h-3.5" />
-                Performance (USDT)
-              </div>
-              {(() => {
-                const last = pnlData[pnlData.length - 1]?.value ?? 0;
-                const first = pnlData[0]?.value ?? 0;
-                const totalRet = first !== 0 ? ((last - first) / Math.abs(first) * 100) : 0;
-                let maxDD = 0, peak = first;
-                for (const d of pnlData) {
-                  if (d.value > peak) peak = d.value;
-                  const dd = (peak - d.value) / Math.abs(peak) * 100;
-                  if (dd > maxDD) maxDD = dd;
-                }
-                const stats = [
-                  { label: 'Equity', val: `$${last.toFixed(2)}`, color: last >= first ? 'text-trading-up' : 'text-trading-down' },
-                  { label: 'Total Return', val: `${totalRet >= 0 ? '+' : ''}${totalRet.toFixed(2)}%`, color: totalRet >= 0 ? 'text-trading-up' : 'text-trading-down' },
-                  { label: 'Max Drawdown', val: `-${maxDD.toFixed(2)}%`, color: 'text-trading-down' },
-                  { label: 'Data Points', val: `${pnlData.length}`, color: 'text-trading-text' },
-                ];
-                return (
-                  <div className="flex items-center gap-2">
-                    {stats.map(s => (
-                      <div key={s.label} className="px-2.5 py-1 bg-trading-card border border-trading-border rounded flex items-center gap-1.5">
-                        <span className="text-[9px] text-trading-muted uppercase">{s.label}</span>
-                        <span className={cn("text-[11px] font-black font-mono", s.color)}>{s.val}</span>
-                      </div>
-                    ))}
-                  </div>
-                );
-              })()}
+            <div className="flex items-center gap-3 text-[10px] uppercase text-trading-muted tracking-[2px]">
+              <TrendingUp className="w-3.5 h-3.5" />
+              Recent Signals
             </div>
-            <button
-              onClick={async () => {
-                if (!confirm("Reset semua PnL history? Data paper trading akan dihapus.")) return;
-                await fetch("/api/pnl-history", { method: "DELETE" });
-                setPnlData([]);
-              }}
-              className="text-[9px] px-2 py-1 bg-trading-down/10 text-trading-down border border-trading-down/30 rounded hover:bg-trading-down/20 transition-colors font-bold uppercase tracking-wider"
-            >
-              Reset
-            </button>
           </div>
-          <div className="flex-1 min-h-0 bg-trading-card/30 border border-trading-border rounded p-2">
-            <ResponsiveContainer width="100%" height="100%">
-              <LineChart data={pnlData}>
-                <CartesianGrid strokeDasharray="3 3" stroke="#1A1D23" vertical={false} />
-                <XAxis dataKey="time" hide />
-                <YAxis hide domain={['dataMin - 10', 'dataMax + 10']} />
-                <Tooltip
-                  contentStyle={{ backgroundColor: '#111318', border: '1px solid #1A1D23', fontSize: '10px' }}
-                  labelStyle={{ color: '#666' }}
-                />
-                <Line
-                  type="monotone"
-                  dataKey="value"
-                  stroke="#00D1FF"
-                  strokeWidth={2}
-                  dot={{ fill: '#00D1FF', r: 2 }}
-                  activeDot={{ r: 4, stroke: '#00FFA3' }}
-                />
-              </LineChart>
-            </ResponsiveContainer>
+          <div className="flex-1 min-h-0 bg-trading-card/30 border border-trading-border rounded p-2 overflow-y-auto">
+            {signals.length === 0 && (
+              <div className="text-[10px] text-trading-muted text-center py-4">No signals yet</div>
+            )}
+            {signals.slice(0, 20).map((s: any) => (
+              <div key={s.id} className="flex items-center justify-between py-1.5 border-b border-trading-border/50 last:border-0">
+                <div className="flex items-center gap-2">
+                  <span className={cn("text-[10px] font-bold", s.side === 'LONG' ? 'text-trading-up' : 'text-trading-down')}>
+                    {s.side}
+                  </span>
+                  <span className="text-[10px] text-trading-text">{s.symbol}</span>
+                  <span className="text-[9px] text-trading-muted">{s.strategy}</span>
+                </div>
+                <div className="flex items-center gap-3">
+                  <span className="text-[9px] text-trading-muted">E: ${s.entry_price?.toLocaleString()}</span>
+                  <span className="text-[9px] text-trading-muted">{s.est_duration}</span>
+                  <span className="text-[9px] text-trading-muted">{new Date(s.sent_at).toLocaleTimeString()}</span>
+                </div>
+              </div>
+            ))}
           </div>
         </section>
 
@@ -926,7 +879,7 @@ export default function App() {
                     {/* ── Strategy rows ── */}
                     <div className="space-y-1.5 mb-3">
                       {coin.momentumArb && (() => {
-                        const r = getBlockReason(coin.momentumArb.action, coin.trend, coin.momentumArb.volumeRatio, 1.0, isAutoPilot, false, marketContext.fundingRates[coin.symbol], marketContext.fearGreed?.value, 'MOMENTUM-ARB', coin.oiChangePct, coin.lsRatio, cooldownStatus[`${coin.symbol}|MOMENTUM-ARB`], coin.regime, coin.adx);
+                        const r = getBlockReason(coin.momentumArb.action, coin.trend, coin.momentumArb.volumeRatio, 1.0, false, marketContext.fundingRates[coin.symbol], marketContext.fearGreed?.value, 'MOMENTUM-ARB', coin.oiChangePct, coin.lsRatio, cooldownStatus[`${coin.symbol}|MOMENTUM-ARB`], coin.regime, coin.adx);
                         const active = coin.momentumArb.action !== 'HOLD';
                         return (
                           <div className={cn("rounded overflow-hidden border",
@@ -966,20 +919,10 @@ export default function App() {
                               <span className={cn("text-[11px] font-mono", r.color)}>↳ {r.label}</span>
                               {active && (
                                 <button
-                                  onClick={() => executeManual(coin.symbol, 'MOMENTUM-ARB', coin.momentumArb!.action)}
-                                  disabled={executingKey === `${coin.symbol}|MOMENTUM-ARB`}
-                                  className={cn(
-                                    "ml-2 shrink-0 px-2 py-0.5 rounded text-[9px] font-black uppercase tracking-wider border transition-all disabled:opacity-40",
-                                    executeConfirmKey === `${coin.symbol}|MOMENTUM-ARB`
-                                      ? "bg-yellow-400/20 border-yellow-400 text-yellow-300 animate-pulse"
-                                      : coin.momentumArb!.action === 'BUY'
-                                        ? "bg-trading-up/10 border-trading-up/50 text-trading-up hover:bg-trading-up/25"
-                                        : "bg-trading-down/10 border-trading-down/50 text-trading-down hover:bg-trading-down/25"
-                                  )}
+                                  onClick={() => sendManualSignal(coin.symbol, 'MOMENTUM-ARB', coin.momentumArb!.action === 'BUY' ? 'LONG' : 'SHORT')}
+                                  className="ml-2 shrink-0 px-2 py-0.5 rounded text-[9px] font-black uppercase tracking-wider border transition-all bg-trading-accent/10 border-trading-accent/50 text-trading-accent hover:bg-trading-accent/25"
                                 >
-                                  {executingKey === `${coin.symbol}|MOMENTUM-ARB` ? '...' :
-                                   executeConfirmKey === `${coin.symbol}|MOMENTUM-ARB` ? 'CONFIRM?' :
-                                   coin.momentumArb!.action === 'BUY' ? '▶ LONG' : '▶ SHORT'}
+                                  📡 SEND
                                 </button>
                               )}
                             </div>
@@ -988,7 +931,7 @@ export default function App() {
                       })()}
 
                       {coin.meanRev && (() => {
-                        const r = getBlockReason(coin.meanRev.action, coin.trend, coin.meanRev.volumeRatio, 0.8, isAutoPilot, true, marketContext.fundingRates[coin.symbol], marketContext.fearGreed?.value, 'MEAN-REV', coin.oiChangePct, coin.lsRatio, cooldownStatus[`${coin.symbol}|MEAN-REV`], coin.regime, coin.adx);
+                        const r = getBlockReason(coin.meanRev.action, coin.trend, coin.meanRev.volumeRatio, 0.8, true, marketContext.fundingRates[coin.symbol], marketContext.fearGreed?.value, 'MEAN-REV', coin.oiChangePct, coin.lsRatio, cooldownStatus[`${coin.symbol}|MEAN-REV`], coin.regime, coin.adx);
                         const active = coin.meanRev.action !== 'HOLD';
                         const bbColor = coin.meanRev.bbPos === 'LOWER' ? 'text-trading-up'
                                       : coin.meanRev.bbPos === 'UPPER' ? 'text-trading-down'
@@ -1029,20 +972,10 @@ export default function App() {
                               <span className={cn("text-[11px] font-mono", r.color)}>↳ {r.label}</span>
                               {active && (
                                 <button
-                                  onClick={() => executeManual(coin.symbol, 'MEAN-REV', coin.meanRev!.action)}
-                                  disabled={executingKey === `${coin.symbol}|MEAN-REV`}
-                                  className={cn(
-                                    "ml-2 shrink-0 px-2 py-0.5 rounded text-[9px] font-black uppercase tracking-wider border transition-all disabled:opacity-40",
-                                    executeConfirmKey === `${coin.symbol}|MEAN-REV`
-                                      ? "bg-yellow-400/20 border-yellow-400 text-yellow-300 animate-pulse"
-                                      : coin.meanRev!.action === 'BUY'
-                                        ? "bg-trading-up/10 border-trading-up/50 text-trading-up hover:bg-trading-up/25"
-                                        : "bg-trading-down/10 border-trading-down/50 text-trading-down hover:bg-trading-down/25"
-                                  )}
+                                  onClick={() => sendManualSignal(coin.symbol, 'MEAN-REV', coin.meanRev!.action === 'BUY' ? 'LONG' : 'SHORT')}
+                                  className="ml-2 shrink-0 px-2 py-0.5 rounded text-[9px] font-black uppercase tracking-wider border transition-all bg-trading-accent/10 border-trading-accent/50 text-trading-accent hover:bg-trading-accent/25"
                                 >
-                                  {executingKey === `${coin.symbol}|MEAN-REV` ? '...' :
-                                   executeConfirmKey === `${coin.symbol}|MEAN-REV` ? 'CONFIRM?' :
-                                   coin.meanRev!.action === 'BUY' ? '▶ LONG' : '▶ SHORT'}
+                                  📡 SEND
                                 </button>
                               )}
                             </div>
@@ -1095,17 +1028,10 @@ export default function App() {
                               </span>
                               {active && (
                                 <button
-                                  onClick={() => executeManual(coin.symbol, 'SWING-LONG', 'BUY')}
-                                  disabled={executingKey === `${coin.symbol}|SWING-LONG`}
-                                  className={cn(
-                                    "ml-2 shrink-0 px-2 py-0.5 rounded text-[9px] font-black uppercase tracking-wider border transition-all disabled:opacity-40",
-                                    executeConfirmKey === `${coin.symbol}|SWING-LONG`
-                                      ? "bg-yellow-400/20 border-yellow-400 text-yellow-300 animate-pulse"
-                                      : "bg-amber-500/10 border-amber-500/50 text-amber-400 hover:bg-amber-500/25"
-                                  )}
+                                  onClick={() => sendManualSignal(coin.symbol, 'SWING-LONG', 'LONG')}
+                                  className="ml-2 shrink-0 px-2 py-0.5 rounded text-[9px] font-black uppercase tracking-wider border transition-all bg-amber-500/10 border-amber-500/50 text-amber-400 hover:bg-amber-500/25"
                                 >
-                                  {executingKey === `${coin.symbol}|SWING-LONG` ? '...' :
-                                   executeConfirmKey === `${coin.symbol}|SWING-LONG` ? 'CONFIRM?' : '▶ SWING LONG'}
+                                  📡 SEND
                                 </button>
                               )}
                             </div>
@@ -1331,55 +1257,21 @@ export default function App() {
           </div>
 
           <div className="space-y-4 pt-4 border-t border-trading-border">
-            <div className="flex justify-between items-center">
-              <div className="text-[10px] text-trading-muted uppercase tracking-widest font-bold">Auto-Trade Override</div>
-              <div 
-                onClick={() => {
-                  const next = !isAutoPilot;
-                  setIsAutoPilot(next);
-                  addLog(`Auto-trade ${next ? 'ENABLED' : 'DISABLED'}`, next ? 'success' : 'warning');
-                  fetch("/api/settings", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ isAutoPilot: next }) });
-                }}
-                className={cn(
-                  "w-8 h-4 rounded-full transition-all relative cursor-pointer",
-                  isAutoPilot ? "bg-trading-up" : "bg-trading-border"
-                )}
-              >
-                <div className={cn(
-                  "absolute top-0.5 left-0.5 w-3 h-3 bg-white rounded-full transition-transform",
-                  isAutoPilot && "translate-x-4"
-                )} />
-              </div>
-            </div>
-            <button 
-              onClick={() => {
-                const next = !isAutoPilot;
-                setIsAutoPilot(next);
-                addLog(`Manual Override: ${next ? 'EXECUTION START' : 'EMERGENCY KILL'}`, next ? 'success' : 'error');
-                fetch("/api/settings", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ isAutoPilot: next }) });
-              }}
-              className={cn(
-                "w-full py-3 rounded text-[11px] font-black uppercase tracking-widest transition-all",
-                isAutoPilot 
-                  ? "bg-trading-down text-white shadow-[0_0_20px_rgba(255,59,105,0.2)]" 
-                  : "bg-trading-accent text-trading-bg"
-              )}
-            >
-              {isAutoPilot ? "Emergency Kill" : "Initialize Trade"}
-            </button>
+            <div className="text-[10px] text-trading-muted uppercase tracking-widest font-bold">Signal Mode</div>
+            <div className="text-[11px] text-trading-up font-bold">ACTIVE — Telegram alerts enabled</div>
           </div>
         </aside>
 
         </div>
       </main>
 
-      {/* ── Open Positions Modal ── */}
+      {/* ── Signal History Modal ── */}
       <AnimatePresence>
-        {isPositionsOpen && (
+        {isSignalsOpen && (
           <div className="fixed inset-0 z-[100] flex items-center justify-center p-4 md:p-10">
             <motion.div
               initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }}
-              onClick={() => setIsPositionsOpen(false)}
+              onClick={() => setIsSignalsOpen(false)}
               className="absolute inset-0 bg-trading-bg/90 backdrop-blur-sm"
             />
             <motion.div
@@ -1391,36 +1283,19 @@ export default function App() {
               <div className="p-6 border-b border-trading-border flex items-center justify-between">
                 <div className="flex items-center gap-3">
                   <BarChart2 className="w-5 h-5 text-trading-up" />
-                  <h2 className="text-sm font-bold uppercase tracking-[2px]">Open Positions</h2>
-                  <span className="text-[9px] px-2 py-0.5 bg-trading-up/10 text-trading-up border border-trading-up/30 rounded-full font-bold uppercase">
-                    {openPositions.length} Active
-                  </span>
+                  <h2 className="text-lg font-black tracking-tight">Signal History</h2>
+                  <span className="text-[10px] text-trading-muted font-mono">{signals.length} signals</span>
                 </div>
-                <div className="flex items-center gap-2">
-                  {openPositions.length > 0 && (
-                    <button
-                      onClick={closeAllPositions}
-                      disabled={closingAll || closingId !== null}
-                      className="flex items-center gap-1.5 px-3 py-1.5 bg-trading-down/10 text-trading-down border border-trading-down/30 rounded text-[10px] font-black uppercase tracking-widest hover:bg-trading-down/20 transition-colors disabled:opacity-50"
-                    >
-                      {closingAll ? (
-                        <><Activity className="w-3 h-3 animate-spin" /> Closing...</>
-                      ) : (
-                        <><X className="w-3 h-3" /> Close All</>
-                      )}
-                    </button>
-                  )}
-                  <button onClick={() => setIsPositionsOpen(false)} className="p-2 hover:bg-trading-border rounded transition-colors text-trading-muted hover:text-white">
-                    <X className="w-5 h-5" />
-                  </button>
-                </div>
+                <button onClick={() => setIsSignalsOpen(false)} className="p-2 hover:bg-trading-border rounded transition-colors text-trading-muted hover:text-white">
+                  <X className="w-5 h-5" />
+                </button>
               </div>
 
               <div className="flex-1 overflow-auto">
-                {openPositions.length === 0 ? (
+                {signals.length === 0 ? (
                   <div className="flex flex-col items-center justify-center h-48 opacity-30">
                     <BarChart2 className="w-8 h-8 mb-3" />
-                    <div className="text-[10px] uppercase tracking-widest">No open positions</div>
+                    <div className="text-[10px] uppercase tracking-widest">No signals yet</div>
                   </div>
                 ) : (
                   <table className="w-full text-left text-[11px]">
@@ -1428,70 +1303,50 @@ export default function App() {
                       <tr className="text-trading-muted uppercase tracking-wider">
                         <th className="px-6 py-4 font-medium">Symbol</th>
                         <th className="px-6 py-4 font-medium">Side</th>
+                        <th className="px-6 py-4 font-medium">Strategy</th>
                         <th className="px-6 py-4 font-medium">Entry</th>
-                        <th className="px-6 py-4 font-medium">Current</th>
-                        <th className="px-6 py-4 font-medium">Amount</th>
-                        <th className="px-6 py-4 font-medium">Leverage</th>
-                        <th className="px-6 py-4 font-medium">Fee</th>
-                        <th className="px-6 py-4 font-medium">Unrealized PnL</th>
-                        <th className="px-6 py-4 font-medium text-right">Opened</th>
+                        <th className="px-6 py-4 font-medium">TP</th>
+                        <th className="px-6 py-4 font-medium">SL</th>
+                        <th className="px-6 py-4 font-medium">Conf</th>
+                        <th className="px-6 py-4 font-medium">Est. Time</th>
+                        <th className="px-6 py-4 font-medium">Status</th>
+                        <th className="px-4 py-4 font-medium text-right">Sent</th>
                         <th className="px-4 py-4 font-medium text-right">Action</th>
                       </tr>
                     </thead>
                     <tbody className="divide-y divide-trading-border">
-                      {openPositions.map(pos => (
-                        <tr key={pos.id} className="hover:bg-white/[0.02] transition-colors">
-                          <td className="px-6 py-4 font-bold">{pos.symbol}</td>
+                      {signals.map((sig: any) => (
+                        <tr key={sig.id} className="hover:bg-white/[0.02] transition-colors">
+                          <td className="px-6 py-4 font-bold">{sig.symbol}</td>
                           <td className="px-6 py-4">
                             <span className={cn(
                               "px-2 py-0.5 rounded text-[9px] font-black uppercase",
-                              pos.side === 'LONG' ? "bg-trading-up/10 text-trading-up" : "bg-trading-down/10 text-trading-down"
+                              sig.side === 'LONG' ? "bg-trading-up/10 text-trading-up" : "bg-trading-down/10 text-trading-down"
                             )}>
-                              {pos.side}
+                              {sig.side}
                             </span>
                           </td>
-                          <td className="px-6 py-4 font-mono">${pos.entry_price.toLocaleString()}</td>
-                          <td className="px-6 py-4 font-mono">
-                            ${pos.current_price.toLocaleString()}
-                            {(pos as any).using_mark_price && (
-                              <span className="ml-1 text-[8px] px-1 py-0.5 bg-purple-500/15 text-purple-400 rounded font-bold">MARK</span>
-                            )}
-                          </td>
-                          <td className="px-6 py-4 font-mono text-trading-muted">{pos.amount}</td>
-                          <td className="px-6 py-4 font-mono text-trading-muted">{pos.leverage}x</td>
+                          <td className="px-6 py-4 text-trading-muted">{sig.strategy}</td>
+                          <td className="px-6 py-4 font-mono">${sig.entry_price?.toLocaleString()}</td>
+                          <td className="px-6 py-4 font-mono text-trading-up">${sig.tp_price?.toLocaleString()}</td>
+                          <td className="px-6 py-4 font-mono text-trading-down">${sig.sl_price?.toLocaleString()}</td>
+                          <td className="px-6 py-4 font-mono">{sig.confidence?.toFixed(1)}</td>
+                          <td className="px-6 py-4 text-trading-muted">{sig.est_duration}</td>
                           <td className="px-6 py-4">
-                            <div className="font-mono text-trading-down text-[11px]">
-                              -{((pos as any).total_fee_est ?? pos.fee_usdt).toFixed(4)} USDT
-                            </div>
-                            <div className="text-[9px] text-trading-muted font-mono mt-0.5">
-                              entry {pos.fee_usdt.toFixed(4)} + exit ~{((pos as any).total_fee_est - pos.fee_usdt).toFixed(4)}
-                            </div>
+                            <span className={cn("text-[9px] font-bold uppercase",
+                              sig.status === 'ACTIVE' ? "text-trading-up" : "text-trading-muted"
+                            )}>{sig.status}</span>
                           </td>
-                          <td className="px-6 py-4">
-                            <div className={cn("font-bold font-mono", pos.pnl_usdt >= 0 ? "text-trading-up" : "text-trading-down")}>
-                              {pos.pnl_usdt >= 0 ? "+" : ""}{pos.pnl_usdt.toFixed(2)} USDT
-                            </div>
-                            <div className={cn("text-[9px] font-mono mt-0.5", pos.pnl_pct >= 0 ? "text-trading-up" : "text-trading-down")}>
-                              ROE {pos.pnl_pct >= 0 ? "+" : ""}{pos.pnl_pct.toFixed(2)}%
-                            </div>
-                            <div className={cn("text-[9px] font-mono mt-0.5 font-bold", pos.net_pnl_usdt >= 0 ? "text-trading-up" : "text-trading-down")}>
-                              Net: {pos.net_pnl_usdt >= 0 ? "+" : ""}{pos.net_pnl_usdt.toFixed(2)}
-                            </div>
-                            {(pos as any).break_even_price && (
-                              <div className="text-[9px] font-mono mt-0.5 text-trading-muted">
-                                BE: ${(pos as any).break_even_price.toLocaleString()}
-                              </div>
-                            )}
-                          </td>
-                          <td className="px-6 py-4 text-right text-trading-muted font-mono">{pos.opened_at}</td>
+                          <td className="px-4 py-4 text-right text-trading-muted font-mono">{new Date(sig.sent_at).toLocaleTimeString()}</td>
                           <td className="px-4 py-4 text-right">
-                            <button
-                              onClick={() => closePosition(pos.id)}
-                              disabled={closingId === pos.id || closingAll}
-                              className="px-2 py-1 bg-trading-down/10 text-trading-down border border-trading-down/30 rounded text-[9px] font-black uppercase tracking-widest hover:bg-trading-down/20 transition-colors disabled:opacity-40"
-                            >
-                              {closingId === pos.id ? <Activity className="w-3 h-3 animate-spin inline" /> : "Close"}
-                            </button>
+                            {sig.status === 'ACTIVE' && (
+                              <button
+                                onClick={() => expireSignal(sig.id)}
+                                className="px-2 py-1 bg-trading-down/10 text-trading-down border border-trading-down/30 rounded text-[9px] font-black uppercase tracking-widest hover:bg-trading-down/20 transition-colors"
+                              >
+                                Expire
+                              </button>
+                            )}
                           </td>
                         </tr>
                       ))}
@@ -1499,141 +1354,14 @@ export default function App() {
                   </table>
                 )}
               </div>
-
-              <div className="p-4 bg-trading-bg/50 border-t border-trading-border flex items-center justify-between text-[10px]">
-                <div className="flex items-center gap-3">
-                  <button
-                    onClick={async () => {
-                      setIsSyncing(true);
-                      try {
-                        const r = await fetch("/api/sync-positions", { method: "POST" });
-                        const d = await r.json();
-                        if (d.last_sync) setLastSync(d.last_sync);
-                        const posRes = await fetch("/api/open-positions");
-                        const posData = await posRes.json();
-                        setOpenPositions(posData.positions ?? []);
-                      } finally {
-                        setIsSyncing(false);
-                      }
-                    }}
-                    disabled={isSyncing}
-                    className="flex items-center gap-1.5 px-3 py-1.5 bg-trading-card border border-trading-border rounded hover:border-trading-muted transition-colors disabled:opacity-50 uppercase font-bold tracking-widest text-[9px]"
-                  >
-                    <Activity className={cn("w-3 h-3", isSyncing && "animate-spin")} />
-                    {isSyncing ? "Syncing..." : "Sync Binance"}
-                  </button>
-                  {lastSync && (
-                    <span className="text-trading-muted">
-                      Last sync: {new Date(lastSync).toLocaleTimeString()}
-                    </span>
-                  )}
-                </div>
-                {openPositions.length > 0 && (
-                  <div className="flex items-center gap-4">
-                    <span className="text-trading-muted font-mono">
-                      Fees: <span className="text-trading-down font-bold">
-                        -{openPositions.reduce((s, p) => s + p.fee_usdt, 0).toFixed(4)} USDT
-                      </span>
-                    </span>
-                    <span className={cn(
-                      "font-bold font-mono",
-                      openPositions.reduce((s, p) => s + p.net_pnl_usdt, 0) >= 0 ? "text-trading-up" : "text-trading-down"
-                    )}>
-                      Net Unrealized: {openPositions.reduce((s, p) => s + p.net_pnl_usdt, 0) >= 0 ? "+" : ""}
-                      {openPositions.reduce((s, p) => s + p.net_pnl_usdt, 0).toFixed(2)} USDT
-                    </span>
-                  </div>
-                )}
-              </div>
             </motion.div>
           </div>
         )}
       </AnimatePresence>
 
-      {/* ── Trade History Modal ── */}
-      <AnimatePresence>
-        {isHistoryOpen && (
-          <div className="fixed inset-0 z-[100] flex items-center justify-center p-4 md:p-10">
-            <motion.div 
-              initial={{ opacity: 0 }}
-              animate={{ opacity: 1 }}
-              exit={{ opacity: 0 }}
-              onClick={() => setIsHistoryOpen(false)}
-              className="absolute inset-0 bg-trading-bg/90 backdrop-blur-sm"
-            />
-            <motion.div 
-              initial={{ opacity: 0, scale: 0.95, y: 20 }}
-              animate={{ opacity: 1, scale: 1, y: 0 }}
-              exit={{ opacity: 0, scale: 0.95, y: 20 }}
-              className="relative w-full max-w-4xl max-h-[80vh] bg-trading-card border border-trading-border rounded-lg shadow-2xl flex flex-col overflow-hidden"
-            >
-              <div className="p-6 border-b border-trading-border flex items-center justify-between">
-                <div className="flex items-center gap-3">
-                  <History className="w-5 h-5 text-trading-accent" />
-                  <h2 className="text-sm font-bold uppercase tracking-[2px]">Detailed Execution History</h2>
-                </div>
-                <button 
-                  onClick={() => setIsHistoryOpen(false)}
-                  className="p-2 hover:bg-trading-border rounded transition-colors text-trading-muted hover:text-white"
-                >
-                  <X className="w-5 h-5" />
-                </button>
-              </div>
-              
-              <div className="flex-1 overflow-auto">
-                <table className="w-full text-left text-[11px]">
-                  <thead className="sticky top-0 bg-trading-card border-b border-trading-border">
-                    <tr className="text-trading-muted uppercase tracking-wider">
-                      <th className="px-6 py-4 font-medium">Asset</th>
-                      <th className="px-6 py-4 font-medium">Strategy</th>
-                      <th className="px-6 py-4 font-medium">Entry</th>
-                      <th className="px-6 py-4 font-medium">Exit</th>
-                      <th className="px-6 py-4 font-medium">Fee</th>
-                      <th className="px-6 py-4 font-medium">PnL</th>
-                      <th className="px-6 py-4 font-medium text-right">Timestamp</th>
-                    </tr>
-                  </thead>
-                  <tbody className="divide-y divide-trading-border">
-                    {tradeHistory.map((trade) => (
-                      <tr key={trade.id} className="hover:bg-white/[0.02] transition-colors">
-                        <td className="px-6 py-4 font-bold">{trade.symbol}</td>
-                        <td className="px-6 py-4 text-trading-muted">{trade.strategy}</td>
-                        <td className="px-6 py-4 font-mono">${trade.entry?.toLocaleString() ?? '—'}</td>
-                        <td className="px-6 py-4 font-mono text-trading-muted">
-                          {trade.exit != null ? `$${trade.exit.toLocaleString()}` : <span className="text-trading-accent text-[9px] font-bold uppercase">OPEN</span>}
-                        </td>
-                        <td className="px-6 py-4 font-mono text-trading-down text-[10px]">
-                          {trade.fee != null && trade.fee > 0 ? `-${trade.fee.toFixed(4)}` : <span className="text-trading-muted">—</span>}
-                        </td>
-                        <td className="px-6 py-4">
-                          <div className={cn(
-                            "font-bold font-mono",
-                            trade.pnl == null ? "text-trading-muted" : trade.pnl >= 0 ? "text-trading-up" : "text-trading-down"
-                          )}>
-                            {trade.pnl != null ? `${trade.pnl >= 0 ? '+' : ''}${trade.pnl.toFixed(2)} USDT` : '—'}
-                          </div>
-                          {trade.pnl != null && trade.fee != null && trade.fee > 0 && (
-                            <div className={cn(
-                              "text-[9px] font-mono mt-0.5 font-bold",
-                              (trade.pnl - trade.fee) >= 0 ? "text-trading-up" : "text-trading-down"
-                            )}>
-                              Net: {(trade.pnl - trade.fee) >= 0 ? "+" : ""}{(trade.pnl - trade.fee).toFixed(2)}
-                            </div>
-                          )}
-                        </td>
-                        <td className="px-6 py-4 text-right text-trading-muted font-mono">{trade.time}</td>
-                      </tr>
-                    ))}
-                  </tbody>
-                </table>
-              </div>
-              <div className="p-4 bg-trading-bg/50 border-t border-trading-border text-[10px] text-trading-muted text-center italic">
-                Showing last {tradeHistory.length} verified executions from Binance API stream.
-              </div>
-            </motion.div>
-          </div>
-        )}
-      </AnimatePresence>
+      
+
+      
 
       {/* ── Backtest Modal ── */}
       <AnimatePresence>
@@ -2120,6 +1848,221 @@ export default function App() {
         )}
       </AnimatePresence>
 
+      {/* ── Paper Trades Modal ── */}
+      <AnimatePresence>
+        {isPaperTradesOpen && (
+          <div className="fixed inset-0 z-[100] flex items-center justify-center p-4 md:p-6">
+            <motion.div
+              initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }}
+              className="absolute inset-0 bg-black/70 backdrop-blur-sm"
+              onClick={() => setIsPaperTradesOpen(false)}
+            />
+            <motion.div
+              initial={{ opacity: 0, scale: 0.95 }} animate={{ opacity: 1, scale: 1 }} exit={{ opacity: 0, scale: 0.95 }}
+              className="relative bg-trading-bg border border-trading-border rounded-xl w-full max-w-5xl max-h-[90vh] flex flex-col z-10 overflow-hidden"
+            >
+              {/* Header */}
+              <div className="flex items-center justify-between px-6 py-4 border-b border-trading-border shrink-0">
+                <div className="flex items-center gap-3">
+                  <Shield className="w-5 h-5 text-cyan-400" />
+                  <span className="font-black tracking-tight text-cyan-400">PAPER TRADING</span>
+                  <span className="text-[10px] text-trading-muted font-mono uppercase">Virtual trades — no real money</span>
+                  <span className={cn(
+                    "px-2 py-0.5 rounded text-[9px] font-black uppercase tracking-wider",
+                    paperMode ? "bg-cyan-400/20 text-cyan-400 border border-cyan-400/30" : "bg-trading-card text-trading-muted border border-trading-border"
+                  )}>
+                    {paperMode ? "ACTIVE" : "DISABLED"}
+                  </span>
+                </div>
+                <button onClick={() => setIsPaperTradesOpen(false)} className="text-trading-muted hover:text-white transition-colors">
+                  <X className="w-5 h-5" />
+                </button>
+              </div>
+
+              {/* Tabs */}
+              <div className="flex border-b border-trading-border shrink-0">
+                {(['open', 'history', 'performance'] as const).map(tab => (
+                  <button
+                    key={tab}
+                    onClick={() => setPaperTab(tab)}
+                    className={cn(
+                      "px-5 py-3 text-[10px] font-bold uppercase tracking-widest transition-colors",
+                      paperTab === tab ? "text-cyan-400 border-b-2 border-cyan-400" : "text-trading-muted hover:text-trading-text"
+                    )}
+                  >
+                    {tab === 'open' ? `Open (${paperTrades.filter(t => t.status === 'OPEN').length})` : tab === 'history' ? 'History' : 'Performance'}
+                  </button>
+                ))}
+              </div>
+
+              {/* Body */}
+              <div className="flex-1 overflow-y-auto p-6 space-y-4">
+
+                {/* ── Open Trades Tab ── */}
+                {paperTab === 'open' && (() => {
+                  const open = paperTrades.filter(t => t.status === 'OPEN');
+                  return open.length === 0 ? (
+                    <div className="text-center py-16 text-trading-muted text-[11px]">
+                      No open paper trades. Enable paper mode and wait for a signal.
+                    </div>
+                  ) : (
+                    <div className="space-y-3">
+                      {open.map(t => {
+                        const isLong = t.side === 'LONG';
+                        const tpPct  = isLong ? (t.tp_price - t.entry_price) / t.entry_price * 100 : (t.entry_price - t.tp_price) / t.entry_price * 100;
+                        const slPct  = isLong ? (t.entry_price - t.sl_price) / t.entry_price * 100 : (t.sl_price - t.entry_price) / t.entry_price * 100;
+                        const rr     = slPct > 0 ? (tpPct / slPct).toFixed(2) : 'N/A';
+                        return (
+                          <div key={t.id} className="bg-trading-card border border-trading-border rounded-lg p-4">
+                            <div className="flex items-center justify-between mb-3">
+                              <div className="flex items-center gap-3">
+                                <span className={cn("text-[11px] font-black", isLong ? "text-trading-up" : "text-trading-down")}>
+                                  {t.side}
+                                </span>
+                                <span className="text-[13px] font-bold">{t.symbol}</span>
+                                <span className="text-[9px] text-trading-muted bg-trading-border px-2 py-0.5 rounded">{t.strategy}</span>
+                                <span className="text-[9px] text-cyan-400">Score {t.signal_score?.toFixed(1)}</span>
+                              </div>
+                              <div className="flex items-center gap-2">
+                                <span className="text-[9px] text-trading-muted">{new Date(t.open_time).toLocaleString()}</span>
+                                <button
+                                  onClick={async () => {
+                                    const r = await fetch(`/api/paper-trades/${t.id}/close`, { method: 'POST' });
+                                    if (r.ok) { addLog(`Paper trade closed manually: ${t.symbol}`, 'info'); fetchPaperData(); }
+                                  }}
+                                  className="px-2 py-1 text-[9px] font-bold bg-trading-border hover:bg-trading-muted/20 rounded transition-colors"
+                                >
+                                  Close
+                                </button>
+                              </div>
+                            </div>
+                            <div className="grid grid-cols-4 gap-3 text-[10px]">
+                              <div>
+                                <div className="text-trading-muted mb-0.5">Entry</div>
+                                <div className="font-mono font-bold">${t.entry_price.toLocaleString()}</div>
+                              </div>
+                              <div>
+                                <div className="text-trading-muted mb-0.5">TP (+{tpPct.toFixed(2)}%)</div>
+                                <div className="font-mono font-bold text-trading-up">${t.tp_price.toLocaleString()}</div>
+                              </div>
+                              <div>
+                                <div className="text-trading-muted mb-0.5">SL (-{slPct.toFixed(2)}%)</div>
+                                <div className="font-mono font-bold text-trading-down">${t.sl_price.toLocaleString()}</div>
+                              </div>
+                              <div>
+                                <div className="text-trading-muted mb-0.5">R:R</div>
+                                <div className="font-mono font-bold text-trading-accent">1 : {rr}</div>
+                              </div>
+                            </div>
+                          </div>
+                        );
+                      })}
+                    </div>
+                  );
+                })()}
+
+                {/* ── History Tab ── */}
+                {paperTab === 'history' && (() => {
+                  const closed = paperTrades.filter(t => t.status !== 'OPEN');
+                  return closed.length === 0 ? (
+                    <div className="text-center py-16 text-trading-muted text-[11px]">No closed paper trades yet.</div>
+                  ) : (
+                    <div className="space-y-2">
+                      {closed.map(t => {
+                        const isWin = (t.pnl_pct ?? 0) > 0;
+                        const pnlSign = (t.pnl_pct ?? 0) >= 0 ? '+' : '';
+                        return (
+                          <div key={t.id} className={cn(
+                            "flex items-center justify-between p-3 rounded-lg border",
+                            isWin ? "bg-trading-up/5 border-trading-up/20" : "bg-trading-down/5 border-trading-down/20"
+                          )}>
+                            <div className="flex items-center gap-3">
+                              <span className="text-[14px]">{t.status === 'TP' ? '✅' : t.status === 'SL' ? '❌' : '🔵'}</span>
+                              <div>
+                                <div className="flex items-center gap-2">
+                                  <span className={cn("text-[10px] font-black", t.side === 'LONG' ? "text-trading-up" : "text-trading-down")}>{t.side}</span>
+                                  <span className="text-[11px] font-bold">{t.symbol}</span>
+                                  <span className="text-[9px] text-trading-muted">{t.strategy}</span>
+                                </div>
+                                <div className="text-[9px] text-trading-muted mt-0.5">
+                                  {new Date(t.open_time).toLocaleString()} → {t.close_time ? new Date(t.close_time).toLocaleString() : '—'}
+                                </div>
+                              </div>
+                            </div>
+                            <div className="text-right">
+                              <div className={cn("text-[13px] font-black font-mono", isWin ? "text-trading-up" : "text-trading-down")}>
+                                {pnlSign}{t.pnl_pct?.toFixed(2)}%
+                              </div>
+                              <div className="text-[9px] text-trading-muted font-mono">
+                                ${t.entry_price.toLocaleString()} → ${t.close_price?.toLocaleString() ?? '—'}
+                              </div>
+                            </div>
+                          </div>
+                        );
+                      })}
+                    </div>
+                  );
+                })()}
+
+                {/* ── Performance Tab ── */}
+                {paperTab === 'performance' && (() => {
+                  const totalClosed = paperTrades.filter(t => t.status !== 'OPEN').length;
+                  return (
+                    <div className="space-y-4">
+                      {strategyStats.length === 0 && totalClosed === 0 && (
+                        <div className="text-center py-16 text-trading-muted text-[11px]">No performance data yet. Wait for paper trades to close.</div>
+                      )}
+                      {strategyStats.map(s => {
+                        const winRate = s.total_trades > 0 ? (s.win_trades / s.total_trades * 100) : 0;
+                        const pnlSign = s.total_pnl_pct >= 0 ? '+' : '';
+                        return (
+                          <div key={s.strategy} className="bg-trading-card border border-trading-border rounded-lg p-5">
+                            <div className="flex items-center justify-between mb-4">
+                              <span className="font-black text-[13px]">{s.strategy}</span>
+                              <span className={cn("text-[13px] font-black font-mono", s.total_pnl_pct >= 0 ? "text-trading-up" : "text-trading-down")}>
+                                {pnlSign}{s.total_pnl_pct.toFixed(2)}%
+                              </span>
+                            </div>
+                            <div className="grid grid-cols-2 sm:grid-cols-4 gap-4 text-[10px]">
+                              <div className="bg-trading-bg/50 rounded p-3 text-center">
+                                <div className="text-trading-muted mb-1">Win Rate</div>
+                                <div className={cn("text-[16px] font-black", winRate >= 50 ? "text-trading-up" : "text-trading-down")}>
+                                  {winRate.toFixed(0)}%
+                                </div>
+                                <div className="text-trading-muted text-[9px] mt-0.5">{s.win_trades}W / {s.loss_trades}L</div>
+                              </div>
+                              <div className="bg-trading-bg/50 rounded p-3 text-center">
+                                <div className="text-trading-muted mb-1">Total Trades</div>
+                                <div className="text-[16px] font-black">{s.total_trades}</div>
+                              </div>
+                              <div className="bg-trading-bg/50 rounded p-3 text-center">
+                                <div className="text-trading-muted mb-1">Avg Win</div>
+                                <div className="text-[16px] font-black text-trading-up">+{s.avg_win_pct.toFixed(2)}%</div>
+                              </div>
+                              <div className="bg-trading-bg/50 rounded p-3 text-center">
+                                <div className="text-trading-muted mb-1">Avg Loss</div>
+                                <div className="text-[16px] font-black text-trading-down">{s.avg_loss_pct.toFixed(2)}%</div>
+                              </div>
+                            </div>
+                            {/* Win rate bar */}
+                            <div className="mt-3 h-2 bg-trading-border rounded-full overflow-hidden">
+                              <div
+                                className="h-full bg-trading-up/70 rounded-full transition-all"
+                                style={{ width: `${winRate}%` }}
+                              />
+                            </div>
+                          </div>
+                        );
+                      })}
+                    </div>
+                  );
+                })()}
+              </div>
+            </motion.div>
+          </div>
+        )}
+      </AnimatePresence>
+
       {/* ── Settings Modal ── */}
       <AnimatePresence>
         {isSettingsOpen && (
@@ -2147,6 +2090,31 @@ export default function App() {
 
               {/* Body */}
               <div className="overflow-y-auto flex-1 p-6 space-y-8">
+
+                {/* ── Paper Mode Toggle ── */}
+                <div className="p-4 bg-trading-card border border-cyan-400/30 rounded-lg flex items-center justify-between">
+                  <div>
+                    <div className="flex items-center gap-2 mb-1">
+                      <Shield className="w-4 h-4 text-cyan-400" />
+                      <span className="text-[11px] font-black text-cyan-400 uppercase tracking-wider">Paper Mode</span>
+                    </div>
+                    <p className="text-[9px] text-trading-muted leading-relaxed">
+                      When ON, every signal automatically opens a virtual paper trade tracked in the database. No real money is used.
+                    </p>
+                  </div>
+                  <button
+                    onClick={() => setPaperMode(v => !v)}
+                    className={cn(
+                      "ml-6 shrink-0 w-12 h-6 rounded-full transition-colors relative",
+                      paperMode ? "bg-cyan-400" : "bg-trading-border"
+                    )}
+                  >
+                    <div className={cn(
+                      "absolute top-0.5 w-5 h-5 rounded-full bg-white transition-transform",
+                      paperMode ? "translate-x-6" : "translate-x-0.5"
+                    )} />
+                  </button>
+                </div>
 
                 {/* ── Global Settings ── */}
                 <div className="space-y-4">
@@ -2445,6 +2413,7 @@ export default function App() {
                           swingLeverageVal: botSettings.swingLeverage,
                           swingSlMult: botSettings.swingSlMult,
                           swingTpMult: botSettings.swingTpMult,
+                          paperModeVal: paperMode,
                         }),
                       });
                       addLog("Bot settings saved", "success");

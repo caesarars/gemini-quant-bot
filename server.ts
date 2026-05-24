@@ -65,6 +65,55 @@ async function runMigrations() {
   await pool.query(`ALTER TABLE bot_settings ADD COLUMN IF NOT EXISTS swing_tp_mult   NUMERIC(5,2) DEFAULT 8.0`);
   await pool.query(`UPDATE bot_settings SET active_strategies = array_append(active_strategies, 'SWING-LONG') WHERE id = 'bot_config' AND NOT ('SWING-LONG' = ANY(COALESCE(active_strategies, '{}')))`);
 
+  await pool.query(`CREATE TABLE IF NOT EXISTS signals (
+    id            UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    symbol        VARCHAR(20) NOT NULL,
+    side          VARCHAR(10) NOT NULL CHECK (side IN ('LONG','SHORT')),
+    strategy      VARCHAR(100) NOT NULL,
+    timeframe     VARCHAR(10) NOT NULL,
+    entry_price   NUMERIC(20,8) NOT NULL,
+    tp_price      NUMERIC(20,8) NOT NULL,
+    sl_price      NUMERIC(20,8) NOT NULL,
+    confidence    NUMERIC(4,2),
+    est_duration  VARCHAR(50),
+    context       JSONB,
+    status        VARCHAR(20) DEFAULT 'ACTIVE' CHECK (status IN ('ACTIVE','EXPIRED','HIT_TP','HIT_SL')),
+    telegram_sent BOOLEAN DEFAULT false,
+    sent_at       TIMESTAMPTZ DEFAULT NOW()
+  )`);
+  await pool.query(`CREATE INDEX IF NOT EXISTS idx_signals_symbol_sent ON signals (symbol, sent_at DESC)`);
+  await pool.query(`CREATE INDEX IF NOT EXISTS idx_signals_status ON signals (status)`);
+
+  // Paper trading mode
+  await pool.query(`ALTER TABLE bot_settings ADD COLUMN IF NOT EXISTS paper_mode BOOLEAN DEFAULT true`);
+  await pool.query(`CREATE TABLE IF NOT EXISTS paper_trades (
+    id           UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    symbol       VARCHAR(20)  NOT NULL,
+    strategy     VARCHAR(30)  NOT NULL,
+    side         VARCHAR(10)  NOT NULL CHECK (side IN ('LONG','SHORT')),
+    entry_price  NUMERIC(20,8) NOT NULL,
+    tp_price     NUMERIC(20,8) NOT NULL,
+    sl_price     NUMERIC(20,8) NOT NULL,
+    status       VARCHAR(10)  DEFAULT 'OPEN' CHECK (status IN ('OPEN','TP','SL','MANUAL','EXPIRED')),
+    open_time    TIMESTAMPTZ  DEFAULT NOW(),
+    close_time   TIMESTAMPTZ,
+    close_price  NUMERIC(20,8),
+    pnl_pct      NUMERIC(10,4),
+    signal_score NUMERIC(4,2),
+    context      JSONB
+  )`);
+  await pool.query(`CREATE INDEX IF NOT EXISTS idx_paper_trades_status   ON paper_trades (status, open_time DESC)`);
+  await pool.query(`CREATE INDEX IF NOT EXISTS idx_paper_trades_strategy ON paper_trades (strategy, open_time DESC)`);
+  await pool.query(`CREATE TABLE IF NOT EXISTS strategy_stats (
+    strategy      VARCHAR(30)   PRIMARY KEY,
+    total_trades  INT           DEFAULT 0,
+    win_trades    INT           DEFAULT 0,
+    loss_trades   INT           DEFAULT 0,
+    total_pnl_pct NUMERIC(18,4) DEFAULT 0,
+    avg_win_pct   NUMERIC(10,4) DEFAULT 0,
+    avg_loss_pct  NUMERIC(10,4) DEFAULT 0,
+    last_updated  TIMESTAMPTZ   DEFAULT NOW()
+  )`);
 }
 
 // ── Exchange ───────────────────────────────────────────────────────────────────
@@ -76,9 +125,6 @@ const binance = new ccxt.binanceusdm({
   enableRateLimit: true,
 });
 
-// Track consecutive balance fetch failures for auto-mock fallback
-let balanceFetchFailures = 0;
-const MAX_BALANCE_FAILURES = 3;
 
 // ── AI (DeepSeek) ──────────────────────────────────────────────────────────────
 
@@ -413,10 +459,11 @@ let scanResults: any[] = [];
 // Set of currently enabled strategies — includes SWING-LONG
 let activeStrategies = new Set<string>(["MOMENTUM-ARB", "MEAN-REV", "SWING-LONG"]);
 // Taker fee rate — configurable via Settings, persisted in DB
-let takerRate = 0.0004;
+let takerRate  = 0.0004;
+let paperMode  = true;   // paper-trade mode (execute virtual trades, no Binance API)
 
 // ── Validation Log ─────────────────────────────────────────────────────────────
-// Real-time audit trail of every checkAutoExecute run so the frontend can show
+// Real-time audit trail of every generateSignal run so the frontend can show
 // exactly which filter blocked (or passed) a signal.
 type ValidationCheck = { name: string; status: "pass" | "block" | "info"; detail: string };
 type ValidationEntry = {
@@ -425,7 +472,7 @@ type ValidationEntry = {
   symbol: string;
   strategy: string;
   action: string;
-  finalStatus: "executed" | "blocked" | "skipped";
+  finalStatus: "executed" | "blocked" | "skipped" | "signaled";
   checks: ValidationCheck[];
 };
 const validationLogs: ValidationEntry[] = [];
@@ -531,75 +578,40 @@ function calcContextMultipliers(
   return { tpBonus: Math.min(tpBonus, 1.8), slMult };
 }
 
-// Fetch USDT balance from Binance futures (mock = 10,000 if no keys)
-let cachedBalance = 0;      // 0 forces fallback sizing until first real fetch
-let cachedBalanceAt = 0;
-async function getAccountBalance(): Promise<number> {
-  if (!process.env.BINANCE_API_KEY || !process.env.BINANCE_SECRET_KEY) return 10000;
-  if (Date.now() - cachedBalanceAt < 30_000) return cachedBalance; // cache 30s
-  try {
-    const bal = await binance.fetchBalance() as any;
-    // Use free (available) balance, not total — total includes locked margin of open positions
-    cachedBalance = parseFloat(bal.free?.USDT ?? bal.USDT?.free ?? bal.total?.USDT ?? 0);
-    cachedBalanceAt = Date.now();
-    balanceFetchFailures = 0; // reset on success
-  } catch (e: any) {
-    balanceFetchFailures++;
-    console.error(`[BALANCE] fetch error (${balanceFetchFailures}/${MAX_BALANCE_FAILURES}):`, e?.message);
-    if (balanceFetchFailures >= MAX_BALANCE_FAILURES) {
-      console.warn(`[BALANCE] Auto-switching to MOCK mode — balance fetch failed ${MAX_BALANCE_FAILURES}x. Check your Binance API key permissions (Futures must be enabled).`);
-    }
-  }
-  return cachedBalance;
-}
 
 // ── Auto-Execute ───────────────────────────────────────────────────────────────
 
 type AnySignal = { action: "BUY" | "SELL" | "HOLD"; price: number; rsi: number; volumeRatio: number; atr: number; atrPct: number; score?: number; buyScore?: number; sellScore?: number; cross?: string | null; bbPos?: string | null };
 
-async function checkAutoExecute(symbol: string, signal: AnySignal, strategyName: string, bypassAutoPilot = false) {
+async function generateSignal(symbol: string, signal: AnySignal, strategyName: string) {
   const vid = Math.random().toString(36).slice(2, 8);
   const checks: ValidationCheck[] = [];
 
-  const settingsRow = await pool.query("SELECT is_auto_pilot FROM bot_settings WHERE id = 'bot_config'");
-  const isAutoPilot = settingsRow.rows[0]?.is_auto_pilot || false;
-  const autoPilotPass = isAutoPilot || bypassAutoPilot;
-
   const trend = getTrend(symbol);
   const { regime, adx } = getRegime(symbol);
-  console.log(`[${strategyName}] ${symbol} → ${signal.action} RSI:${signal.rsi} trend:${trend} regime:${regime}(ADX:${adx}) autoPilot:${isAutoPilot} manual:${bypassAutoPilot}`);
+  console.log(`[${strategyName}] ${symbol} → ${signal.action} RSI:${signal.rsi} trend:${trend} regime:${regime}(ADX:${adx})`);
 
   checks.push({ name: "Signal", status: "info", detail: `${signal.action}  RSI:${signal.rsi}  Score:${(signal.score ?? 0).toFixed(1)}` });
-  checks.push({ name: "Auto-Pilot", status: autoPilotPass ? "pass" : "block", detail: bypassAutoPilot ? "MANUAL OVERRIDE" : isAutoPilot ? "ON" : "OFF — execution disabled" });
   checks.push({ name: "Regime", status: "info", detail: `${regime} (ADX ${adx.toFixed(1)})` });
 
-  if (!autoPilotPass || signal.action === "HOLD") {
+  if (signal.action === "HOLD") {
     pushValidation({ id: vid, timestamp: Date.now(), symbol, strategy: strategyName, action: signal.action, finalStatus: "skipped", checks });
     return;
   }
 
-  // Regime-based strategy gating (ADX on 15m).
-  // In manual mode (bypassAutoPilot) the gate is advisory only — the user chose to
-  // execute, so we warn but don't block. Auto mode keeps the hard block.
+  // Regime filter
   const meanRevConflict  = strategyName === "MEAN-REV"      && regime === "TRENDING";
   const momentumConflict = strategyName === "MOMENTUM-ARB"  && regime === "RANGING";
   if (meanRevConflict || momentumConflict) {
     const reason = meanRevConflict
       ? `ADX ${adx.toFixed(1)} (strong trend) — mean-rev contra-trend risk`
       : `ADX ${adx.toFixed(1)} (ranging) — momentum needs directional move`;
-    if (bypassAutoPilot) {
-      // Manual override: log warning but allow execution
-      checks.push({ name: "Regime Gate", status: "info", detail: `⚠ MANUAL OVERRIDE — ${reason}` });
-      console.log(`[REGIME] ${symbol} ${strategyName} regime mismatch WARNED (manual override) — ${reason}`);
-    } else {
-      checks.push({ name: "Regime Gate", status: "block", detail: `${strategyName} blocked — ${reason}` });
-      pushValidation({ id: vid, timestamp: Date.now(), symbol, strategy: strategyName, action: signal.action, finalStatus: "blocked", checks });
-      console.log(`[REGIME] ${symbol} ${strategyName} blocked — ${reason}`);
-      return;
-    }
-  } else {
-    checks.push({ name: "Regime Gate", status: "pass", detail: `${strategyName} allowed in ${regime} regime` });
+    checks.push({ name: "Regime Gate", status: "block", detail: `${strategyName} blocked — ${reason}` });
+    pushValidation({ id: vid, timestamp: Date.now(), symbol, strategy: strategyName, action: signal.action, finalStatus: "blocked", checks });
+    console.log(`[REGIME] ${symbol} ${strategyName} blocked — ${reason}`);
+    return;
   }
+  checks.push({ name: "Regime Gate", status: "pass", detail: `${strategyName} allowed in ${regime} regime` });
 
   // Trend filter — only MOMENTUM-ARB uses this
   if (strategyName === "MOMENTUM-ARB") {
@@ -613,17 +625,12 @@ async function checkAutoExecute(symbol: string, signal: AnySignal, strategyName:
       pushValidation({ id: vid, timestamp: Date.now(), symbol, strategy: strategyName, action: signal.action, finalStatus: "blocked", checks });
       console.log(`[TREND] ${symbol} SELL blocked — UP`); return;
     }
-    if (trend === "NEUTRAL") {
-      checks.push({ name: "Trend", status: "pass", detail: `Trend NEUTRAL — allowed (score gate still applies)` });
-    } else {
-      checks.push({ name: "Trend", status: "pass", detail: `${signal.action} aligned with ${trend} trend` });
-    }
+    checks.push({ name: "Trend", status: "pass", detail: `${signal.action} aligned with ${trend} trend` });
   } else {
     checks.push({ name: "Trend", status: "pass", detail: `Skipped — ${strategyName} ignores trend` });
   }
 
-  // Volume thresholds — MEAN-REV is intentionally permissive because
-  // mean-reversion setups appear in quiet candles.
+  // Volume thresholds
   const volThreshold = strategyName === "MEAN-REV"     ? 0.6
                      : strategyName === "MOMENTUM-ARB" ? 0.8
                      :                                   0.7;
@@ -640,12 +647,12 @@ async function checkAutoExecute(symbol: string, signal: AnySignal, strategyName:
   const fundingRate = fundingRateCache.get(symbol);
   if (fundingRate !== undefined) {
     if (signal.action === "BUY" && fundingRate > 0.0005) {
-      checks.push({ name: "Funding", status: "block", detail: `${(fundingRate * 100).toFixed(4)}% > 0.05% (longs paying too much)` });
+      checks.push({ name: "Funding", status: "block", detail: `${(fundingRate * 100).toFixed(4)}% > 0.05%` });
       pushValidation({ id: vid, timestamp: Date.now(), symbol, strategy: strategyName, action: signal.action, finalStatus: "blocked", checks });
       console.log(`[FUNDING] ${symbol} BUY blocked — ${(fundingRate * 100).toFixed(4)}% > 0.05%`); return;
     }
     if (signal.action === "SELL" && fundingRate < -0.0006) {
-      checks.push({ name: "Funding", status: "block", detail: `${(fundingRate * 100).toFixed(4)}% < -0.06% (shorts paying too much)` });
+      checks.push({ name: "Funding", status: "block", detail: `${(fundingRate * 100).toFixed(4)}% < -0.06%` });
       pushValidation({ id: vid, timestamp: Date.now(), symbol, strategy: strategyName, action: signal.action, finalStatus: "blocked", checks });
       console.log(`[FUNDING] ${symbol} SELL blocked — ${(fundingRate * 100).toFixed(4)}% < -0.06%`); return;
     }
@@ -670,14 +677,14 @@ async function checkAutoExecute(symbol: string, signal: AnySignal, strategyName:
       }
     }
     if (signal.action === "BUY"  && fg > 85) {
-      checks.push({ name: "Fear & Greed", status: "block", detail: `BUY blocked — F&G ${fg} (extreme greed)` });
+      checks.push({ name: "Fear & Greed", status: "block", detail: `BUY blocked — F&G ${fg}` });
       pushValidation({ id: vid, timestamp: Date.now(), symbol, strategy: strategyName, action: signal.action, finalStatus: "blocked", checks });
-      console.log(`[F&G] ${symbol} ${strategyName} BUY blocked — F&G ${fg}`); return;
+      console.log(`[F&G] ${symbol} BUY blocked — F&G ${fg}`); return;
     }
     if (signal.action === "SELL" && fg < 15) {
-      checks.push({ name: "Fear & Greed", status: "block", detail: `SELL blocked — F&G ${fg} (extreme fear)` });
+      checks.push({ name: "Fear & Greed", status: "block", detail: `SELL blocked — F&G ${fg}` });
       pushValidation({ id: vid, timestamp: Date.now(), symbol, strategy: strategyName, action: signal.action, finalStatus: "blocked", checks });
-      console.log(`[F&G] ${symbol} ${strategyName} SELL blocked — F&G ${fg}`); return;
+      console.log(`[F&G] ${symbol} SELL blocked — F&G ${fg}`); return;
     }
     checks.push({ name: "Fear & Greed", status: "pass", detail: `F&G ${fg} — within limits` });
   } else {
@@ -688,14 +695,14 @@ async function checkAutoExecute(symbol: string, signal: AnySignal, strategyName:
   const oiData = openInterestCache.get(symbol);
   if (oiData) {
     if (strategyName === "MOMENTUM-ARB" && signal.action === "BUY" && oiData.oiChangePct < -4.0) {
-      checks.push({ name: "Open Interest", status: "block", detail: `OI ${oiData.oiChangePct.toFixed(2)}% (short covering, not real demand)` });
+      checks.push({ name: "Open Interest", status: "block", detail: `OI ${oiData.oiChangePct.toFixed(2)}%` });
       pushValidation({ id: vid, timestamp: Date.now(), symbol, strategy: strategyName, action: signal.action, finalStatus: "blocked", checks });
-      console.log(`[OI] ${symbol} MOMENTUM-ARB BUY blocked — OI ${oiData.oiChangePct.toFixed(2)}%`); return;
+      console.log(`[OI] ${symbol} blocked — OI ${oiData.oiChangePct.toFixed(2)}%`); return;
     }
     if (strategyName === "MEAN-REV" && signal.action === "SELL" && oiData.oiChangePct < -4.0) {
-      checks.push({ name: "Open Interest", status: "block", detail: `OI ${oiData.oiChangePct.toFixed(2)}% (liquidation exhaustion near)` });
+      checks.push({ name: "Open Interest", status: "block", detail: `OI ${oiData.oiChangePct.toFixed(2)}%` });
       pushValidation({ id: vid, timestamp: Date.now(), symbol, strategy: strategyName, action: signal.action, finalStatus: "blocked", checks });
-      console.log(`[OI] ${symbol} MEAN-REV SELL blocked — OI ${oiData.oiChangePct.toFixed(2)}%`); return;
+      console.log(`[OI] ${symbol} blocked — OI ${oiData.oiChangePct.toFixed(2)}%`); return;
     }
     checks.push({ name: "Open Interest", status: "pass", detail: `OI ${oiData.oiChangePct.toFixed(2)}% — valid` });
   } else {
@@ -706,12 +713,12 @@ async function checkAutoExecute(symbol: string, signal: AnySignal, strategyName:
   const lsRatio = longShortCache.get(symbol);
   if (lsRatio !== undefined) {
     if (signal.action === "BUY"  && lsRatio > 2.5) {
-      checks.push({ name: "Long/Short", status: "block", detail: `L/S ${lsRatio.toFixed(2)} (market over-long, reversal risk)` });
+      checks.push({ name: "Long/Short", status: "block", detail: `L/S ${lsRatio.toFixed(2)}` });
       pushValidation({ id: vid, timestamp: Date.now(), symbol, strategy: strategyName, action: signal.action, finalStatus: "blocked", checks });
       console.log(`[LS] ${symbol} BUY blocked — L/S ${lsRatio.toFixed(2)}`); return;
     }
     if (signal.action === "SELL" && lsRatio < 0.4) {
-      checks.push({ name: "Long/Short", status: "block", detail: `L/S ${lsRatio.toFixed(2)} (market over-short, reversal risk)` });
+      checks.push({ name: "Long/Short", status: "block", detail: `L/S ${lsRatio.toFixed(2)}` });
       pushValidation({ id: vid, timestamp: Date.now(), symbol, strategy: strategyName, action: signal.action, finalStatus: "blocked", checks });
       console.log(`[LS] ${symbol} SELL blocked — L/S ${lsRatio.toFixed(2)}`); return;
     }
@@ -720,41 +727,34 @@ async function checkAutoExecute(symbol: string, signal: AnySignal, strategyName:
     checks.push({ name: "Long/Short", status: "pass", detail: `No data — skipped` });
   }
 
-  // 1. Prevent duplicate open positions
-  const openPos = await pool.query(
-    `SELECT id FROM trades WHERE symbol = $1 AND strategy = $2 AND status = 'OPEN' LIMIT 1`,
-    [symbol, strategyName]
-  );
-  if (openPos.rows.length > 0) {
-    checks.push({ name: "Open Position", status: "block", detail: `Already has an open ${strategyName} position` });
+  // Score gate
+  const score = signal.score ?? 0;
+  if (score < 3.0) {
+    checks.push({ name: "Score", status: "block", detail: `${score.toFixed(1)} < 3.0` });
     pushValidation({ id: vid, timestamp: Date.now(), symbol, strategy: strategyName, action: signal.action, finalStatus: "blocked", checks });
-    console.log(`[AUTO] ${symbol} ${strategyName} skipped — already has an open position`);
-    return;
+    console.log(`[SCORE] ${symbol} blocked — ${score} < 3.0`); return;
   }
-  checks.push({ name: "Open Position", status: "pass", detail: `No open ${strategyName} position` });
+  checks.push({ name: "Score", status: "pass", detail: `${score.toFixed(1)} ≥ 3.0` });
 
-  // 2. Cooldown per strategy
+  // Cooldown per strategy
   const cooldown = strategyName === "SWING-LONG"   ? "24 hours"
                  : strategyName === "MOMENTUM-ARB" ? "15 minutes"
                  : strategyName === "MEAN-REV"      ? "30 minutes"
                  :                                   "5 minutes";
   const recent   = await pool.query(
-    `SELECT id FROM trades WHERE symbol = $1 AND strategy = $2
-     AND timestamp > NOW() - INTERVAL '${cooldown}' LIMIT 1`, [symbol, strategyName]
+    `SELECT id FROM signals WHERE symbol = $1 AND strategy = $2
+     AND sent_at > NOW() - INTERVAL '${cooldown}' LIMIT 1`, [symbol, strategyName]
   );
   if (recent.rows.length > 0) {
     checks.push({ name: "Cooldown", status: "block", detail: `Active (${cooldown})` });
     pushValidation({ id: vid, timestamp: Date.now(), symbol, strategy: strategyName, action: signal.action, finalStatus: "blocked", checks });
-    console.log(`[AUTO] ${symbol} ${strategyName} skipped — cooldown active (${cooldown})`);
+    console.log(`[SIGNAL] ${symbol} ${strategyName} skipped — cooldown active (${cooldown})`);
     return;
   }
   checks.push({ name: "Cooldown", status: "pass", detail: `None (${cooldown} window clear)` });
 
-  // ATR multipliers and leverage differ per strategy
-  const cfgRow   = await pool.query("SELECT leverage, risk_level, atr_sl_mult::float, atr_tp_mult::float, arb_sl_mult::float, arb_tp_mult::float, mr_sl_mult::float, mr_tp_mult::float, swing_leverage::int, swing_sl_mult::float, swing_tp_mult::float FROM bot_settings WHERE id = 'bot_config'");
-  const leverage = strategyName === "SWING-LONG" ? (cfgRow.rows[0]?.swing_leverage ?? 3)
-                 : cfgRow.rows[0]?.leverage || 10;
-  const riskPct  = (cfgRow.rows[0]?.risk_level ?? 1) / 100;
+  // ATR multipliers
+  const cfgRow   = await pool.query("SELECT atr_sl_mult::float, atr_tp_mult::float, arb_sl_mult::float, arb_tp_mult::float, mr_sl_mult::float, mr_tp_mult::float, swing_sl_mult::float, swing_tp_mult::float FROM bot_settings WHERE id = 'bot_config'");
   const slMult   = strategyName === "SWING-LONG"   ? (cfgRow.rows[0]?.swing_sl_mult ?? 2.0)
                  : strategyName === "MOMENTUM-ARB" ? (cfgRow.rows[0]?.arb_sl_mult  ?? 1.0)
                  : strategyName === "MEAN-REV"      ? (cfgRow.rows[0]?.mr_sl_mult   ?? 1.0)
@@ -763,204 +763,210 @@ async function checkAutoExecute(symbol: string, signal: AnySignal, strategyName:
                  : strategyName === "MOMENTUM-ARB" ? (cfgRow.rows[0]?.arb_tp_mult  ?? 3.0)
                  : strategyName === "MEAN-REV"      ? (cfgRow.rows[0]?.mr_tp_mult   ?? 2.0)
                  :                                    (cfgRow.rows[0]?.atr_tp_mult  ?? 4.0);
-  const side      = signal.action === "BUY" ? "buy" : "sell";
-  const closeSide = signal.action === "BUY" ? "sell" : "buy";
   const isLong    = signal.action === "BUY";
-  const hasKeys   = !!(process.env.BINANCE_API_KEY && process.env.BINANCE_SECRET_KEY);
+  const side      = isLong ? "LONG" : "SHORT";
+  const entryPrice = signal.price;
+  const atr       = signal.atr ?? 0;
 
-  // ── ATR-based position sizing ──
-  const balance     = await getAccountBalance();
-  const riskAmount  = balance * riskPct;
-  const stopDistance = (signal.atr ?? 0) * slMult;
-  let amount = 0;
-  if (stopDistance > 0) {
-    amount = riskAmount / stopDistance;
-  }
-  const notional = amount * signal.price;
-  if (notional < 10 || amount <= 0) {
-    amount = parseFloat((binance as any).amountToPrecision(symbol, 25 / signal.price));
-    checks.push({ name: "Position Size", status: "info", detail: `Fallback fixed sizing (notional $${notional.toFixed(2)} < $10)` });
-    console.log(`[AUTO-SIZE] ${symbol} fallback to fixed sizing (notional ${notional.toFixed(2)} < $10)`);
-  } else {
-    amount = parseFloat((binance as any).amountToPrecision(symbol, amount));
-    checks.push({ name: "Position Size", status: "pass", detail: `${amount.toFixed(4)} @ $${signal.price.toLocaleString()} (notional $${(amount * signal.price).toFixed(2)})` });
-  }
-
-  // ── Pre-flight margin guard ──
-  // required margin = notional / leverage; keep within 90% of free balance so
-  // fees and slippage don't push us over the edge (-2019 Margin insufficient).
-  if (hasKeys) {
-    const freshFree = await getAccountBalance();
-    const requiredMargin = (amount * signal.price) / leverage;
-    if (freshFree <= 0) {
-      checks.push({ name: "Margin Guard", status: "block", detail: `Free balance $${freshFree.toFixed(2)} — cannot size position` });
-      pushValidation({ id: vid, timestamp: Date.now(), symbol, strategy: strategyName, action: signal.action, finalStatus: "blocked", checks });
-      console.log(`[MARGIN] ${symbol} blocked — free balance $${freshFree.toFixed(2)}`);
-      return;
-    }
-    if (requiredMargin > freshFree * 0.9) {
-      // Scale down to fit within 90% of available free balance
-      const maxNotional = freshFree * 0.9 * leverage;
-      const scaledAmount = parseFloat((binance as any).amountToPrecision(symbol, maxNotional / signal.price));
-      checks.push({ name: "Margin Guard", status: "info", detail: `Scaled down: margin needed $${requiredMargin.toFixed(2)} > 90% of free $${freshFree.toFixed(2)} → notional $${(scaledAmount * signal.price).toFixed(2)}` });
-      console.log(`[MARGIN] ${symbol} scaled ${amount.toFixed(4)} → ${scaledAmount.toFixed(4)} (free balance $${freshFree.toFixed(2)})`);
-      amount = scaledAmount;
-      // If scaled amount is too small to trade, block
-      if (amount <= 0 || amount * signal.price < 5) {
-        checks.push({ name: "Margin Guard", status: "block", detail: `Insufficient free margin $${freshFree.toFixed(2)} for minimum trade size` });
-        pushValidation({ id: vid, timestamp: Date.now(), symbol, strategy: strategyName, action: signal.action, finalStatus: "blocked", checks });
-        console.log(`[MARGIN] ${symbol} blocked — scaled amount too small after guard`);
-        return;
-      }
-    } else {
-      checks.push({ name: "Margin Guard", status: "pass", detail: `Margin OK: $${requiredMargin.toFixed(2)} needed, $${freshFree.toFixed(2)} free` });
-    }
-  }
-
-  console.log(`[AUTO] ${signal.action} ${symbol} x${leverage} ATR:${signal.atrPct?.toFixed(3)}% risk:${(riskPct*100).toFixed(1)}% size:${amount.toFixed(4)} notional:$${(amount*signal.price).toFixed(2)}`);
-
-  let fillPrice = signal.price;
-  let feeUsdt = parseFloat((fillPrice * amount * takerRate).toFixed(6));
-
-  const orderWarnings: string[] = [];
-  let tpPrice      = 0;
-  let callbackRate = 0;
-  let tpBonus      = 1.0;
-
-  if (hasKeys) {
-    try {
-      await binance.setLeverage(leverage, symbol);
-      const order = await binance.createOrder(symbol, "market", side, amount);
-      fillPrice = parseFloat(String((order as any).average || (order as any).price || signal.price));
-      const orderFee = (order as any).fee;
-      if (orderFee?.cost && orderFee?.currency === "USDT") {
-        feeUsdt = parseFloat(Math.abs(orderFee.cost).toFixed(6));
-      } else {
-        feeUsdt = parseFloat((fillPrice * amount * takerRate).toFixed(6));
-      }
-      checks.push({ name: "Binance Order", status: "pass", detail: `Market ${side} filled @ $${fillPrice.toLocaleString()} fee $${feeUsdt}` });
-      console.log(`[AUTO-FUTURES] ✓ ${signal.action} ${symbol} x${leverage} fill:${fillPrice} fee:${feeUsdt} USDT`);
-    } catch (e: any) {
-      checks.push({ name: "Binance Order", status: "block", detail: `Market order failed: ${(e?.message ?? "unknown").slice(0, 100)}` });
-      pushValidation({ id: vid, timestamp: Date.now(), symbol, strategy: strategyName, action: signal.action, finalStatus: "blocked", checks });
-      console.error(`[AUTO-FUTURES] ✗ Market order failed [${symbol}]:`, e?.message);
-      await sendTelegram(
-        `❌ <b>AUTO TRADE FAILED</b>\n` +
-        `Symbol: <code>${symbol}</code>  Side: <b>${isLong ? "LONG" : "SHORT"}</b>\n` +
-        `Strategy: <code>${strategyName}</code>\n` +
-        `Reason: <code>${(e?.message ?? "unknown error").slice(0, 300)}</code>`
-      );
-      return;
-    }
-
-    // ── ATR-based dynamic levels with market-context adjustment ──
-    const atrPctFill = (signal.atr ?? 0) / fillPrice;
-    const vwap       = parseFloat(calcVWAP(momentumBuffer.get(symbol) || []).toFixed(6));
-    const oiD        = openInterestCache.get(symbol);
-    const { tpBonus: tb, slMult: ctxSlMult } = calcContextMultipliers(
-      signal.action, strategyName,
-      fundingRateCache.get(symbol), fearGreedCache,
-      vwap, fillPrice,
-      oiD?.oiChangePct, longShortCache.get(symbol)
-    );
-    tpBonus = tb;
-    const dynSlPct = Math.min(Math.max(atrPctFill * slMult * ctxSlMult, 0.001), 0.05);
-    const dynTpPct = Math.min(Math.max(atrPctFill * tpMult * tpBonus,   0.01),  0.15);
-    callbackRate   = parseFloat(Math.min(Math.max(dynSlPct * 100, 0.5), 5.0).toFixed(1));
-    tpPrice        = safeTpPrice(isLong, fillPrice, amount, dynTpPct, feeUsdt, symbol);
-
-    if (tpBonus !== 1.0 || ctxSlMult !== 1.0) {
-      console.log(`[CTX] ${symbol} TP×${tpBonus.toFixed(2)} SL×${ctxSlMult.toFixed(2)} | FR:${((fundingRateCache.get(symbol) ?? 0)*100).toFixed(4)}% F&G:${fearGreedCache?.value ?? 'N/A'}`);
-    }
-    console.log(`[AUTO] ATR-SL:${(dynSlPct*100).toFixed(3)}% (cb:${callbackRate}%)  ATR-TP:${(dynTpPct*100).toFixed(3)}% @ ${tpPrice}`);
-
-    // Wait for Binance position engine to register the fill before placing TP/SL.
-    // Without this, reduceOnly orders can be rejected because the position hasn't
-    // appeared yet from Binance's perspective.
-    await new Promise(r => setTimeout(r, 400));
-
-    // Fetch actual position size so TP/SL amount exactly matches what Binance holds.
-    // Using the computed `amount` risks reduceOnly rejection if exchange precision differs.
-    let tpSlAmount = amount;
-    try {
-      const positions = await binance.fetchPositions([symbol]);
-      const pos = positions.find((p: any) => {
-        const sym = (p.symbol as string).split(":")[0];
-        return sym === symbol && Math.abs(Number(p.contracts ?? 0)) > 0;
-      });
-      if (pos) {
-        const posAmt = parseFloat((binance as any).amountToPrecision(symbol, Math.abs(Number(pos.contracts))));
-        if (posAmt > 0) {
-          tpSlAmount = posAmt;
-          console.log(`[AUTO] Using actual position size ${tpSlAmount} (computed was ${amount})`);
-        }
-      }
-    } catch (e: any) {
-      console.warn(`[AUTO] Could not fetch position size, using computed amount:`, e?.message);
-    }
-
-    // ── Native TP order ──
-    // priceProtect omitted — it causes false -4061 rejections when mark price is
-    // slightly ahead of fill price at placement time.
-    try {
-      await binance.createOrder(symbol, "TAKE_PROFIT_MARKET", closeSide, tpSlAmount, undefined, {
-        stopPrice: tpPrice, reduceOnly: true, workingType: "MARK_PRICE",
-      });
-      checks.push({ name: "Take Profit", status: "pass", detail: `@ $${tpPrice.toLocaleString()}` });
-      console.log(`[AUTO] TP order placed @ ${tpPrice}`);
-    } catch (e: any) {
-      console.error(`[AUTO] TP order failed [${symbol}]:`, e?.message);
-      orderWarnings.push(`TP failed: ${(e?.message ?? "").slice(0, 150)}`);
-      checks.push({ name: "Take Profit", status: "block", detail: `Failed: ${(e?.message ?? "").slice(0, 80)}` });
-    }
-
-    // ── Native Trailing SL ──
-    try {
-      await binance.createOrder(symbol, "TRAILING_STOP_MARKET", closeSide, tpSlAmount, undefined, {
-        callbackRate, reduceOnly: true, workingType: "MARK_PRICE",
-      });
-      checks.push({ name: "Trailing SL", status: "pass", detail: `${callbackRate}% callback` });
-      console.log(`[AUTO] Trailing SL placed @ ${callbackRate}% callback`);
-    } catch (e: any) {
-      console.error(`[AUTO] Trailing SL order failed [${symbol}]:`, e?.message);
-      orderWarnings.push(`SL failed: ${(e?.message ?? "").slice(0, 150)}`);
-      checks.push({ name: "Trailing SL", status: "block", detail: `Failed: ${(e?.message ?? "").slice(0, 80)}` });
-    }
-  }
-
-  await pool.query(
-    `INSERT INTO trades (symbol, type, entry_price, amount, strategy, status, leverage, fee_usdt)
-     VALUES ($1, $2, $3, $4, $5, 'OPEN', $6, $7)`,
-    [symbol, signal.action, fillPrice, amount, strategyName, leverage, feeUsdt]
+  // Context multipliers
+  const vwap = parseFloat(calcVWAP(momentumBuffer.get(symbol) || []).toFixed(6));
+  const oiD  = openInterestCache.get(symbol);
+  const { tpBonus, slMult: ctxSlMult } = calcContextMultipliers(
+    signal.action, strategyName,
+    fundingRateCache.get(symbol), fearGreedCache,
+    vwap, entryPrice,
+    oiD?.oiChangePct, longShortCache.get(symbol)
   );
-  checks.push({ name: "Database", status: "pass", detail: `Recorded OPEN trade @ $${fillPrice.toLocaleString()}` });
-  console.log(`[AUTO] DB recorded: ${signal.action} ${symbol} @ ${fillPrice} fee:${feeUsdt} USDT [${strategyName}]`);
+  const dynSlPct = Math.min(Math.max((atr / entryPrice) * slMult * ctxSlMult, 0.001), 0.05);
+  const dynTpPct = Math.min(Math.max((atr / entryPrice) * tpMult * tpBonus,   0.01),  0.15);
+  const slPrice  = isLong ? entryPrice * (1 - dynSlPct) : entryPrice * (1 + dynSlPct);
+  const tpPrice  = isLong ? entryPrice * (1 + dynTpPct) : entryPrice * (1 - dynTpPct);
 
-  broadcastSSE("trade", { symbol, action: signal.action, strategy: strategyName, price: fillPrice, amount, leverage, timestamp: Date.now() });
-  pushValidation({ id: vid, timestamp: Date.now(), symbol, strategy: strategyName, action: signal.action, finalStatus: orderWarnings.length ? "executed" : "executed", checks });
+  const estDuration = strategyName === "SWING-LONG"   ? "1–3 days"
+                    : strategyName === "MOMENTUM-ARB" ? "30–60 min"
+                    : strategyName === "MEAN-REV"      ? "1–4 hours"
+                    :                                   "5–15 min";
+  const timeframe   = strategyName === "SWING-LONG"   ? "4h"
+                    : strategyName === "MOMENTUM-ARB" ? "5m"
+                    : strategyName === "MEAN-REV"      ? "15m"
+                    :                                   "1m";
 
-  if (hasKeys) {
-    const icon   = orderWarnings.length ? "⚠️" : "✅";
-    const status = orderWarnings.length ? "EXECUTED (warnings)" : "EXECUTED";
-    const slPrice = isLong ? fillPrice * (1 - (signal.atr ?? 0) / fillPrice * slMult) : fillPrice * (1 + (signal.atr ?? 0) / fillPrice * slMult);
-    const tpPriceDisplay = tpPrice > 0 ? tpPrice.toLocaleString() : "N/A";
-    const slPriceDisplay = slPrice > 0 ? slPrice.toLocaleString() : "N/A";
-    const score = signal.score ?? 0;
-    const notional = fillPrice * amount;
+  // Insert signal
+  await pool.query(
+    `INSERT INTO signals (symbol, side, strategy, timeframe, entry_price, tp_price, sl_price, confidence, est_duration, context, status, telegram_sent)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, 'ACTIVE', false)`,
+    [symbol, side, strategyName, timeframe, entryPrice, tpPrice, slPrice, score, estDuration,
+      JSON.stringify({ trend, regime, adx, volRatio, fundingRate, fg: fearGreedCache?.value, oiChangePct: oiD?.oiChangePct, lsRatio })]
+  );
 
-    await sendTelegram(
-      `${icon} <b>AUTO TRADE ${status}</b>\n` +
-      `<code>${symbol}</code>  <b>${isLong ? "LONG 🟢" : "SHORT 🔴"}</b>  <code>${strategyName}</code>\n` +
-      `Score: <code>${score.toFixed(1)}/5.0</code>  RSI: <code>${signal.rsi}</code>\n\n` +
-      `📊 <b>SETUP</b>\n` +
-      `Entry: <code>$${fillPrice.toLocaleString()}</code>\n` +
-      `TP:    <code>$${tpPriceDisplay}</code>\n` +
-      `SL:    <code>$${slPriceDisplay}</code> (trailing ${callbackRate}%)\n` +
-      `Size:  <code>${amount.toFixed(4)} ${symbol.split("/")[0]}</code>  ($${notional.toLocaleString()})\n` +
-      `Lev:   <code>${leverage}×</code>  Fee: <code>${feeUsdt} USDT</code>\n` +
-      `Risk:  <code>${(balance * riskPct).toFixed(2)} USDT</code> (${(riskPct * 100).toFixed(1)}% of balance)` +
-      (orderWarnings.length ? `\n\n⚠️ <b>Warnings:</b>\n<code>${orderWarnings.join("\n")}</code>` : "")
+  // Send Telegram
+  const icon = "🚨";
+  const status = "SIGNAL GENERATED";
+  const slPriceDisplay = slPrice > 0 ? slPrice.toLocaleString() : "N/A";
+  const tpPriceDisplay = tpPrice > 0 ? tpPrice.toLocaleString() : "N/A";
+
+  await sendTelegram(
+    `${icon} <b>NEXUSBOT SIGNAL — ${status}</b>
+` +
+    `<code>${symbol}</code>  <b>${isLong ? "LONG 🟢" : "SHORT 🔴"}</b>  <code>${strategyName}</code>
+` +
+    `Score: <code>${score.toFixed(1)}/5.0</code>  RSI: <code>${signal.rsi}</code>
+
+` +
+    `📊 <b>SETUP</b>
+` +
+    `Entry: <code>$${entryPrice.toLocaleString()}</code>
+` +
+    `TP:    <code>$${tpPriceDisplay}</code>  (+${(dynTpPct*100).toFixed(2)}%)
+` +
+    `SL:    <code>$${slPriceDisplay}</code>  (-${(dynSlPct*100).toFixed(2)}%)
+` +
+    `⏱ Est. Time: <code>${estDuration}</code>
+
+` +
+    `📈 Trend: <code>${trend}</code> | Regime: <code>${regime}</code>
+` +
+    `💧 Vol: <code>${volRatio.toFixed(1)}×</code> | Funding: <code>${((fundingRate ?? 0)*100).toFixed(4)}%</code>
+` +
+    `Sent: <code>${new Date().toISOString()}</code>`
+  );
+
+  // Mark telegram_sent = true on the latest signal for this symbol+strategy
+  await pool.query(
+    `UPDATE signals SET telegram_sent = true WHERE symbol = $1 AND strategy = $2 AND sent_at = (SELECT MAX(sent_at) FROM signals WHERE symbol = $1 AND strategy = $2)`,
+    [symbol, strategyName]
+  );
+
+  checks.push({ name: "Signal Sent", status: "pass", detail: `Telegram alert dispatched` });
+  pushValidation({ id: vid, timestamp: Date.now(), symbol, strategy: strategyName, action: signal.action, finalStatus: "signaled", checks });
+
+  broadcastSSE("signal", {
+    symbol, side, strategy: strategyName, entryPrice, tpPrice, slPrice,
+    confidence: score, estDuration, timestamp: Date.now()
+  });
+
+  console.log(`[SIGNAL] ✓ ${side} ${symbol} @ ${entryPrice} TP:${tpPrice} SL:${slPrice} [${strategyName}]`);
+
+  // Execute a paper trade immediately if paper mode is enabled
+  if (paperMode) {
+    await executePaperTrade(symbol, side, strategyName, entryPrice, tpPrice, slPrice, score, {
+      trend, regime, adx, volRatio, fundingRate, fg: fearGreedCache?.value,
+    });
+  }
+}
+
+// ── Paper Trading ──────────────────────────────────────────────────────────────
+
+async function executePaperTrade(
+  symbol: string, side: string, strategy: string,
+  entryPrice: number, tpPrice: number, slPrice: number,
+  score: number, context: Record<string, any> = {}
+) {
+  try {
+    await pool.query(
+      `INSERT INTO paper_trades (symbol, strategy, side, entry_price, tp_price, sl_price, signal_score, context)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
+      [symbol, strategy, side, entryPrice, tpPrice, slPrice, score, JSON.stringify(context)]
     );
+    const isLong = side === "LONG";
+    const tpPct  = isLong ? (tpPrice - entryPrice) / entryPrice * 100 : (entryPrice - tpPrice) / entryPrice * 100;
+    const slPct  = isLong ? (entryPrice - slPrice) / entryPrice * 100 : (slPrice - entryPrice) / entryPrice * 100;
+    const rr     = slPct > 0 ? (tpPct / slPct).toFixed(2) : "N/A";
+    await sendTelegram(
+      `📝 <b>PAPER TRADE OPENED</b>\n` +
+      `${isLong ? "🟢 LONG" : "🔴 SHORT"} <code>${symbol}</code>  [${strategy}]\n\n` +
+      `Entry: <code>$${entryPrice.toLocaleString()}</code>\n` +
+      `TP:    <code>$${tpPrice.toLocaleString()}</code>  (+${tpPct.toFixed(2)}%)\n` +
+      `SL:    <code>$${slPrice.toLocaleString()}</code>  (-${slPct.toFixed(2)}%)\n` +
+      `R:R    <code>1 : ${rr}</code>   Score: <code>${score.toFixed(1)}</code>`
+    );
+    console.log(`[PAPER] ✓ ${side} ${symbol} @ ${entryPrice} TP:${tpPrice} SL:${slPrice} [${strategy}]`);
+  } catch (e: any) {
+    console.error(`[PAPER] Error opening trade:`, e?.message);
+  }
+}
+
+async function updateStrategyStats(strategy: string, pnlPct: number) {
+  try {
+    const isWin = pnlPct > 0;
+    await pool.query(
+      `INSERT INTO strategy_stats (strategy, total_trades, win_trades, loss_trades, total_pnl_pct,
+                                   avg_win_pct, avg_loss_pct, last_updated)
+       VALUES ($1, 1, $2, $3, $4,
+         CASE WHEN $4 > 0 THEN $4 ELSE 0 END,
+         CASE WHEN $4 <= 0 THEN $4 ELSE 0 END,
+         NOW())
+       ON CONFLICT (strategy) DO UPDATE
+       SET total_trades  = strategy_stats.total_trades + 1,
+           win_trades    = strategy_stats.win_trades   + $2,
+           loss_trades   = strategy_stats.loss_trades  + $3,
+           total_pnl_pct = strategy_stats.total_pnl_pct + $4,
+           avg_win_pct   = CASE
+             WHEN (strategy_stats.win_trades + $2) > 0 THEN
+               (strategy_stats.avg_win_pct * strategy_stats.win_trades + GREATEST($4, 0))
+               / (strategy_stats.win_trades + $2)
+             ELSE strategy_stats.avg_win_pct END,
+           avg_loss_pct  = CASE
+             WHEN (strategy_stats.loss_trades + $3) > 0 THEN
+               (strategy_stats.avg_loss_pct * strategy_stats.loss_trades + LEAST($4, 0))
+               / (strategy_stats.loss_trades + $3)
+             ELSE strategy_stats.avg_loss_pct END,
+           last_updated  = NOW()`,
+      [strategy, isWin ? 1 : 0, isWin ? 0 : 1, pnlPct]
+    );
+  } catch (e: any) {
+    console.error(`[STATS] Error updating strategy stats:`, e?.message);
+  }
+}
+
+async function runPaperTradeMonitor() {
+  try {
+    const openTrades = await pool.query(
+      `SELECT id, symbol, strategy, side,
+              entry_price::float, tp_price::float, sl_price::float
+       FROM paper_trades WHERE status = 'OPEN'`
+    );
+    if (openTrades.rows.length === 0) return;
+
+    for (const trade of openTrades.rows) {
+      const price = markPriceCache.get(trade.symbol)
+                 ?? scanResults.find(r => r.symbol === trade.symbol)?.price;
+      if (!price) continue;
+
+      const isLong = trade.side === "LONG";
+      const hitTP  = isLong ? price >= trade.tp_price : price <= trade.tp_price;
+      const hitSL  = isLong ? price <= trade.sl_price : price >= trade.sl_price;
+      if (!hitTP && !hitSL) continue;
+
+      const closeReason = hitTP ? "TP" : "SL";
+      const pnlPct = isLong
+        ? (price - trade.entry_price) / trade.entry_price * 100
+        : (trade.entry_price - price) / trade.entry_price * 100;
+
+      await pool.query(
+        `UPDATE paper_trades SET status = $1, close_time = NOW(), close_price = $2, pnl_pct = $3 WHERE id = $4`,
+        [closeReason, price, pnlPct, trade.id]
+      );
+      await updateStrategyStats(trade.strategy, pnlPct);
+
+      const emoji   = hitTP ? "✅" : "❌";
+      const pnlSign = pnlPct >= 0 ? "+" : "";
+      await sendTelegram(
+        `${emoji} <b>PAPER TRADE CLOSED — ${closeReason}</b>\n` +
+        `${isLong ? "🟢 LONG" : "🔴 SHORT"} <code>${trade.symbol}</code>  [${trade.strategy}]\n\n` +
+        `Entry: <code>$${trade.entry_price.toLocaleString()}</code>\n` +
+        `Exit:  <code>$${price.toLocaleString()}</code>\n` +
+        `PnL:   <code>${pnlSign}${pnlPct.toFixed(2)}%</code>  ${hitTP ? "🎯" : "🛑"}`
+      );
+      broadcastSSE("paper_trade_closed", {
+        id: trade.id, symbol: trade.symbol, strategy: trade.strategy,
+        reason: closeReason, pnlPct: parseFloat(pnlPct.toFixed(2)),
+        entryPrice: trade.entry_price, closePrice: price,
+      });
+      console.log(`[PAPER] ${closeReason} ${trade.symbol} ${pnlSign}${pnlPct.toFixed(2)}% [${trade.strategy}]`);
+    }
+  } catch (e: any) {
+    console.error("[PAPER] Monitor error:", e?.message);
   }
 }
 
@@ -1046,8 +1052,7 @@ async function refreshSwingBuffers() {
 
       if (activeStrategies.has("SWING-LONG") && (isNew || isRetry)) {
         lastSwingAttempt.set(symbol, Date.now());
-        if (isNew) sendSignalAlert(symbol, signal as AnySignal, "SWING-LONG");
-        await checkAutoExecute(symbol, signal as AnySignal, "SWING-LONG");
+        await generateSignal(symbol, signal as AnySignal, "SWING-LONG");
       }
       lastSwingAction.set(symbol, signal.action);
     } catch (e: any) {
@@ -1106,8 +1111,7 @@ function initWebSocket() {
           const isRetryMR = signal.action !== "HOLD" && (Date.now() - lastMR) > 2 * 60 * 1000;
           if (activeStrategies.has("MEAN-REV") && (isNewMR || isRetryMR)) {
             lastMeanRevAttempt.set(symbol, Date.now());
-            if (isNewMR) sendSignalAlert(symbol, signal, "MEAN-REV");
-            await checkAutoExecute(symbol, signal, "MEAN-REV");
+            await generateSignal(symbol, signal, "MEAN-REV");
           }
           lastMeanRevAction.set(symbol, signal.action);
         }
@@ -1147,8 +1151,7 @@ function initWebSocket() {
           const isRetryMA = signal.action !== "HOLD" && (Date.now() - lastMA) > 60 * 1000;
           if (activeStrategies.has("MOMENTUM-ARB") && (isNewMA || isRetryMA)) {
             lastMomentumAttempt.set(symbol, Date.now());
-            if (isNewMA) sendSignalAlert(symbol, signal, "MOMENTUM-ARB");
-            await checkAutoExecute(symbol, signal, "MOMENTUM-ARB");
+            await generateSignal(symbol, signal, "MOMENTUM-ARB");
           }
           lastMomentumAction.set(symbol, signal.action);
         }
@@ -1167,44 +1170,7 @@ function initWebSocket() {
   ws.on("error", (err: Error) => console.error("[WS] Error:", err.message));
 }
 
-// ── Mock Trade Monitor (no API keys — simulates TP/SL using live scan prices) ──
-// In live mode Binance handles TP/SL natively via server-side orders placed on entry.
 
-const runMockTradeMonitor = async () => {
-  if (process.env.BINANCE_API_KEY && process.env.BINANCE_SECRET_KEY) return; // live mode: Binance handles it
-  try {
-    const openTrades = await pool.query(
-      `SELECT id, symbol, type, entry_price::float, amount::float FROM trades WHERE status = 'OPEN'`
-    );
-    if (openTrades.rows.length === 0) return;
-
-    const cfg   = await pool.query(`SELECT take_profit_pct::float, stop_loss_pct::float FROM bot_settings WHERE id = 'bot_config'`);
-    const tpPct = (cfg.rows[0]?.take_profit_pct ?? 1.5) / 100;
-    const slPct = (cfg.rows[0]?.stop_loss_pct   ?? 0.8) / 100;
-
-    for (const trade of openTrades.rows) {
-      const live = scanResults.find(r => r.symbol === trade.symbol);
-      if (!live?.price) continue;
-      const currentPrice = live.price;
-      const isLong       = trade.type === "BUY";
-      const pnlPct       = isLong ? (currentPrice - trade.entry_price) / trade.entry_price
-                                  : (trade.entry_price - currentPrice) / trade.entry_price;
-      const hitTP = pnlPct >=  tpPct;
-      const hitSL = pnlPct <= -slPct;
-      if (!hitTP && !hitSL) continue;
-
-      const reason  = hitTP ? "TP" : "SL";
-      const pnlUSDT = (isLong ? currentPrice - trade.entry_price : trade.entry_price - currentPrice) * trade.amount;
-      await pool.query(
-        `UPDATE trades SET status = 'CLOSED', exit_price = $1, pnl = $2 WHERE id = $3`,
-        [currentPrice, pnlUSDT.toFixed(4), trade.id]
-      );
-      console.log(`[MOCK-${reason}] ${trade.symbol} PnL=${pnlUSDT.toFixed(2)} USDT`);
-    }
-  } catch (err) {
-    console.error("[MOCK-MONITOR] Error:", err);
-  }
-};
 
 // ── Market Context (Funding Rate + Fear & Greed) ────────────────────────────────
 
@@ -1278,55 +1244,7 @@ async function sendTelegram(message: string): Promise<void> {
   }
 }
 
-// Send signal alert with full setup details before trade execution
-async function sendSignalAlert(symbol: string, signal: AnySignal, strategyName: string) {
-  const { token, chatId } = await getTelegramConfig();
-  if (!token || !chatId) return;
 
-  const isLong = signal.action === "BUY";
-  const price  = signal.price;
-  const atr    = signal.atr ?? 0;
-
-  // Default SL/TP multipliers per strategy (for alert approximation)
-  const slMult = strategyName === "MOMENTUM-ARB" ? 1.0 : strategyName === "MEAN-REV" ? 1.0 : 1.5;
-  const tpMult = strategyName === "MOMENTUM-ARB" ? 3.0 : strategyName === "MEAN-REV" ? 2.0 : 4.0;
-
-  const slPrice = isLong ? price - atr * slMult : price + atr * slMult;
-  const tpPrice = isLong ? price + atr * tpMult : price - atr * tpMult;
-  const slPct   = Math.abs((slPrice - price) / price * 100);
-  const tpPct   = Math.abs((tpPrice - price) / price * 100);
-
-  // Score strength label
-  const score = signal.score ?? 0;
-  const strength = score >= 4 ? "🔥 STRONG" : score >= 3 ? "⚡ WEAK" : "❌ BELOW THRESHOLD";
-
-  // Rationale lines based on strategy
-  const lines: string[] = [];
-  if (strategyName === "MOMENTUM-ARB") {
-    lines.push(`• Fresh EMA crossover (+3.0)`);
-    if (signal.rsi > 55 && isLong) lines.push(`• RSI momentum > 55 (+1.0)`);
-    if (signal.rsi < 45 && !isLong) lines.push(`• RSI momentum < 45 (+1.0)`);
-    if ((signal.volumeRatio ?? 1) >= 1.2) lines.push(`• Volume spike (+0.5)`);
-  } else {
-    lines.push(`• Bollinger Band touch (+2.0)`);
-    if (signal.rsi < 38 && isLong) lines.push(`• RSI oversold (+1.5)`);
-    if (signal.rsi > 62 && !isLong) lines.push(`• RSI overbought (+1.5)`);
-  }
-
-  const message =
-    `🚨 <b>SIGNAL ALERT — ${strength}</b>\n` +
-    `<code>${symbol}</code>  <b>${isLong ? "LONG 🟢" : "SHORT 🔴"}</b>  <code>${strategyName}</code>\n` +
-    `Score: <code>${score.toFixed(1)}/5.0</code>  RSI: <code>${signal.rsi}</code>  Vol: <code>${(signal.volumeRatio ?? 1).toFixed(1)}×</code>\n\n` +
-    `📊 <b>SETUP</b>\n` +
-    `Entry: <code>$${price.toLocaleString()}</code>\n` +
-    `TP:    <code>$${tpPrice.toLocaleString()}</code>  (+${tpPct.toFixed(2)}%)\n` +
-    `SL:    <code>$${slPrice.toLocaleString()}</code>  (-${slPct.toFixed(2)}%)\n` +
-    `ATR:   <code>${signal.atrPct?.toFixed(3)}%</code>\n\n` +
-    `📈 <b>RATIONALE</b>\n` +
-    lines.map(l => `${l}`).join("\n");
-
-  await sendTelegram(message);
-}
 
 async function fetchFuturesData() {
   await Promise.all(SYMBOLS.map(async symbol => {
@@ -1353,60 +1271,7 @@ async function fetchFuturesData() {
 
 let lastSyncAt: string | null = null;
 
-async function syncPositionsFromBinance() {
-  if (!process.env.BINANCE_API_KEY || !process.env.BINANCE_SECRET_KEY) return;
 
-  try {
-    // All OPEN trades in our DB
-    const dbTrades = await pool.query(
-      `SELECT id, symbol, type, entry_price::float, amount::float
-       FROM trades WHERE status = 'OPEN'`
-    );
-    if (dbTrades.rows.length === 0) {
-      lastSyncAt = new Date().toISOString();
-      return;
-    }
-
-    // Actual open positions on Binance (only contracts > 0)
-    const rawPositions = await binance.fetchPositions();
-    const openOnBinance = new Map<string, any>();
-    for (const pos of rawPositions) {
-      if (Math.abs(Number(pos.contracts ?? 0)) > 0) {
-        // ccxt may return "BTC/USDT:USDT" — normalise to "BTC/USDT"
-        const sym = (pos.symbol as string).split(":")[0];
-        openOnBinance.set(sym, pos);
-      }
-    }
-
-    for (const trade of dbTrades.rows as any[]) {
-      const stillOpen = openOnBinance.has(trade.symbol);
-      if (stillOpen) continue;
-
-      // Position gone on Binance → mark CLOSED in DB
-      // Use current ticker price as best-effort exit price
-      let exitPrice = trade.entry_price;
-      try {
-        const ticker = await binance.fetchTicker(trade.symbol);
-        exitPrice = ticker.last as number;
-      } catch { /* keep entry price as fallback */ }
-
-      const isLong  = trade.type === "BUY";
-      const pnlUSDT = (isLong ? exitPrice - trade.entry_price : trade.entry_price - exitPrice) * trade.amount;
-
-      await pool.query(
-        `UPDATE trades SET status = 'CLOSED', exit_price = $1, pnl = $2 WHERE id = $3`,
-        [exitPrice, pnlUSDT.toFixed(4), trade.id]
-      );
-      console.log(`[SYNC] Closed in DB: ${trade.symbol} exit:${exitPrice} PnL:${pnlUSDT.toFixed(2)} USDT`);
-    }
-
-    lastSyncAt = new Date().toISOString();
-    console.log(`[SYNC] Done — ${dbTrades.rows.length} checked, ${new Date().toLocaleTimeString()}`);
-    broadcastSSE("sync", { timestamp: lastSyncAt });
-  } catch (err: any) {
-    console.error("[SYNC] Error:", err?.message);
-  }
-}
 
 // ── PnL Snapshot ───────────────────────────────────────────────────────────────
 
@@ -1614,106 +1479,6 @@ app.get("/api/open-positions", async (_req, res) => {
   }
 });
 
-// Manual sync trigger
-app.post("/api/sync-positions", async (_req, res) => {
-  try {
-    await syncPositionsFromBinance();
-    res.json({ ok: true, last_sync: lastSyncAt });
-  } catch (err: any) {
-    res.status(500).json({ error: err?.message });
-  }
-});
-
-// Close a single open position by trade ID
-app.post("/api/close-position/:id", async (req, res) => {
-  const { id } = req.params;
-  try {
-    const tradeRes = await pool.query(
-      `SELECT id, symbol, type, entry_price::float, amount::float FROM trades WHERE id = $1 AND status = 'OPEN'`,
-      [id]
-    );
-    if (tradeRes.rows.length === 0)
-      return res.status(404).json({ error: "Position not found or already closed" });
-
-    const trade   = tradeRes.rows[0];
-    const hasKeys = !!(process.env.BINANCE_API_KEY && process.env.BINANCE_SECRET_KEY);
-    let exitPrice = trade.entry_price;
-
-    if (hasKeys) {
-      try { await binance.cancelAllOrders(trade.symbol); } catch { /* TP/SL may already be filled */ }
-      try {
-        const closeSide = trade.type === "BUY" ? "sell" : "buy";
-        const order = await binance.createOrder(trade.symbol, "market", closeSide, trade.amount, undefined, { reduceOnly: true });
-        exitPrice = parseFloat(String((order as any).average || (order as any).price || trade.entry_price));
-      } catch (e: any) {
-        return res.status(500).json({ error: `Binance close failed: ${e?.message}` });
-      }
-    } else {
-      exitPrice = scanResults.find(r => r.symbol === trade.symbol)?.price ?? trade.entry_price;
-    }
-
-    const isLong  = trade.type === "BUY";
-    const pnlUsdt = (isLong ? exitPrice - trade.entry_price : trade.entry_price - exitPrice) * trade.amount;
-    await pool.query(
-      `UPDATE trades SET status = 'CLOSED', exit_price = $1, pnl = $2 WHERE id = $3`,
-      [exitPrice, pnlUsdt.toFixed(4), id]
-    );
-    console.log(`[CLOSE] ${trade.symbol} @ ${exitPrice} PnL:${pnlUsdt.toFixed(2)} USDT`);
-    res.json({ ok: true, symbol: trade.symbol, exitPrice, pnlUsdt: parseFloat(pnlUsdt.toFixed(4)) });
-  } catch (err: any) {
-    res.status(500).json({ error: err?.message });
-  }
-});
-
-// Close all open positions at market
-app.post("/api/close-all-positions", async (_req, res) => {
-  try {
-    const openTrades = await pool.query(
-      `SELECT id, symbol, type, entry_price::float, amount::float FROM trades WHERE status = 'OPEN'`
-    );
-    if (openTrades.rows.length === 0) return res.json({ ok: true, closed: 0 });
-
-    const hasKeys      = !!(process.env.BINANCE_API_KEY && process.env.BINANCE_SECRET_KEY);
-    const symbolsSeen  = new Set<string>();
-    let   closed       = 0;
-    const results: any[] = [];
-
-    for (const trade of openTrades.rows) {
-      let exitPrice = trade.entry_price;
-
-      if (hasKeys) {
-        if (!symbolsSeen.has(trade.symbol)) {
-          try { await binance.cancelAllOrders(trade.symbol); } catch { /* ignore */ }
-          symbolsSeen.add(trade.symbol);
-        }
-        try {
-          const closeSide = trade.type === "BUY" ? "sell" : "buy";
-          const order = await binance.createOrder(trade.symbol, "market", closeSide, trade.amount, undefined, { reduceOnly: true });
-          exitPrice = parseFloat(String((order as any).average || (order as any).price || trade.entry_price));
-        } catch (e: any) {
-          console.error(`[CLOSE-ALL] ${trade.symbol} failed:`, e?.message);
-          continue;
-        }
-      } else {
-        exitPrice = scanResults.find(r => r.symbol === trade.symbol)?.price ?? trade.entry_price;
-      }
-
-      const isLong  = trade.type === "BUY";
-      const pnlUsdt = (isLong ? exitPrice - trade.entry_price : trade.entry_price - exitPrice) * trade.amount;
-      await pool.query(
-        `UPDATE trades SET status = 'CLOSED', exit_price = $1, pnl = $2 WHERE id = $3`,
-        [exitPrice, pnlUsdt.toFixed(4), trade.id]
-      );
-      closed++;
-      results.push({ symbol: trade.symbol, exitPrice, pnlUsdt: parseFloat(pnlUsdt.toFixed(4)) });
-      console.log(`[CLOSE-ALL] ${trade.symbol} @ ${exitPrice} PnL:${pnlUsdt.toFixed(2)} USDT`);
-    }
-
-    res.json({ ok: true, closed, results });
-  } catch (err: any) {
-    res.status(500).json({ error: err?.message });
-  }
-});
 
 app.get("/api/settings", async (req, res) => {
   try {
@@ -1726,7 +1491,7 @@ app.post("/api/settings", async (req, res) => {
   const { isAutoPilot, riskLevel, maxSlippage, takeProfitPct, stopLossPct, leverage,
           atrSlMult, atrTpMult, arbSlMult, arbTpMult, mrSlMult, mrTpMult, activeStrategiesVal,
           telegramBotToken, telegramChatId, takerRateVal,
-          swingLeverageVal, swingSlMult, swingTpMult } = req.body;
+          swingLeverageVal, swingSlMult, swingTpMult, paperModeVal } = req.body;
   const strategiesParam = Array.isArray(activeStrategiesVal) ? activeStrategiesVal : null;
   try {
     const r = await pool.query(
@@ -1749,7 +1514,8 @@ app.post("/api/settings", async (req, res) => {
            taker_rate         = COALESCE($16, taker_rate),
            swing_leverage     = COALESCE($17, swing_leverage),
            swing_sl_mult      = COALESCE($18, swing_sl_mult),
-           swing_tp_mult      = COALESCE($19, swing_tp_mult)
+           swing_tp_mult      = COALESCE($19, swing_tp_mult),
+           paper_mode         = COALESCE($20, paper_mode)
        WHERE id = 'bot_config' RETURNING *`,
       [isAutoPilot ?? null, riskLevel ?? null, maxSlippage ?? null,
        takeProfitPct ?? null, stopLossPct ?? null, leverage ?? null,
@@ -1758,7 +1524,8 @@ app.post("/api/settings", async (req, res) => {
        telegramBotToken ?? null, telegramChatId ?? null,
        takerRateVal != null ? parseFloat(takerRateVal) : null,
        swingLeverageVal != null ? parseInt(swingLeverageVal) : null,
-       swingSlMult ?? null, swingTpMult ?? null]
+       swingSlMult ?? null, swingTpMult ?? null,
+       paperModeVal != null ? Boolean(paperModeVal) : null]
     );
     // Sync in-memory values so they take effect immediately without restart
     if (strategiesParam) {
@@ -1769,6 +1536,10 @@ app.post("/api/settings", async (req, res) => {
       takerRate = parseFloat(takerRateVal);
       console.log(`[SETTINGS] Taker rate updated to ${(takerRate * 100).toFixed(4)}%`);
     }
+    if (paperModeVal != null) {
+      paperMode = Boolean(paperModeVal);
+      console.log(`[SETTINGS] Paper mode: ${paperMode ? "ON" : "OFF"}`);
+    }
     res.json(r.rows[0]);
   } catch { res.status(500).json({ error: "Failed to update settings" }); }
 });
@@ -1777,10 +1548,15 @@ app.post("/api/test-telegram", async (req, res) => {
   const { type = "basic" } = req.body;
   try {
     if (type === "signal") {
-      await sendSignalAlert(
-        "BTC/USDT",
-        { action: "BUY", price: 64250, rsi: 34, atr: 125, atrPct: 0.19, volumeRatio: 1.8, score: 4.2 } as any,
-        "MOMENTUM-ARB"
+      await sendTelegram(
+        `🧪 <b>NEXUSBOT TEST SIGNAL</b>\n` +
+        `<code>BTC/USDT</code>  <b>LONG 🟢</b>  <code>MOMENTUM-ARB</code>\n` +
+        `Score: <code>4.2/5.0</code>  RSI: <code>34</code>\n\n` +
+        `📊 <b>SETUP</b>\n` +
+        `Entry: <code>$64,250.00</code>\n` +
+        `TP:    <code>$65,000.00</code>\n` +
+        `SL:    <code>$63,500.00</code>\n` +
+        `⏱ Est. Time: <code>30–60 min</code>`
       );
     } else {
       await sendTelegram(
@@ -1809,55 +1585,118 @@ app.get("/api/ohlcv/:symbol", async (req, res) => {
     res.json(r.rows.reverse());
   } catch { res.status(500).json({ error: "Failed to fetch OHLCV" }); }
 });
-
-app.get("/api/pnl-history", async (req, res) => {
+app.get("/api/signals", async (req, res) => {
   try {
-    const r = await pool.query(
-      `SELECT TO_CHAR(TO_TIMESTAMP(timestamp/1000.0),'HH24:MI') AS time, total_value::float AS value
-       FROM pnl_snapshots ORDER BY timestamp ASC`
-    );
-    res.json(r.rows);
-  } catch { res.status(500).json({ error: "Failed to fetch PnL history" }); }
-});
-
-app.delete("/api/pnl-history", async (req, res) => {
-  try {
-    const { above } = req.query; // optional: DELETE /api/pnl-history?above=10000
-    if (above) {
-      const threshold = parseFloat(above as string);
-      await pool.query("DELETE FROM pnl_snapshots WHERE total_value > $1", [threshold]);
-      res.json({ ok: true, message: `Deleted snapshots with total_value > ${threshold}` });
-    } else {
-      await pool.query("TRUNCATE pnl_snapshots");
-      res.json({ ok: true, message: "All PnL history cleared" });
+    const status = (req.query.status as string) || "ALL";
+    let query = `SELECT id, symbol, side, strategy, timeframe, entry_price::float AS entry_price, tp_price::float AS tp_price, sl_price::float AS sl_price, confidence, est_duration, status, telegram_sent, sent_at FROM signals`;
+    const params: any[] = [];
+    if (status !== "ALL") {
+      query += ` WHERE status = $1`;
+      params.push(status);
     }
-  } catch { res.status(500).json({ error: "Failed to delete PnL history" }); }
+    query += ` ORDER BY sent_at DESC LIMIT 50`;
+    const r = await pool.query(query, params);
+    res.json(r.rows);
+  } catch { res.status(500).json({ error: "Failed to fetch signals" }); }
 });
 
-app.get("/api/trade-history", async (req, res) => {
+app.post("/api/signals/:id/expire", async (req, res) => {
+  try {
+    await pool.query(`UPDATE signals SET status = 'EXPIRED' WHERE id = $1`, [req.params.id]);
+    res.json({ ok: true });
+  } catch { res.status(500).json({ error: "Failed to expire signal" }); }
+});
+
+app.post("/api/send-signal", async (req, res) => {
+  const { symbol, side, strategy, entry, tp, sl } = req.body;
+  if (!symbol || !side || !strategy || !entry || !tp || !sl) {
+    return res.status(400).json({ error: "Missing fields" });
+  }
+  try {
+    await pool.query(
+      `INSERT INTO signals (symbol, side, strategy, timeframe, entry_price, tp_price, sl_price, confidence, est_duration, status, telegram_sent)
+       VALUES ($1, $2, $3, 'MANUAL', $4, $5, $6, 5.0, 'Manual', 'ACTIVE', false)`,
+      [symbol, side, strategy, entry, tp, sl]
+    );
+    await sendTelegram(
+      `🚨 <b>NEXUSBOT MANUAL SIGNAL</b>
+` +
+      `<code>${symbol}</code>  <b>${side}</b>  <code>${strategy}</code>
+` +
+      `Entry: <code>$${Number(entry).toLocaleString()}</code>
+` +
+      `TP:    <code>$${Number(tp).toLocaleString()}</code>
+` +
+      `SL:    <code>$${Number(sl).toLocaleString()}</code>`
+    );
+    res.json({ ok: true });
+  } catch (e: any) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+
+
+
+
+
+
+
+
+
+
+// ── Paper Trade API ────────────────────────────────────────────────────────────
+
+app.get("/api/paper-trades", async (req, res) => {
+  try {
+    const status = (req.query.status as string) || "ALL";
+    let q = `SELECT id, symbol, strategy, side,
+               entry_price::float, tp_price::float, sl_price::float,
+               status, open_time, close_time, close_price::float, pnl_pct::float, signal_score::float
+             FROM paper_trades`;
+    const params: any[] = [];
+    if (status !== "ALL") { q += ` WHERE status = $1`; params.push(status); }
+    q += ` ORDER BY open_time DESC LIMIT 100`;
+    const r = await pool.query(q, params);
+    res.json(r.rows);
+  } catch (e: any) { res.status(500).json({ error: e.message }); }
+});
+
+app.get("/api/strategy-stats", async (_req, res) => {
   try {
     const r = await pool.query(
-      `SELECT id, symbol, entry_price::float AS entry, exit_price::float AS exit,
-              pnl::float, fee_usdt::float AS fee, strategy,
-              TO_CHAR(timestamp AT TIME ZONE 'UTC','HH24:MI:SS') AS time
-       FROM trades ORDER BY timestamp DESC LIMIT 50`
+      `SELECT strategy, total_trades, win_trades, loss_trades,
+              total_pnl_pct::float, avg_win_pct::float, avg_loss_pct::float, last_updated
+       FROM strategy_stats ORDER BY total_trades DESC`
     );
     res.json(r.rows);
-  } catch { res.status(500).json({ error: "Failed to fetch trade history" }); }
+  } catch (e: any) { res.status(500).json({ error: e.message }); }
 });
 
-
-app.post("/api/execute", async (req, res) => {
-  const { symbol, type, entryPrice, amount, strategy } = req.body;
-  if (!symbol || !type || !entryPrice) return res.status(400).json({ error: "symbol, type, entryPrice required" });
+app.post("/api/paper-trades/:id/close", async (req, res) => {
   try {
-    const r = await pool.query(
-      `INSERT INTO trades (symbol, type, entry_price, amount, strategy, status)
-       VALUES ($1, $2, $3, $4, $5, 'OPEN') RETURNING *`,
-      [symbol, type, entryPrice, amount || 0, strategy || "MANUAL"]
+    const { id } = req.params;
+    const tRow = await pool.query(
+      `SELECT symbol, strategy, side, entry_price::float FROM paper_trades WHERE id = $1 AND status = 'OPEN'`,
+      [id]
     );
-    res.json(r.rows[0]);
-  } catch { res.status(500).json({ error: "Failed to record trade" }); }
+    if (tRow.rows.length === 0)
+      return res.status(404).json({ error: "Trade not found or already closed" });
+    const t = tRow.rows[0];
+    const price = markPriceCache.get(t.symbol)
+               ?? scanResults.find(r => r.symbol === t.symbol)?.price
+               ?? t.entry_price;
+    const isLong = t.side === "LONG";
+    const pnlPct = isLong
+      ? (price - t.entry_price) / t.entry_price * 100
+      : (t.entry_price - price) / t.entry_price * 100;
+    await pool.query(
+      `UPDATE paper_trades SET status = 'MANUAL', close_time = NOW(), close_price = $1, pnl_pct = $2 WHERE id = $3`,
+      [price, pnlPct, id]
+    );
+    await updateStrategyStats(t.strategy, pnlPct);
+    res.json({ ok: true, pnlPct: parseFloat(pnlPct.toFixed(2)), closePrice: price });
+  } catch (e: any) { res.status(500).json({ error: e.message }); }
 });
 
 app.post("/api/ai-confirm", async (req, res) => {
@@ -1872,54 +1711,10 @@ app.post("/api/ai-confirm", async (req, res) => {
   } catch { res.status(500).json({ error: "AI Confirmation Failed" }); }
 });
 
-// ── Manual Trade Execution ────────────────────────────────────────────────────
-// Recalculates the live signal from the in-memory candle buffer and runs the
-// full checkAutoExecute filter chain (bypassing only the auto-pilot gate).
-// All other guards — regime, trend, volume, funding, cooldown, position limit —
-// still apply so you can't fire a duplicate or over-leveraged position by hand.
-app.post("/api/manual-execute", async (req, res) => {
-  const { symbol, strategy } = req.body as { symbol: string; strategy: string };
-  if (!symbol || !strategy) return res.status(400).json({ error: "symbol and strategy required" });
-  if (!["MOMENTUM-ARB", "MEAN-REV", "SWING-LONG"].includes(strategy))
-    return res.status(400).json({ error: `Unknown strategy: ${strategy}` });
+// ── Manual Signal Trigger ─────────────────────────────────────────────────────
 
-  let signal: AnySignal;
-  if (strategy === "MOMENTUM-ARB") {
-    signal = calculateMomentumSignal(momentumBuffer.get(symbol) || []) as AnySignal;
-  } else if (strategy === "SWING-LONG") {
-    signal = calculateSwingLongSignal(swingBuffer.get(symbol) || []) as AnySignal;
-  } else {
-    signal = calculateMeanRevSignal(trendBuffer.get(symbol) || []) as AnySignal;
-  }
 
-  if (signal.action === "HOLD") {
-    return res.status(422).json({ error: `Current ${strategy} signal for ${symbol} is HOLD — nothing to execute` });
-  }
 
-  console.log(`[MANUAL] ${symbol} ${strategy} → ${signal.action} @ $${signal.price}`);
-
-  try {
-    // bypassAutoPilot=true — skips the auto-pilot gate, all other filters still run
-    await checkAutoExecute(symbol, signal, strategy, true);
-    res.json({ ok: true, action: signal.action, price: signal.price, strategy, symbol, message: `Manual ${signal.action} ${symbol} via ${strategy} queued — check Validation Log` });
-  } catch (err: any) {
-    console.error("[MANUAL] error:", err?.message);
-    res.status(500).json({ error: err?.message });
-  }
-});
-
-app.get("/api/balance", async (req, res) => {
-  try {
-    if (!process.env.BINANCE_API_KEY || !process.env.BINANCE_SECRET_KEY) {
-      return res.json({ total: { USDT: 10000 }, status: "mock", reason: "No API keys" });
-    }
-    const balance = await binance.fetchBalance() as any;
-    res.json({ total: { USDT: parseFloat(String(balance.total?.USDT ?? 0)) }, status: "live", type: "futures" });
-  } catch (err: any) {
-    console.error("[API /balance] error:", err?.message);
-    res.status(200).json({ status: "error", error: err?.message, total: { USDT: 10000 }, fallback: "mock" });
-  }
-});
 
 app.get("/api/check-api", async (req, res) => {
   if (!process.env.BINANCE_API_KEY || !process.env.BINANCE_SECRET_KEY)
@@ -1934,24 +1729,7 @@ app.get("/api/check-api", async (req, res) => {
 });
 
 // ── Force-test a real order for a specific symbol/strategy ───────────────────
-app.post("/api/test-trade", async (req, res) => {
-  const { symbol, strategy = "MOMENTUM-ARB", action = "BUY" } = req.body;
-  if (!symbol) return res.status(400).json({ error: "symbol required" });
-  const buf = strategy === "MEAN-REV"  ? trendBuffer.get(symbol)
-            : strategy === "SWING-LONG" ? swingBuffer.get(symbol)
-            :                            momentumBuffer.get(symbol);
-  if (!buf || buf.length < 10) return res.status(400).json({ error: "buffer not ready" });
-  const signal = strategy === "MEAN-REV"  ? calculateMeanRevSignal(buf)
-               : strategy === "SWING-LONG" ? calculateSwingLongSignal(buf)
-               :                            calculateMomentumSignal(buf);
-  const forced = { ...signal, action: action as "BUY" | "SELL" };
-  try {
-    await checkAutoExecute(symbol, forced, strategy);
-    res.json({ ok: true, signal: forced.action, rsi: forced.rsi, vol: forced.volumeRatio });
-  } catch (e: any) {
-    res.status(500).json({ error: e.message });
-  }
-});
+
 
 // ── Diagnose — real-time filter state per symbol ───────────────────────────────
 
@@ -2665,10 +2443,11 @@ async function startServer() {
   console.log("Migrations applied");
 
   // Load persisted settings before seeding
-  const stRow = await pool.query("SELECT active_strategies, taker_rate FROM bot_settings WHERE id = 'bot_config'");
+  const stRow = await pool.query("SELECT active_strategies, taker_rate, paper_mode FROM bot_settings WHERE id = 'bot_config'");
   activeStrategies = new Set(stRow.rows[0]?.active_strategies || ["MOMENTUM-ARB", "MEAN-REV", "SWING-LONG"]);
-  if (stRow.rows[0]?.taker_rate != null) takerRate = parseFloat(stRow.rows[0].taker_rate);
-  console.log(`Active strategies: ${[...activeStrategies].join(", ")} | Taker rate: ${(takerRate * 100).toFixed(4)}%`);
+  if (stRow.rows[0]?.taker_rate  != null) takerRate = parseFloat(stRow.rows[0].taker_rate);
+  if (stRow.rows[0]?.paper_mode  != null) paperMode = Boolean(stRow.rows[0].paper_mode);
+  console.log(`Active strategies: ${[...activeStrategies].join(", ")} | Taker rate: ${(takerRate * 100).toFixed(4)}% | Paper mode: ${paperMode ? "ON" : "OFF"}`);
 
   await binance.loadMarkets();
   console.log("Markets loaded");
@@ -2687,6 +2466,9 @@ async function startServer() {
   // 4h SWING-LONG buffer: refresh every 15 min (new 4h candle closes every 240 min)
   setInterval(refreshSwingBuffers, 15 * 60 * 1000);
 
+  // Paper trade monitor: check open paper trades against live prices every 30s
+  setInterval(runPaperTradeMonitor, 30 * 1000);
+
   // SSE snapshot interval — push dashboard data to all connected clients every 2s
   setInterval(async () => {
     if (sseClients.length === 0) return;
@@ -2696,13 +2478,6 @@ async function startServer() {
 
   // Fallback reseed every 5 min (catches any gaps if WS misses a candle)
   setInterval(seedCandleBuffer, 5 * 60 * 1000);
-  // Mock mode: simulate TP/SL via scan prices. Live mode: Binance handles it natively.
-  setInterval(runMockTradeMonitor, 10 * 1000);
-  // Sync DB with actual Binance positions every 60s (detects native TP/SL fills)
-  setInterval(syncPositionsFromBinance, 60 * 1000);
-  setInterval(takePnLSnapshot, 60 * 60 * 1000);
-  runMockTradeMonitor();
-  syncPositionsFromBinance();
 
   if (process.env.NODE_ENV !== "production") {
     const vite = await createViteServer({ server: { middlewareMode: true }, appType: "spa" });
